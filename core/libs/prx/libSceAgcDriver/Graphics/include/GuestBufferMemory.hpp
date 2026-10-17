@@ -14,10 +14,6 @@
 #include <utility>
 #include <vector>
 
-namespace AgcDriver::GuestMemory {
-struct Commitment;
-}
-
 namespace AgcDriver::Graphics {
 
 void ShutdownGuestBufferWorkers();
@@ -405,7 +401,7 @@ private:
         std::uint64_t end;
         bool writable;
     };
-    void addCopiedRange(const CopiedRange& range, const GuestMemory::Commitment* known = nullptr);
+    void addCopiedRange(const CopiedRange& range);
     // The BDA table entry of an uploaded region.
     static ShaderRecompiler::BdaAbi::Range addressRange(const Region& region);
     static std::uint64_t servedEnd(const Region& region);

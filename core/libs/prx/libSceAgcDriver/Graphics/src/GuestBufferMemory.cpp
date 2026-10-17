@@ -110,11 +110,6 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<ImageMirror*> sparseMirrors;
     std::unique_ptr<std::atomic<std::uint64_t>[]> verified;
     std::vector<CopiedRange> copied;
-    struct CommittedCopies {
-        std::uint64_t commitGeneration;
-        std::vector<GuestMemory::Commitment> ranges;
-    };
-    mutable AtomicSharedPtr<const CommittedCopies> copiedCommitted;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
@@ -1271,14 +1266,6 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
         return current != nullptr && !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
     }
     return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
-}
-
-std::uint64_t arenaCommits() {
-#ifdef _WIN32
-    return GuestArena::GuestArenaCommitGeneration_nid_postfix();
-#else
-    return 0;
-#endif
 }
 
 std::uint64_t effectiveUse(const HostImports& state, const HostImport& entry) {
@@ -3213,22 +3200,7 @@ void GuestBufferMemory::AcquireRegistered() {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
             lap(timing.leaseUs, at);
-            static const bool commitMemo = std::getenv("APS5_NO_SPACE_COMMIT_MEMO") == nullptr;
-            if (commitMemo) {
-                const auto commits = arenaCommits();
-                auto committed = space->copiedCommitted.load();
-                if (committed == nullptr || committed->commitGeneration != commits) {
-                    auto described = std::make_shared<AddressSpace::CommittedCopies>();
-                    described->commitGeneration = commits;
-                    described->ranges.reserve(space->copied.size());
-                    for (const auto& range : space->copied) described->ranges.push_back(GuestMemory::DescribeCommitted(range.begin, range.end - range.begin));
-                    committed = std::move(described);
-                    space->copiedCommitted.store(committed);
-                }
-                for (std::size_t index = 0; index < space->copied.size(); ++index) addCopiedRange(space->copied[index], &committed->ranges[index]);
-            } else {
-                for (const auto& range : space->copied) addCopiedRange(range);
-            }
+            for (const auto& range : space->copied) addCopiedRange(range);
             regionsSorted = sortedLookup;
             lap(timing.importsUs, at);
             // Writable mirrors are compared with guest memory per build, as acquireMirror does for
@@ -3414,24 +3386,17 @@ void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const
     Require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "guest memory range overflow");
 }
 
-void GuestBufferMemory::addCopiedRange(const CopiedRange& range, const GuestMemory::Commitment* known) {
+void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
     validate(range.begin, range.end - range.begin);
     Region region{range.begin, range.end, range.writable, {}, nullptr};
     // Read-only ranges are read from live guest memory at Upload: the lease pins them and the guest
     // cannot write them, so that equals a snapshot taken now without the extra copy. Reserved heaps
     // are registered whole while the guest commits pages on demand: committed pages only.
     region.hostBacked = !range.writable;
-    if (known != nullptr) {
-        if (!known->whole) {
-            region.sparse = true;
-            region.backed = known->ranges;
-        }
-    } else {
-        auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
-        if (!committed.whole) {
-            region.sparse = true;
-            region.backed = std::move(committed.ranges);
-        }
+    auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
+    if (!committed.whole) {
+        region.sparse = true;
+        region.backed = std::move(committed.ranges);
     }
     regions.push_back(std::move(region));
 }

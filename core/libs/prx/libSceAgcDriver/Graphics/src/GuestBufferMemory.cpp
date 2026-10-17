@@ -110,8 +110,11 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<ImageMirror*> sparseMirrors;
     std::unique_ptr<std::atomic<std::uint64_t>[]> verified;
     std::vector<CopiedRange> copied;
-    mutable std::mutex copiedMutex;
-    mutable std::vector<GuestMemory::Commitment> copiedCommitted;
+    struct CommittedCopies {
+        std::uint64_t commitGeneration;
+        std::vector<GuestMemory::Commitment> ranges;
+    };
+    mutable AtomicSharedPtr<const CommittedCopies> copiedCommitted;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
@@ -1268,6 +1271,14 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
         return current != nullptr && !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
     }
     return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
+}
+
+std::uint64_t arenaCommits() {
+#ifdef _WIN32
+    return GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#else
+    return 0;
+#endif
 }
 
 std::uint64_t effectiveUse(const HostImports& state, const HostImport& entry) {
@@ -3178,7 +3189,15 @@ void GuestBufferMemory::AcquireRegistered() {
                     }
                 }
                 spaceUse = stamp;
-                while (state.spaceUses.size() > 64) state.spaceUses.erase(state.spaceUses.begin());
+                if (state.spaceUses.size() > 64) {
+                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+                    for (auto& [base, entry] : state.imports) {
+                        if (entry.spaceSerial != oldest->first) continue;
+                        entry.lastUse = std::max(entry.lastUse, oldest->second);
+                        entry.spaceSerial = 0;
+                    }
+                    state.spaceUses.erase(oldest);
+                }
             }
         }
         if (hit) {
@@ -3196,12 +3215,17 @@ void GuestBufferMemory::AcquireRegistered() {
             lap(timing.leaseUs, at);
             static const bool commitMemo = std::getenv("APS5_NO_SPACE_COMMIT_MEMO") == nullptr;
             if (commitMemo) {
-                std::lock_guard copiedLock(space->copiedMutex);
-                if (space->copiedCommitted.size() != space->copied.size()) {
-                    space->copiedCommitted.clear();
-                    for (const auto& range : space->copied) space->copiedCommitted.push_back(GuestMemory::DescribeCommitted(range.begin, range.end - range.begin));
+                const auto commits = arenaCommits();
+                auto committed = space->copiedCommitted.load();
+                if (committed == nullptr || committed->commitGeneration != commits) {
+                    auto described = std::make_shared<AddressSpace::CommittedCopies>();
+                    described->commitGeneration = commits;
+                    described->ranges.reserve(space->copied.size());
+                    for (const auto& range : space->copied) described->ranges.push_back(GuestMemory::DescribeCommitted(range.begin, range.end - range.begin));
+                    committed = std::move(described);
+                    space->copiedCommitted.store(committed);
                 }
-                for (std::size_t index = 0; index < space->copied.size(); ++index) addCopiedRange(space->copied[index], &space->copiedCommitted[index]);
+                for (std::size_t index = 0; index < space->copied.size(); ++index) addCopiedRange(space->copied[index], &committed->ranges[index]);
             } else {
                 for (const auto& range : space->copied) addCopiedRange(range);
             }

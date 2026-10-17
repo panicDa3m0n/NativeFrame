@@ -390,10 +390,17 @@ void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintp
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
-    const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
+    std::vector<std::pair<std::uintptr_t, std::size_t>> created;
+    try {
+        created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
+    } catch (...) {
+        commitGeneration.fetch_add(1, std::memory_order_acq_rel);
+        throw;
+    }
     if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
         for (const auto& [address, size] : created) callback(address, size, generation);
     }
+    commitGeneration.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {

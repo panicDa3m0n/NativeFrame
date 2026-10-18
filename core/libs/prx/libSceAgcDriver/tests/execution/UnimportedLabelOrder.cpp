@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -81,6 +82,7 @@ int StoreLabel(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint
 int main() {
     try {
         GuestBlock labels;
+        GuestBlock temporary;
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -88,6 +90,21 @@ int main() {
         if (!device->FillBuffer(labels.Address() + 4096, 4096, pattern)) {
             std::printf("skipped, the device does not import guest memory\n");
             return VulkanTestSkipped;
+        }
+        {
+            const auto imported = AgcDriver::Graphics::HostImportLiveBytes();
+            const std::array<std::uint32_t, 2> value{0x76543210u, 0xfedcba98u};
+            const auto bytes = std::as_bytes(std::span(value));
+            const auto address = temporary.Address() + 4092;
+            const int reason = device->WriteLabelOnGpu(address, bytes, 90, 0);
+            Require(reason == 1 && AgcDriver::Graphics::HostImportLiveBytes() == imported, "an eight-byte label did not select its unimported CPU path");
+            Require(labels.Words()[1024] == pattern[0], "the targeted label returned before preceding GPU work completed");
+            device->WaitIdle();
+            AgcDriver::GuestMemory::Write(address, bytes, 4);
+            Require(labels.Words()[1024] == pattern[0], "the CPU label overtook earlier GPU work");
+            Require(temporary.Words()[1023] == value[0] && temporary.Words()[1024] == value[1], "the unimported eight-byte label did not land");
+            Require(temporary.Words()[1022] == 0 && temporary.Words()[1025] == 0, "the CPU label changed neighboring words");
+            Require(device->FillBuffer(labels.Address() + 4096, 4096, pattern), "cannot record work after the unimported label");
         }
         StoreLabel(*device, AddressOf(&commandMemory[8]), 1, 1);
         StoreLabel(*device, labels.Address() + 4, 2, 2);

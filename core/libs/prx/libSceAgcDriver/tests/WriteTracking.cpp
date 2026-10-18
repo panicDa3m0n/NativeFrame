@@ -29,6 +29,7 @@ using namespace AgcDriver::GuestMemory;
 constexpr std::size_t Block = 65536;
 #ifdef _WIN32
 constexpr wchar_t HostHoleMode[] = L"--host-hole";
+constexpr wchar_t CollectWindowMode[] = L"--collect-window";
 #endif
 
 void Require(bool condition, const std::string& message) {
@@ -653,6 +654,95 @@ void CheckHostHole() {
     }) && imported, "an import into an arena host hole did not run");
     Require(!Watched(hole, bytes), "an import made an arena host hole watched");
 }
+
+void CheckCollectWindow() {
+    constexpr std::size_t window = 2 * 1024 * 1024;
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(window, window));
+    GuestArena::GuestArenaCommit_nid_postfix(memory, window, PAGE_READWRITE, window);
+    auto* partial = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(window, window));
+    GuestArena::GuestArenaCommit_nid_postfix(partial, Block, PAGE_READWRITE, Block);
+    struct Cleanup {
+        void* memory;
+        void* partial;
+        ~Cleanup() {
+            GuestArena::GuestArenaRelease_nid_postfix(memory, window);
+            GuestArena::GuestArenaRelease_nid_postfix(partial, window);
+        }
+    } cleanup{memory, partial};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(Watched(base, window), "the collect window is not watched");
+    std::memset(memory, 17, window);
+    const auto nearby = base + 16;
+    const auto distant = base + 5 * Block + 32;
+    const auto quiet = base + 9 * Block;
+    const auto flip = [&](std::uint64_t address) { static_cast<volatile std::uint8_t*>(memory)[address - base] ^= 1; };
+
+    BumpCollectEpoch();
+    const auto first = CollectWrites(nearby, 16);
+    Require(first != 0, "the first window walk failed");
+    Require(CollectWrites(distant, 16) == first, "a block inside the walked window was walked again in the same epoch");
+
+    const auto beforeEpoch = TrackerGeneration();
+    flip(distant);
+    BumpCollectEpoch();
+    Require(CollectWrites(nearby, 16) != 0, "a window walk failed");
+    Require(CollectWrites(distant, 16) != 0 && !UnchangedSince(distant, 16, beforeEpoch), "a block served by the window walk missed a write made before the epoch");
+    Require(UnchangedSince(quiet, 16, beforeEpoch), "a window walk stamped a block nobody wrote");
+
+    const auto beforeReset = TrackerGeneration();
+    flip(distant);
+    BumpCollectEpoch();
+    Require(CollectWrites(nearby, 16) != 0, "a window walk failed");
+    BumpCollectEpoch();
+    Require(CollectWrites(distant, 16) != 0 && !UnchangedSince(distant, 16, beforeReset), "a write found and reset by a neighbour's window walk was lost");
+
+    BumpCollectEpoch();
+    Require(CollectWrites(nearby, 16) != 0, "a window walk failed");
+    const auto afterWalk = TrackerGeneration();
+    flip(distant);
+    BumpCollectEpoch();
+    Require(CollectWrites(distant, 16) > afterWalk && !UnchangedSince(distant, 16, afterWalk), "the next epoch missed a write made after the window walk");
+
+    const auto start = reinterpret_cast<std::uint64_t>(partial);
+    std::memset(partial, 17, Block);
+    BumpCollectEpoch();
+    const auto committed = CollectWrites(start + 16, 16);
+    Require(committed != 0, "a window reaching uncommitted memory lost the requested range");
+    static_cast<volatile std::uint8_t*>(partial)[16] ^= 1;
+    BumpCollectEpoch();
+    Require(CollectWrites(start + 16, 16) > committed && !UnchangedSince(start + 16, 16, committed), "the requested range walked alone missed a CPU write");
+}
+
+void CheckCollectWindowInChild() {
+    std::array<wchar_t, 32768> executable{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    Require(length != 0 && length < executable.size(), "cannot name the test executable");
+    const std::wstring command = L"\"" + std::wstring(executable.data(), length) + L"\" " + CollectWindowMode;
+    std::vector<wchar_t> commandLine(command.begin(), command.end());
+    commandLine.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION process{};
+    Require(SetEnvironmentVariableW(L"APS5_COLLECT_WINDOW_KIB", L"2048") != 0, "cannot set the collect window of the child");
+    const bool created = CreateProcessW(executable.data(), commandLine.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0;
+    SetEnvironmentVariableW(L"APS5_COLLECT_WINDOW_KIB", nullptr);
+    Require(created, "cannot create the collect-window child");
+    const bool exited = WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0;
+    if (!exited) {
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, INFINITE);
+    }
+    DWORD exitCode = 1;
+    const bool reported = GetExitCodeProcess(process.hProcess, &exitCode) != 0;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    Require(exited, "the collect-window child did not exit");
+    Require(reported && exitCode == 0, "the collect-window child failed");
+}
 #endif
 
 void CheckVersionRanges() {
@@ -1101,6 +1191,10 @@ int main() {
             CheckHostHole();
             return 0;
         }
+        if (std::wstring_view(GetCommandLineW()).ends_with(CollectWindowMode)) {
+            CheckCollectWindow();
+            return 0;
+        }
 #endif
         CheckSharedBlock();
         CheckStoredAllSince();
@@ -1119,6 +1213,7 @@ int main() {
         CheckRewatch();
         CheckUntrackedHint();
         CheckHostHoleInChild();
+        CheckCollectWindowInChild();
 #endif
         CheckVersionRanges();
         CheckCollectBoundaries();

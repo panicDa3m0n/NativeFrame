@@ -88,6 +88,7 @@ std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+std::atomic<std::uint64_t> widenedWalkFallbacks{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
@@ -319,7 +320,7 @@ public:
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu widened fallbacks %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()), static_cast<unsigned long long>(widenedWalkFallbacks.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -1270,6 +1271,20 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+std::size_t collectWindowBytes() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_COLLECT_WINDOW_KIB");
+#ifdef _WIN32
+        if (text == nullptr) return WritePageBytes;
+#else
+        if (text == nullptr) return WriteBlockBytes;
+#endif
+        const auto kib = std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 4, 16384);
+        return static_cast<std::size_t>(std::bit_floor(kib)) * 1024;
+    }();
+    return bytes;
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1282,12 +1297,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    const auto window = collectWindowBytes();
+    const bool widen = useMemo && threadCollectEpoch != 0 && window > page && bytes <= window;
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            const auto walked = [&](std::uint64_t key) {
+                const auto found = map.ranges.find(key);
+                return found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end;
+            };
+            if (walked(first) || (widen && walked(first & ~(window - 1)))) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -1315,17 +1336,26 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-#ifndef _WIN32
-    if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
-        const auto begin = first & ~(WriteBlockBytes - 1);
-        const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
+    const auto requestedFirst = first;
+    const auto requestedStop = stop;
+    if (widen) {
+        const auto begin = first & ~(window - 1);
+        const auto end = (stop + window - 1) & ~(window - 1);
         if (end > begin && tracker.covers(begin, end - begin)) {
             first = begin;
             stop = end;
         }
     }
+    bool complete = walkWrites(tracker, first, stop, StampKind::Cpu);
+#ifdef _WIN32
+    if (!complete && (first != requestedFirst || stop != requestedStop)) {
+        widenedWalkFallbacks.fetch_add(1, std::memory_order_relaxed);
+        first = requestedFirst;
+        stop = requestedStop;
+        complete = walkWrites(tracker, first, stop, StampKind::Cpu);
+    }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!complete) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);

@@ -420,6 +420,7 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
@@ -495,6 +496,7 @@ void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void PageStates::initialize() {
+    if (ready.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -521,6 +523,7 @@ void PageStates::initialize() {
             GuestArena::GuestArenaSetAccessObserver_nid_postfix(&ForgetInaccessiblePages);
         }
     });
+    ready.store(true, std::memory_order_release);
 }
 
 struct PageRun {

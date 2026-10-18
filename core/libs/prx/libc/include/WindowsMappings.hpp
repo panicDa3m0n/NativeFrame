@@ -190,6 +190,10 @@ public:
             const auto memory = query(address);
             return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
         }
+        if (view.resident) {
+            resumeResidentWrites(base);
+            return true;
+        }
         invalidate(*view.page, written);
         protectSubpages(base, written, view.protection, "resume shared memory write");
         view.armed &= static_cast<std::uint8_t>(~written);
@@ -219,7 +223,7 @@ public:
         physical.erase(physical.lower_bound(std::make_pair(key, std::uint64_t{0})), physical.lower_bound(std::make_pair(key + 1, std::uint64_t{0})));
     }
 
-    bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
+    bool BeginHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
         std::lock_guard lock(mutex);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
@@ -228,10 +232,12 @@ public:
         }
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
-            ++view.hostWrites;
+            if (store) ++view.hostWrites;
+            else ++view.hostImports;
             const auto written = subpagesOf(it->first, address, end);
-            invalidate(*view.page, written);
-            const auto opened = static_cast<std::uint8_t>(view.armed & written);
+            if (store) invalidate(*view.page, written);
+            else if (view.resident) forgetClean(it->first, it->first + pageBytes);
+            const auto opened = static_cast<std::uint8_t>((store || view.resident) ? view.armed & written : 0);
             if (opened == 0) continue;
             protectSubpages(it->first, opened, view.protection, "open shared memory to a host write");
             view.armed &= static_cast<std::uint8_t>(~opened);
@@ -239,12 +245,14 @@ public:
         return true;
     }
 
-    void EndHostWrite(std::uintptr_t address, std::size_t bytes) {
+    void EndHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
         std::lock_guard lock(mutex);
         const auto end = address + bytes;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
-            --it->second.hostWrites;
-            invalidate(*it->second.page, subpagesOf(it->first, address, end));
+            if (store) --it->second.hostWrites;
+            else --it->second.hostImports;
+            if (store) invalidate(*it->second.page, subpagesOf(it->first, address, end));
+            else if (it->second.resident) forgetClean(it->first, it->first + pageBytes);
         }
     }
 
@@ -531,11 +539,13 @@ private:
         std::uint8_t collected = 0;
         bool resident = false;
         std::shared_ptr<Physical> slot;
+        std::uint32_t hostImports = 0;
     };
     struct Run {
         std::uintptr_t end;
         std::array<std::uint64_t, 8> collected;
         std::uint32_t fresh;
+        bool writeObserved = false;
     };
     struct Window {
         void* view = nullptr;
@@ -549,7 +559,7 @@ private:
 
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
-        const bool armed = clear && run.fresh == 0 && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        const bool armed = clear && run.fresh == 0 && !run.writeObserved && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
@@ -594,12 +604,36 @@ private:
         if (collection == Collection::Fresh) flushReset(stop);
     }
 
+    void resumeResidentWrites(std::uintptr_t address) {
+        const auto run = std::prev(residentRuns.upper_bound(address));
+        run->second.writeObserved = true;
+        forgetClean(run->first, run->second.end);
+        auto first = views.lower_bound(run->first);
+        while (first != views.end() && first->first < run->second.end) {
+            const auto begin = first->first;
+            auto end = begin;
+            const auto protection = first->second.protection;
+            auto next = first;
+            bool armed = false;
+            do {
+                armed = armed || next->second.armed != 0;
+                end = next->first + pageBytes;
+                ++next;
+            } while (next != views.end() && next->first == end && end < run->second.end && next->second.protection == protection);
+            if (armed) {
+                DWORD previous;
+                if (!VirtualProtect(reinterpret_cast<void*>(begin), end - begin, protection, &previous)) fail("resume resident guest writes");
+            }
+            for (; first != next; ++first) first->second.armed = 0;
+        }
+    }
+
     bool armResident(std::uintptr_t from, std::uintptr_t stop) {
         const auto first = views.lower_bound(from & ~(pageBytes - 1));
         if (first == views.end() || !writable(first->second.protection)) return false;
         const auto protection = first->second.protection;
         for (auto it = first; it != views.end() && it->first < stop; ++it) {
-            if (!it->second.resident || it->second.protection != protection || it->second.hostWrites != 0 || it->second.page->pins != 0) return false;
+            if (!it->second.resident || it->second.protection != protection || it->second.hostWrites != 0 || it->second.hostImports != 0 || it->second.page->pins != 0) return false;
         }
         DWORD previous;
         const auto readOnly = protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;

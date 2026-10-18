@@ -1492,6 +1492,108 @@ static void CheckSingleDirectMappingTracksWritesWithoutFaults() {
 #endif
 }
 
+static void CheckLargeResidentWritesStopFaulting() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 0x200000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &physical) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, physical, bytes) == 0);
+    const auto collect = [&] {
+        std::array<void*, bytes / 4096> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapped), bytes, pages.data(), &count, true));
+        return count;
+    };
+    Require(collect() == bytes / 4096);
+    Require(collect() == 0 && collect() == 0);
+    MEMORY_BASIC_INFORMATION memory{};
+    Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READONLY);
+    auto* data = static_cast<unsigned char*>(mapped);
+    const auto path = std::filesystem::path("anyps5-resident-read-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    const std::vector<char> input(65536, 89);
+    {
+        std::ofstream stream(path, std::ios::binary);
+        stream.write(input.data(), static_cast<std::streamsize>(input.size()));
+    }
+    const int fd = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(fd >= 0);
+    Require(sceKernelPread(fd, mapped, input.size(), 0) == static_cast<std::int64_t>(input.size()));
+    Require(data[0] == 89 && data[input.size() - 1] == 89);
+    Require(collect() == input.size() / 4096 && collect() == 0);
+    Require(sceKernelRead(fd, data + input.size(), input.size()) == static_cast<std::int64_t>(input.size()));
+    Require(data[input.size()] == 89 && data[input.size() * 2 - 1] == 89);
+    Require(collect() == input.size() / 4096 && collect() == 0);
+    Require(sceKernelClose(fd) == 0);
+    std::filesystem::remove(path);
+    {
+        GuestArena::HostImportAccess access(mapped, bytes);
+        Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READWRITE);
+        Require(collect() == 0 && collect() == 0);
+        Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READWRITE);
+        data[17] = 3;
+        Require(collect() == 1 && collect() == 0);
+    }
+    for (unsigned int round = 0; round < 16; ++round) Require(collect() == 0);
+    Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READONLY);
+    const auto before = g_accessViolations;
+    const auto handler = AddVectoredExceptionHandler(1, CountAccessViolations);
+    Require(handler != nullptr);
+    for (unsigned int round = 0; round < 16; ++round) {
+        for (std::size_t at = 0; at < bytes; at += 4096) static_cast<volatile unsigned char*>(mapped)[at] = static_cast<unsigned char>(round);
+        Require(collect() == bytes / 4096 && collect() == 0);
+    }
+    Require(RemoveVectoredExceptionHandler(handler));
+    Require(g_accessViolations == before + 1);
+    Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READWRITE);
+    Require(mprotect_nid_postfix(mapped, bytes, 1) == 0);
+    Require(collect() == 0 && collect() == 0);
+    Require(mprotect_nid_postfix(mapped, bytes, 3) == 0);
+    data[0x10000] = 97;
+    Require(collect() == 1 && collect() == 0);
+    Require(sceKernelMunmap(mapped, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, bytes) == 0);
+#endif
+}
+
+static void CheckImportAccessDoesNotInventSharedWrites() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 0x100000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &physical) == 0);
+    void* first = nullptr;
+    void* second = nullptr;
+    Require(sceKernelMapDirectMemory(&first, bytes, 3, 0, physical, 0) == 0);
+    Require(sceKernelMapDirectMemory(&second, bytes, 3, 0, physical, 0) == 0);
+    const auto collect = [&](void* pointer) {
+        std::array<void*, bytes / 4096> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes, pages.data(), &count, true));
+        return count;
+    };
+    collect(first);
+    collect(second);
+    for (unsigned int round = 0; round < 16; ++round) {
+        {
+            GuestArena::HostImportAccess access(first, bytes);
+            Require(collect(first) == 0 && collect(second) == 0);
+        }
+        Require(collect(first) == 0 && collect(second) == 0);
+    }
+    {
+        GuestArena::HostImportAccess access(first, bytes);
+        static_cast<volatile unsigned char*>(first)[4097] = 73;
+        Require(collect(first) == 1 && collect(second) == 1);
+    }
+    Require(static_cast<unsigned char*>(second)[4097] == 73);
+    Require(collect(first) == 0 && collect(second) == 0);
+    Require(sceKernelMunmap(first, bytes) == 0);
+    Require(sceKernelMunmap(second, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, bytes) == 0);
+#endif
+}
+
 static void CheckResidentCollectPreservesPartialWrites() {
 #ifdef _WIN32
     constexpr std::size_t bytes = 0x210000;
@@ -2805,6 +2907,8 @@ int main(int argc, char** argv) {
     CheckPinnedSharedPages();
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
+    CheckLargeResidentWritesStopFaulting();
+    CheckImportAccessDoesNotInventSharedWrites();
     CheckResidentCollectPreservesPartialWrites();
     CheckResidentCollectionDuringHostWrites();
     CheckSecondDirectMappingWaitsForLeases();

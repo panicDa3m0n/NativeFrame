@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -386,6 +387,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
+            KernelWakeSleepers_nid_no_patch();
         }
         noteLabelStore(address, bytes, stamp, queue);
         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());

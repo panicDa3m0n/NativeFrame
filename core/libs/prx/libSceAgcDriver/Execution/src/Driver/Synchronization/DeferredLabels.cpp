@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "ThreadOwned.hpp"
 #include <cstdlib>
 
@@ -120,6 +121,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         if (reason != 0 && reason != 5) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(label.address, bytes, 4);
+            KernelWakeSleepers_nid_no_patch();
         }
         noteLabelStore(label.address, bytes, stamp, queue);
     }

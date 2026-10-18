@@ -21,6 +21,14 @@
 #include <mutex>
 #include <string>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
 namespace Graphics = AgcDriver::Graphics;
@@ -75,10 +83,7 @@ private:
 enum class Outcome : std::uint8_t { NoDevice, NoImport, Passed };
 
 Graphics::Context Probe(const AgcDriver::VulkanDevice& device) {
-    Graphics::Context probe{};
-    probe.device = device.Device();
-    probe.hostImportAlignment = 1;
-    return probe;
+    return AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
 }
 
 bool Fill(AgcDriver::VulkanDevice& device, std::uint64_t address) {
@@ -114,11 +119,13 @@ Outcome WindowsFollowTheirRange() {
     Require(first != 0, "host import windows: the window at " + Hex(address) + " has no serial");
 
     GuestBlock other(OtherBytes);
+    Require(Graphics::HostImportSerial(probe, address, ProbeBytes, true) == first, "host import windows: an unrelated mapping changed the import serial");
     Require(Fill(*device, address), "host import windows: the window at " + Hex(address) + " cannot be filled after an unrelated registration");
     Require(Graphics::HostImportSerial(probe, address, ProbeBytes, false) == first, "host import windows: the window at " + Hex(address) + " was dropped by an unrelated registration, although its range still owns it");
 
     GuestAllocations::Mutation().Remove(guest.Data());
     GuestAllocations::Mutation().Add(guest.Data(), BlockBytes, true, true, true);
+    Require(Graphics::HostImportSerial(probe, address, ProbeBytes, true) != first, "host import windows: a remapped range kept its stale import serial before the next fill");
     Require(Fill(*device, address), "host import windows: the window at " + Hex(address) + " cannot be filled after its range was mapped again");
     const auto second = Graphics::HostImportSerial(probe, address, ProbeBytes, false);
     Require(second != 0 && second != first, "host import windows: the window of the range mapped again kept the serial " + Hex(first));

@@ -1267,6 +1267,23 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
 }
 
+bool singleRangeImportCurrent(const HostImport& entry) {
+    if (entry.joined || entry.unwatched || entry.ranges.size() != 1) return false;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto current = GuestAllocations::GuestAllocationsLookup_nid_postfix(entry.base, false);
+    if (current == nullptr || !current->readable || entry.ranges.front().owner_before(current) || current.owner_before(entry.ranges.front())) return false;
+    if (entry.base < current->address || entry.bytes > current->bytes || entry.base - current->address > current->bytes - entry.bytes) return false;
+    if (entry.bytes == current->bytes) {
+        if (current->address != 0) {
+            const auto previous = GuestAllocations::GuestAllocationsLookup_nid_postfix(current->address - 1, false);
+            if (previous != nullptr && continuesRun(*previous, *current)) return false;
+        }
+        const auto next = GuestAllocations::GuestAllocationsLookup_nid_postfix(current->address + current->bytes, false);
+        if (next != nullptr && continuesRun(*current, *next)) return false;
+    }
+    return generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+}
+
 bool pointerHeld(const HostImports& state, const HostImport& entry) {
     return entry.lastUse >= state.buildFloor;
 }
@@ -5028,7 +5045,12 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     std::lock_guard lock(state.mutex);
     // An import whose registered range changed must not be reused: reconcile first, as an upload
     // does (the walk only runs when the registry changed since the last one).
-    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
+    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) {
+        const auto next = state.imports.upper_bound(address);
+        const auto existing = next != state.imports.begin() ? &std::prev(next)->second : nullptr;
+        const bool current = state.device == context.device && existing != nullptr && address >= existing->base && address + bytes <= existing->base + existing->bytes && singleRangeImportCurrent(*existing);
+        if (!current) refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix());
+    }
     auto found = state.imports.upper_bound(address);
     if (found == state.imports.begin()) return 0;
     --found;

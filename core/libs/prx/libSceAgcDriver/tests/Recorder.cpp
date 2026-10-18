@@ -2264,6 +2264,7 @@ void secondMappingImportTests(const Device& device) {
     const auto first = HostImportSerial(context, address, bytes, true);
     Require(first != 0 && HostImportSerial(context, address, bytes, true) == first, "singly mapped direct memory lost its import");
     Require(sceKernelMapDirectMemory(&release.alias, page, 0x33, 0, release.physical, page) == 0, "map the first page a second time");
+    Require(HostImportSerial(context, address, bytes, true) != first, "a second mapping kept a stale import serial before the next import lookup");
     Require(HostImportFor(context, address, bytes) != nullptr, "direct memory was not imported again after a second mapping of its first page");
     const auto second = HostImportSerial(context, address, bytes, true);
     Require(second != 0 && second != first, "the import of direct memory whose pages were replaced was kept");

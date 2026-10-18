@@ -41,6 +41,7 @@ struct HostImport {
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
     std::uint64_t lead = 0;
+    mutable std::uint64_t spaceSerial = 0;
 };
 
 inline VkDeviceSize HostImportOffset(const HostImport& import, std::uint64_t address) {

@@ -237,6 +237,7 @@ struct HostImports {
 #endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
+    std::map<std::uint64_t, std::uint64_t> spaceUses;
 };
 
 HostImports& Imports() {
@@ -1348,13 +1349,19 @@ bool singleRangeImportCurrent(const HostImport& entry) {
     return generation == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
 }
 
+std::uint64_t effectiveUse(const HostImports& state, const HostImport& entry) {
+    if (entry.spaceSerial == 0) return entry.lastUse;
+    const auto found = state.spaceUses.find(entry.spaceSerial);
+    return found == state.spaceUses.end() ? entry.lastUse : std::max(entry.lastUse, found->second);
+}
+
 bool pointerHeld(const HostImports& state, const HostImport& entry) {
-    return entry.lastUse >= state.buildFloor;
+    return effectiveUse(state, entry) >= state.buildFloor;
 }
 
 bool evictable(const HostImports& state, const HostImport& entry) {
     constexpr std::uint64_t protectedUses = 256;
-    return !pointerHeld(state, entry) && entry.lastUse + protectedUses < state.useCounter;
+    return !pointerHeld(state, entry) && effectiveUse(state, entry) + protectedUses < state.useCounter;
 }
 
 std::uint64_t retireLeastRecent(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, std::uint64_t wanted) {
@@ -1362,7 +1369,7 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
     while (freed < wanted) {
         auto oldest = state.imports.end();
         for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
-            if (evictable(state, it->second) && (oldest == state.imports.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
+            if (evictable(state, it->second) && (oldest == state.imports.end() || effectiveUse(state, it->second) < effectiveUse(state, oldest->second))) oldest = it;
         }
         if (oldest == state.imports.end()) break;
         freed += oldest->second.bytes;
@@ -3249,8 +3256,24 @@ void GuestBufferMemory::AcquireRegistered() {
             importFloor = state.useCounter + 1;
             if (hit) {
                 const auto stamp = ++state.useCounter;
-                for (const auto& region : current->base) {
-                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+                auto& spaceUse = state.spaceUses[current->serial];
+                if (!stampOnce || spaceUse == 0) {
+                    for (const auto& region : current->base) {
+                        if (region.direct == nullptr) continue;
+                        region.direct->lastUse = stamp;
+                        if (stampOnce) region.direct->spaceSerial = current->serial;
+                    }
+                }
+                spaceUse = stamp;
+                if (state.spaceUses.size() > 64) {
+                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+                    for (auto& [base, entry] : state.imports) {
+                        if (entry.spaceSerial != oldest->first) continue;
+                        entry.lastUse = std::max(entry.lastUse, oldest->second);
+                        entry.spaceSerial = 0;
+                    }
+                    state.spaceUses.erase(oldest);
                 }
             }
         }

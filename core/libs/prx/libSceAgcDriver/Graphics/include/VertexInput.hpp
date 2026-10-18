@@ -2,7 +2,6 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
-#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <list>
@@ -307,8 +306,7 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     }
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
-    auto& order = HostThreadLocal<std::vector<std::size_t>, struct VertexCopyOrderTag>();
-    order.resize(fetches.size());
+    std::vector<std::size_t> order(fetches.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
         const auto& x = fetches[a];

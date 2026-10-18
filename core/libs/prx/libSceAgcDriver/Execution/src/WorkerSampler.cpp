@@ -31,16 +31,17 @@ std::jthread workerSamplerThread;
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
 struct Sampler {
-    static constexpr int ProcessDepth = 12;
     static constexpr int WorkerDepth = 64;
 
     HANDLE target = nullptr;
     std::string path;
-    int depth = ProcessDepth;
+    int depth = WorkerDepth;
     bool keepStacks = false;
+    bool boundStacks = false;
     std::uint64_t stackLow = 0;
     std::uint64_t stackHigh = 0;
     std::vector<DwarfFrames> modules;
+    std::vector<DwarfFrames>* index = &modules;
     std::uint64_t pendingModule = 0;
     std::mutex mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> counts;
@@ -60,8 +61,8 @@ struct Sampler {
     }
 
     const DwarfFrames* moduleOf(std::uint64_t pc) const {
-        const auto found = std::upper_bound(modules.begin(), modules.end(), pc, [](std::uint64_t value, const DwarfFrames& module) { return value < module.Base(); });
-        return found != modules.begin() && std::prev(found)->Contains(pc) ? &*std::prev(found) : nullptr;
+        const auto found = std::upper_bound(index->begin(), index->end(), pc, [](std::uint64_t value, const DwarfFrames& module) { return value < module.Base(); });
+        return found != index->begin() && std::prev(found)->Contains(pc) ? &*std::prev(found) : nullptr;
     }
 
     bool hasUnwindData(std::uint64_t pc) const {
@@ -121,8 +122,23 @@ struct Sampler {
             frames = reinterpret_cast<const DwarfFrames::Byte*>(base + sections[index].VirtualAddress);
             framesEnd = frames + sections[index].Misc.VirtualSize;
         }
-        const auto at = std::upper_bound(modules.begin(), modules.end(), base, [](std::uint64_t value, const DwarfFrames& module) { return value < module.Base(); });
-        modules.emplace(at, base, base + nt->OptionalHeader.SizeOfImage, frames, framesEnd);
+        const auto at = std::upper_bound(index->begin(), index->end(), base, [](std::uint64_t value, const DwarfFrames& module) { return value < module.Base(); });
+        index->emplace(at, base, base + nt->OptionalHeader.SizeOfImage, frames, framesEnd);
+    }
+
+    // A thread sampled from outside has no known stack: the committed region holding RSP and the
+    // committed regions above it in the same reservation bound the DWARF steps' reads.
+    void boundStack(std::uint64_t rsp) {
+        if (rsp >= stackLow && rsp < stackHigh) return;
+        stackLow = stackHigh = 0;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(rsp), &memory, sizeof(memory)) == 0 || memory.State != MEM_COMMIT) return;
+        const auto reservation = memory.AllocationBase;
+        const auto low = reinterpret_cast<std::uint64_t>(memory.BaseAddress);
+        auto high = low + memory.RegionSize;
+        while (VirtualQuery(reinterpret_cast<LPCVOID>(high), &memory, sizeof(memory)) != 0 && memory.AllocationBase == reservation && memory.State == MEM_COMMIT) high += memory.RegionSize;
+        stackLow = low;
+        stackHigh = high;
     }
 
     void sample() {
@@ -134,7 +150,10 @@ struct Sampler {
         LARGE_INTEGER resumed{};
         QueryPerformanceCounter(&suspended);
         if (SuspendThread(target) == static_cast<DWORD>(-1)) return;
-        if (GetThreadContext(target, &context) != 0) count = walk(context, frames);
+        if (GetThreadContext(target, &context) != 0) {
+            if (boundStacks) boundStack(context.Rsp);
+            count = walk(context, frames);
+        }
         ResumeThread(target);
         QueryPerformanceCounter(&resumed);
         if (pendingModule != 0) indexModule();
@@ -210,6 +229,7 @@ struct Sampler {
 struct ProcessSampler {
     std::string path;
     DWORD self = 0;
+    std::vector<DwarfFrames> modules;
     std::map<DWORD, Sampler> threads;
     std::uint64_t rounds = 0;
 
@@ -226,7 +246,11 @@ struct ProcessSampler {
         for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
             if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
             auto& thread = threads[entry.th32ThreadID];
-            if (thread.target == nullptr) thread.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            if (thread.target != nullptr) continue;
+            thread.target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+            thread.keepStacks = true;
+            thread.boundStacks = true;
+            thread.index = &modules;
         }
         CloseHandle(snapshot);
         enumerated = std::chrono::steady_clock::now();
@@ -262,6 +286,47 @@ struct ProcessSampler {
             }
         }
         std::fclose(file);
+        writeStacks();
+    }
+
+    // Every thread's collapsed stacks, each rooted at "thread <id>", go to <stem>.collapsed.txt for
+    // call trees and flame graphs; the 40-line summary above loses the callers of deep frames.
+    void writeStacks() {
+        const auto dot = path.rfind('.');
+        const auto slash = path.find_last_of("\\/");
+        const auto stem = dot != std::string::npos && (slash == std::string::npos || dot > slash) ? path.substr(0, dot) : path;
+        const auto collapsed = stem + ".collapsed.txt";
+        const auto temporary = collapsed + ".tmp";
+        std::map<std::uint64_t, std::string> names;
+        std::map<std::uint64_t, std::string> loaded;
+        const auto name = [&](std::uint64_t address) -> const std::string& {
+            auto found = names.find(address);
+            if (found == names.end()) found = names.emplace(address, Sampler::frameName(address, loaded)).first;
+            return found->second;
+        };
+        std::string text;
+        for (auto& [id, thread] : threads) {
+            std::lock_guard lock(thread.mutex);
+            const auto root = "thread " + std::to_string(id) + ';';
+            const auto stacks = thread.stacks.Format(name);
+            for (std::size_t begin = 0; begin < stacks.size();) {
+                const auto end = stacks.find('\n', begin);
+                text += root;
+                text.append(stacks, begin, end - begin + 1);
+                begin = end + 1;
+            }
+        }
+        std::FILE* file = std::fopen(temporary.c_str(), "w");
+        if (file == nullptr) return;
+        std::fprintf(file, "# rounds=%llu depth=%d\n", static_cast<unsigned long long>(rounds), Sampler::WorkerDepth);
+        for (const auto& [base, module] : loaded) {
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            std::fprintf(file, "# module %s 0x%lx 0x%lx\n", module.c_str(), static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage), static_cast<unsigned long>(nt->FileHeader.TimeDateStamp));
+        }
+        const bool written = std::fwrite(text.data(), 1, text.size(), file) == text.size();
+        if (std::fclose(file) != 0 || !written) return;
+        MoveFileExA(temporary.c_str(), collapsed.c_str(), MOVEFILE_REPLACE_EXISTING);
     }
 };
 

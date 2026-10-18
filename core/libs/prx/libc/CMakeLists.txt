@@ -1,4 +1,13 @@
 if(BUILD_TESTING)
+    if(WIN32)
+        add_test_executable(windows_mappings_release_tests ${LIBS_INCLUDE_DIR}/tests/WindowsMappingsRelease.cpp)
+        target_include_directories(windows_mappings_release_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        add_test(NAME windows_mappings_release COMMAND windows_mappings_release_tests)
+        foreach(mode 0 1 2)
+            add_test(NAME windows_mappings_release_mismatch_${mode} COMMAND windows_mappings_release_tests ${mode})
+        endforeach()
+    endif()
+
     add_test_executable(guest_binary_word_tests ${LIBS_INCLUDE_DIR}/tests/GuestBinaryWord.cpp)
     target_include_directories(guest_binary_word_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_binary_word_tests PRIVATE libc)

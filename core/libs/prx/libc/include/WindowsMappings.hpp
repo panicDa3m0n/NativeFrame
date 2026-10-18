@@ -859,6 +859,21 @@ private:
         forgetClean(address, end);
         breakRun(address);
         breakRun(end);
+        if (const auto run = residentRuns.find(address); run != residentRuns.end() && run->second.end == end) {
+            const auto memory = query(address);
+            if (reinterpret_cast<std::uintptr_t>(memory.AllocationBase) != address) throw std::runtime_error("cannot release part of a host allocation");
+            if (memory.Type != MEM_PRIVATE) throw std::runtime_error("resident guest mapping is not private memory");
+            auto allocationEnd = address;
+            do {
+                const auto part = query(allocationEnd);
+                if (part.AllocationBase != memory.AllocationBase) break;
+                allocationEnd = reinterpret_cast<std::uintptr_t>(part.BaseAddress) + part.RegionSize;
+            } while (allocationEnd < end);
+            if (allocationEnd != end || query(end).AllocationBase == memory.AllocationBase) throw std::runtime_error("guest release truncates a host allocation");
+            evict(run);
+            if (!VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
+            return;
+        }
         for (auto cursor = address; cursor < end;) {
             const auto memory = query(cursor);
             if (memory.State == MEM_RESERVE) {

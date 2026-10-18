@@ -1567,6 +1567,46 @@ static void CheckSingleDirectMappingTracksWritesWithoutFaults() {
 #endif
 }
 
+static void CheckResidentCollectPreservesPartialWrites() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 0x210000;
+    constexpr std::size_t small = 0x1000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &physical) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, physical, 0x200000) == 0);
+    const auto address = reinterpret_cast<std::uintptr_t>(mapped);
+    const auto collect = [&](std::size_t offset, std::size_t length, std::size_t capacity, bool clear, bool armed) {
+        unsigned char sentinel = 0;
+        std::vector<void*> pages(capacity + 2, &sentinel);
+        std::size_t count = capacity;
+        const auto function = armed ? &GuestArena::GuestArenaCollectArmedWrites_nid_postfix : &GuestArena::GuestArenaCollectWrites_nid_postfix;
+        Require(function(address + offset, length, pages.data() + 1, &count, clear));
+        Require(count <= capacity && pages.front() == &sentinel && pages.back() == &sentinel);
+        std::vector<std::uintptr_t> found;
+        for (std::size_t at = 0; at < count; ++at) found.push_back(reinterpret_cast<std::uintptr_t>(pages[at + 1]) - address);
+        return found;
+    };
+    Require(collect(0, bytes, 0, true, false).empty());
+    Require(collect(0, bytes, bytes / small, true, false).size() == bytes / small);
+    Require(collect(0, bytes, bytes / small, true, true).empty());
+    auto* data = static_cast<volatile unsigned char*>(mapped);
+    data[3] = 1;
+    data[small + 8] = 2;
+    data[0x200000 + 9] = 3;
+    Require(collect(0, bytes, 0, true, false).empty());
+    Require(collect(1, small - 1, 1, false, true) == std::vector<std::uintptr_t>{1});
+    Require(collect(0, small, 1, false, false) == std::vector<std::uintptr_t>{0});
+    Require(collect(0, small, 1, true, true) == std::vector<std::uintptr_t>{0});
+    Require(collect(0, small, 1, true, false).empty());
+    Require(collect(small, bytes - small, 1, true, false) == std::vector<std::uintptr_t>{small});
+    Require(collect(small * 2, bytes - small * 2, bytes / small, true, true) == std::vector<std::uintptr_t>{0x200000});
+    Require(collect(0, bytes, bytes / small, true, false).empty());
+    Require(sceKernelMunmap(mapped, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, bytes) == 0);
+#endif
+}
+
 static void CheckSecondDirectMappingWaitsForLeases() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -2836,6 +2876,7 @@ int main(int argc, char** argv) {
     CheckPinnedSharedPages();
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
+    CheckResidentCollectPreservesPartialWrites();
     CheckSecondDirectMappingWaitsForLeases();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
     CheckRemappedDirectMemoryIsChargedOnce();

@@ -1,10 +1,12 @@
 #include "prx/libSceAgc/Command/include/RegisterDefaults.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libc/include/ApplicationHeap.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <vector>
 
@@ -53,6 +55,28 @@ struct Storage {
 
 std::mutex defaultsMutex;
 std::array<std::array<Storage, 14>, 2> storage;
+
+// The SDK the title was built with, from its process parameters (0 without them, as in the tests).
+std::uint32_t titleSdkVersion() {
+    static const std::uint32_t version = [] {
+        try {
+            std::uint32_t value = 0;
+            std::memcpy(&value, static_cast<const std::byte*>(ApplicationProcessParameters_nid_no_patch()) + 0x10, sizeof(value));
+            return value;
+        } catch (const std::exception&) {
+            return std::uint32_t{0};
+        }
+    }();
+    return version;
+}
+
+// Titles built before SDK 10.00 walk the compact 12-byte type entries, whose second word also packs
+// each block's register count and stride: Astro Bot (PPSA21567, SDK 9.04) writes past its
+// command buffer when it gets the pairs. Later titles, PPSA99011 among them, read the pairs.
+bool compactTypes() {
+    const auto sdk = titleSdkVersion();
+    return sdk != 0 && sdk < 0x10000000u;
+}
 
 struct AgcContextState {
     std::uint32_t data[512];
@@ -111,7 +135,7 @@ void* GetRegisterDefaults(std::uint32_t version, bool internal, const char* func
             Require((bankIndex >> 2) < source->banks[bankIndex & 3u].pointerCount, function, "register defaults type exceeds its bank");
             types.push_back({source->types[entry * 3], bankIndex});
         }
-        defaults.types = types.empty() ? nullptr : types.data();
+        defaults.types = compactTypes() ? reinterpret_cast<TypeIndex*>(source->types) : types.empty() ? nullptr : types.data();
         defaults.count = source->count;
         destination.pointers = std::move(pointers);
         destination.types = std::move(types);

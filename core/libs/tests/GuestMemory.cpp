@@ -1532,6 +1532,69 @@ static void CheckResidentCollectPreservesPartialWrites() {
 #endif
 }
 
+static void CheckResidentCollectionDuringHostWrites() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 0x100000;
+    constexpr std::size_t small = 0x1000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &physical) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, physical, 0x200000) == 0);
+    auto* data = static_cast<unsigned char*>(mapped);
+    const auto address = reinterpret_cast<std::uintptr_t>(mapped);
+    const auto collect = [&] {
+        std::array<void*, bytes / small> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(address, bytes, pages.data(), &count, true));
+        return std::vector<void*>(pages.begin(), pages.begin() + count);
+    };
+    collect();
+    Require(collect().empty());
+    Require(GuestArena::GuestArenaBeginHostWrite_nid_postfix(data + small, small));
+    data[small + 7] = 1;
+    Require(collect() == std::vector<void*>{data + small});
+    data[small + 8] = 2;
+    GuestArena::GuestArenaEndHostWrite_nid_postfix(data + small, small);
+    Require(collect() == std::vector<void*>{data + small});
+    Require(collect().empty());
+    GuestArena::GuestArenaPinWritable_nid_postfix(data + small * 2, small);
+    collect();
+    static_cast<volatile unsigned char*>(mapped)[small * 2 + 9] = 3;
+    Require(collect() == std::vector<void*>{data + small * 2});
+    GuestArena::GuestArenaUnpinWritable_nid_postfix(data + small * 2, small);
+    collect();
+    std::atomic<unsigned int> written{0};
+    std::atomic<unsigned int> consumed{0};
+    std::thread writer([&] {
+        for (unsigned int round = 1; round <= 128; ++round) {
+            while (consumed.load(std::memory_order_acquire) != round - 1) std::this_thread::yield();
+            static_cast<volatile unsigned char*>(mapped)[small * 3 + 7] = static_cast<unsigned char>(round);
+            written.store(round, std::memory_order_release);
+        }
+    });
+    for (unsigned int round = 1; round <= 128; ++round) {
+        const auto racingPages = collect();
+        while (written.load(std::memory_order_acquire) != round) std::this_thread::yield();
+        const auto pages = collect();
+        Require(std::find(pages.begin(), pages.end(), data + small * 3) != pages.end() || std::find(racingPages.begin(), racingPages.end(), data + small * 3) != racingPages.end());
+        Require(data[small * 3 + 7] == static_cast<unsigned char>(round));
+        Require(collect().empty());
+        consumed.store(round, std::memory_order_release);
+    }
+    writer.join();
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, 0x4000, 3, 0, physical, 0) == 0);
+    collect();
+    static_cast<volatile unsigned char*>(alias)[small + 11] = 4;
+    Require(data[small + 11] == 4);
+    const auto pages = collect();
+    Require(std::find(pages.begin(), pages.end(), data + small) != pages.end());
+    Require(sceKernelMunmap(alias, 0x4000) == 0);
+    Require(sceKernelMunmap(mapped, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, bytes) == 0);
+#endif
+}
+
 static void CheckSecondDirectMappingWaitsForLeases() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -2743,6 +2806,7 @@ int main(int argc, char** argv) {
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckResidentCollectPreservesPartialWrites();
+    CheckResidentCollectionDuringHostWrites();
     CheckSecondDirectMappingWaitsForLeases();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
     CheckRemappedDirectMemoryIsChargedOnce();

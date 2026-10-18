@@ -481,6 +481,50 @@ static void CheckSparseDirectMemoryBacking() {
     Require(sceKernelReleaseDirectMemory(physical, size) == 0);
 }
 
+static void CheckSavedDirectMemorySurvivesCachePressure() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 0x200000;
+    std::array<std::int64_t, 18> retained{};
+    for (std::size_t index = 0; index < retained.size(); ++index) {
+        Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &retained[index]) == 0);
+        void* mapped = nullptr;
+        Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, retained[index], bytes) == 0);
+        std::memset(mapped, static_cast<int>(index + 1), bytes);
+        Require(sceKernelMunmap(mapped, bytes) == 0);
+    }
+    const auto temporary = [] {
+        constexpr std::size_t small = 0x10000;
+        for (unsigned char round = 1; round <= 24; ++round) {
+            std::int64_t physical = 0;
+            Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, small, 0, 0, &physical) == 0);
+            void* mapped = nullptr;
+            Require(sceKernelMapDirectMemory(&mapped, small, 3, 0, physical, 0) == 0);
+            auto* data = static_cast<unsigned char*>(mapped);
+            Require(std::all_of(data, data + small, [](unsigned char value) { return value == 0; }));
+            data[7] = round;
+            data[small - 1] = static_cast<unsigned char>(round + 0x40);
+            Require(sceKernelMunmap(mapped, small) == 0);
+            mapped = nullptr;
+            Require(sceKernelMapDirectMemory(&mapped, small, 3, 0, physical, 0) == 0);
+            data = static_cast<unsigned char*>(mapped);
+            for (std::size_t at = 0; at < small; ++at) Require(data[at] == (at == 7 ? round : at == small - 1 ? static_cast<unsigned char>(round + 0x40) : 0));
+            Require(sceKernelMunmap(mapped, small) == 0);
+            Require(sceKernelReleaseDirectMemory(physical, small) == 0);
+        }
+    };
+    temporary();
+    for (std::size_t index = 0; index < retained.size(); ++index) {
+        void* mapped = nullptr;
+        Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, retained[index], bytes) == 0);
+        const auto* data = static_cast<const unsigned char*>(mapped);
+        Require(std::all_of(data, data + bytes, [&](unsigned char value) { return value == index + 1; }));
+        Require(sceKernelMunmap(mapped, bytes) == 0);
+        Require(sceKernelReleaseDirectMemory(retained[index], bytes) == 0);
+    }
+    temporary();
+#endif
+}
+
 static void CheckReleaseDirectMemoryClearsMappings() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -2995,6 +3039,7 @@ int main(int argc, char** argv) {
     CheckMprotectIgnoresUndefinedBits();
     CheckDirectMemoryFollowsPhysicalPages();
     CheckSparseDirectMemoryBacking();
+    CheckSavedDirectMemorySurvivesCachePressure();
     CheckReleaseDirectMemoryClearsMappings();
     CheckReleaseDirectMemoryRejectsInvalidRanges();
     CheckFixedMappingReplacesPartialOverlap();

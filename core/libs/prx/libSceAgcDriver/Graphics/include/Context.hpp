@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -132,6 +133,18 @@ inline std::uint64_t& DeviceProcLookups() {
 }
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
+
+inline VkMemoryPropertyFlags SnapshotMemoryProperties(const VkPhysicalDeviceMemoryProperties& memory, bool disabled) {
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr VkMemoryPropertyFlags bar = host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    constexpr VkDeviceSize ResizableBarBytes = VkDeviceSize{4} << 30u;
+    if (disabled) return host;
+    for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const auto& type = memory.memoryTypes[i];
+        if ((type.propertyFlags & bar) == bar && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size >= ResizableBarBytes) return bar;
+    }
+    return host;
+}
 
 struct Context {
     VkDevice device;
@@ -259,6 +272,11 @@ struct Context {
     TFunction Resolved(TFunction DeviceFunctions::*member, const char* name) const {
         if (functions != nullptr && functions->*member != nullptr) return functions->*member;
         return Function<TFunction>(name);
+    }
+
+    VkMemoryPropertyFlags SnapshotProperties() const {
+        static const bool disabled = std::getenv("APS5_NO_BAR_SNAPSHOTS") != nullptr;
+        return SnapshotMemoryProperties(memory, disabled);
     }
 
     std::uint32_t MemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {

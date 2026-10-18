@@ -1540,6 +1540,31 @@ BufferWriteCounters& BufferWrites() {
     return counters;
 }
 
+enum class InPlaceSkip { MovedOnly, Written, PendingWriter, Budget, Count };
+
+struct InPlaceCounters {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(InPlaceSkip::Count)> skipped{};
+    std::atomic<std::uint64_t> fastReused{0};
+    std::atomic<std::uint64_t> slowReused{0};
+    std::atomic<std::uint64_t> copied{0};
+    std::atomic<std::uint64_t> copies{0};
+    std::array<std::atomic<std::uint64_t>, 3> uses{};
+    std::array<std::atomic<std::uint64_t>, 3> inPlace{};
+    std::array<std::atomic<std::uint64_t>, 3> snapshotted{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+InPlaceCounters& InPlace() {
+    static InPlaceCounters counters;
+    return counters;
+}
+
+thread_local std::uint64_t preparedSnapshotBytes = 0;
+
+void noteInPlaceSkip(InPlaceSkip reason, std::uint64_t bytes) {
+    InPlace().skipped[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
+}
+
 }
 
 double ShaderResources::phase(BuildPhase which) {
@@ -4983,6 +5008,8 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+    const bool profiled = BuildProfiled();
+    if (profiled) preparedSnapshotBytes = 0;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
@@ -5023,13 +5050,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
-            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            const auto readInPlace = [&] { return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; }); };
+            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) {
+                if (profiled && item.guest && readInPlace()) noteInPlaceSkip(movedOnly ? InPlaceSkip::MovedOnly : InPlaceSkip::Written, item.size);
+                continue;
+            }
+            const bool direct = readInPlace();
+            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
+                if (profiled && direct) noteInPlaceSkip(InPlaceSkip::PendingWriter, item.size);
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) {
+            if (profiled) noteInPlaceSkip(InPlaceSkip::Budget, bytes);
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
@@ -5046,6 +5083,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
+        if (profiled && buffer != nullptr) InPlace().fastReused.fetch_add(bytes, std::memory_order_relaxed);
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
@@ -5053,13 +5091,22 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
+                if (profiled) {
+                    InPlace().copied.fetch_add(bytes, std::memory_order_relaxed);
+                    InPlace().copies.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                if (profiled && buffer != nullptr) InPlace().slowReused.fetch_add(bytes, std::memory_order_relaxed);
                 if (buffer == nullptr) {
-                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.SnapshotProperties());
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                    if (profiled) {
+                        InPlace().copied.fetch_add(bytes, std::memory_order_relaxed);
+                        InPlace().copies.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
@@ -5068,6 +5115,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         selected.push_back(index);
         result->snapshots.push_back({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
+        if (profiled) preparedSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
@@ -5185,6 +5233,36 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     const auto elements = counters.elements.load();
     const auto readOnly = counters.readOnly.load();
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound (cumulative): %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
+}
+
+void ShaderResources::ProfileInPlace(bool dispatch) const {
+    if (!BuildProfiled()) return;
+    std::uint64_t total = 0;
+    for (const auto& [first, second] : guestMemory.InPlaceReads()) total += second - first;
+    const auto snapshot = std::exchange(preparedSnapshotBytes, 0);
+    const std::size_t kind = usesBda || HoldsLease() ? 2 : dispatch ? 1 : 0;
+    auto& counters = InPlace();
+    counters.uses[kind].fetch_add(1, std::memory_order_relaxed);
+    counters.inPlace[kind].fetch_add(total > snapshot ? total - snapshot : 0, std::memory_order_relaxed);
+    counters.snapshotted[kind].fetch_add(snapshot, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (last == 0) {
+        counters.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    constexpr double MiB = 1048576.0;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0, std::memory_order_relaxed)); };
+    const char* names[3] = {"draws", "dispatches", "address-based"};
+    std::string uses;
+    for (std::size_t i = 0; i < 3; ++i) {
+        char text[160];
+        std::snprintf(text, sizeof(text), " %s %.0f uses %.1f MiB in place %.1f MiB snapshotted;", names[i], take(counters.uses[i]), take(counters.inPlace[i]) / MiB, take(counters.snapshotted[i]) / MiB);
+        uses += text;
+    }
+    const auto copies = take(counters.copies);
+    AgcDriver::ProfilePrint_nid_no_patch("[inplace] 10 s:%s snapshots: new %.0f (%.1f MiB copied), reused %.1f MiB fast %.1f MiB slow; left in place by reason: moved-only %.1f MiB, written %.1f MiB, pending writer %.1f MiB, budget %.1f MiB\n", uses.c_str(), copies, take(counters.copied) / MiB, take(counters.fastReused) / MiB, take(counters.slowReused) / MiB, take(counters.skipped[0]) / MiB, take(counters.skipped[1]) / MiB, take(counters.skipped[2]) / MiB, take(counters.skipped[3]) / MiB);
 }
 
 void ShaderResources::CheckFaults() const {

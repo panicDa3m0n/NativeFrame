@@ -4686,6 +4686,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
+    resources.ProfileInPlace(true);
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.

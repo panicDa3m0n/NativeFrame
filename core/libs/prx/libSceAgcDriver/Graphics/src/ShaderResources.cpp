@@ -414,7 +414,28 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
+    bool perUseDepth = false;
+    std::array<std::uint32_t, 8> words{};
+    std::uint32_t wordCount = 0;
+    VkComponentMapping components{};
+    VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
 };
+
+bool PerUseDepthReuse() {
+    static const bool disabled = std::getenv("APS5_NO_PER_USE_DEPTH_REUSE") != nullptr;
+    return !disabled;
+}
+
+LookupRecord depthLookupRecord(const std::shared_ptr<Texture>& texture, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
+    LookupRecord record{texture.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true};
+    if (!texture->RefreshedPerUse() || words.size() > record.words.size()) return record;
+    record.perUseDepth = true;
+    std::copy(words.begin(), words.end(), record.words.begin());
+    record.wordCount = static_cast<std::uint32_t>(words.size());
+    record.components = components;
+    record.viewType = viewType;
+    return record;
+}
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
 
@@ -605,7 +626,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (resource.dimension == TextureDimension::k2DMsaa) {
         Require(!depthCompare, "native multisampled depth comparison sampling is not implemented");
         if (auto depth = DepthSurfaceTexture(context, words, resource, components, multisampleViewType)) {
-            logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+            logLookup(depthLookupRecord(depth, words, resource, components, multisampleViewType));
             return depth;
         }
         auto target = MultisampleTargetTexture(context, resource, components, multisampleViewType);
@@ -616,7 +637,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
-        logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
+        logLookup(depthLookupRecord(depth, words, resource, components, VK_IMAGE_VIEW_TYPE_2D));
         return depth;
     }
     const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
@@ -2327,7 +2348,10 @@ void ShaderResources::noteReusable() {
     reusable = false;
     directRegions.clear();
     if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        if (textures[i] == nullptr || !textures[i]->RefreshedPerUse()) continue;
+        if (!PerUseDepthReuse() || i >= validatedTextures.size() || !validatedTextures[i].valid || !validatedTextures[i].perUseDepth) return;
+    }
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
     if (!regions.has_value()) return;
@@ -2715,7 +2739,14 @@ void ShaderResources::captureValidation() {
     };
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
-        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
+        if (const auto* found = record(textures[i].get())) {
+            validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
+            validatedTextures[i].perUseDepth = found->perUseDepth;
+            validatedTextures[i].words = found->words;
+            validatedTextures[i].wordCount = found->wordCount;
+            validatedTextures[i].components = found->components;
+            validatedTextures[i].viewType = found->viewType;
+        }
     }
     lookupLog().clear();
 }
@@ -2772,7 +2803,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+            if (!depthStillServes(i)) return fail(FastFail::Depth);
             continue;
         }
         const auto address = surface.resource.baseAddress;
@@ -2892,13 +2923,21 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     return true;
 }
 
+bool ShaderResources::depthStillServes(std::size_t index) const {
+    const auto& surface = validatedTextures[index];
+    if (!surface.perUseDepth) return DepthSurfaceHolds(context, surface.resource, textures[index].get());
+    if (!PerUseDepthReuse()) return false;
+    const auto again = DepthSurfaceTexture(context, std::span<const std::uint32_t>(surface.words.data(), surface.wordCount), surface.resource, surface.components, surface.viewType);
+    return again != nullptr && again.get() == textures[index].get();
+}
+
 bool ShaderResources::fastRevalidateEach() {
     if (validatedTextures.size() != textures.size()) return false;
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return false;
         if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return false;
+            if (!depthStillServes(i)) return false;
             continue;
         }
         const auto address = surface.resource.baseAddress;

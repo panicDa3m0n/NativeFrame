@@ -485,7 +485,13 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        bool perUseDepth = false;
+        std::array<std::uint32_t, 8> words{};
+        std::uint32_t wordCount = 0;
+        VkComponentMapping components{};
+        VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
     };
+    bool depthStillServes(std::size_t index) const;
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for

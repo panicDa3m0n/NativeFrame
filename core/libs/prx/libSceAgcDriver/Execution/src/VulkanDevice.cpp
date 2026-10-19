@@ -3777,6 +3777,18 @@ bool DispatchMove() {
     return enabled;
 }
 
+bool DispatchSnapshots() {
+    static const bool enabled = std::getenv("APS5_NO_DISPATCH_SNAPSHOTS") == nullptr;
+    return enabled;
+}
+
+std::shared_ptr<Graphics::ShaderResources::DrawBindings> dispatchSnapshotBindings(const Graphics::ShaderResources& resources, Graphics::Recorder& recorder) {
+    if (!DispatchSnapshots()) return nullptr;
+    auto bindings = resources.PrepareDrawBindings(recorder);
+    if (bindings != nullptr && bindings->allocation.set == VK_NULL_HANDLE) bindings.reset();
+    return bindings;
+}
+
 std::size_t DispatchMoveBytes() {
     static const std::size_t bytes = [] {
         const char* text = std::getenv("APS5_DISPMOVE_MAX_KIB");
@@ -5017,6 +5029,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         }
     }
     resources->PatchPushConstants(pushBytes);
+    auto snapshotBindings = overlay == nullptr ? dispatchSnapshotBindings(*resources, *state->recorder) : nullptr;
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
     // the longest call.
@@ -5057,7 +5070,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
     record.resourceKeyMatched = fromCache;
-    record.bindings = overlay;
+    record.bindings = overlay != nullptr ? overlay : snapshotBindings;
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
@@ -5228,6 +5241,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     if (dataRefresh == RecordedDispatch::DataRefresh::Words) counters.refreshByWords.fetch_add(1, std::memory_order_relaxed);
     RecordedDispatch record{&context, &shaders[0], hit->resources, hit->objects, recipe.pushes ? VkShaderStageFlags{VK_SHADER_STAGE_COMPUTE_BIT} : VkShaderStageFlags{0}, &recipe.pushBytes, x, y, z, arguments, nullptr, programAddress, dataRefresh, recipe.dataWordsHash, 0, &timer};
     record.resourceKeyMatched = verify != nullptr;
+    record.bindings = dispatchSnapshotBindings(*hit->resources, *state->recorder);
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

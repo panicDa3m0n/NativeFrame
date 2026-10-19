@@ -1340,8 +1340,12 @@ std::shared_ptr<StorageTexture> memoizedResidentTarget(const Context& context, c
     const auto& memo = residentTargetMemo(color);
     if (memo.recorder == nullptr || memo.recorder != Recorder::Active() || memo.device != context.device || !SameColorTarget(memo.color, color)) return {};
     if (memo.generation != GuestMemory::TrackerGeneration() || memo.epoch != GuestMemory::CollectEpoch() || memo.pending != StorageTexture::PendingSerial() || memo.cache != StorageCacheSerial()) return {};
-    if (PendingCpuWritesPossible(context)) return {};
-    return memo.resident.lock();
+    auto resident = memo.resident.lock();
+    if (resident == nullptr) return {};
+    const auto& descriptor = resident->Descriptor();
+    const auto bytes = static_cast<std::size_t>(resident->GuestBytes());
+    if (PendingCpuWritesOverlap(context, descriptor.baseAddress, bytes) || (descriptor.dccAddress != 0 && PendingCpuWritesOverlap(context, descriptor.dccAddress, DccKeyBytes(bytes)))) return {};
+    return resident;
 }
 
 void verifyResidentTarget(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& memoized, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {

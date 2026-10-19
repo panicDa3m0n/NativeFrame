@@ -115,7 +115,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+        if (!store.has_value() && opcode == 0x50) store = Pm4::ResolveGdsStore(packet, gpuStoreLimit);
+        if (store.has_value()) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 

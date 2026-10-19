@@ -135,6 +135,7 @@ struct StoreWrite {
     std::span<const std::byte> Bytes() const { return ownedBytes.empty() ? viewBytes : std::span<const std::byte>(ownedBytes); }
 };
 std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit);
+std::optional<StoreWrite> ResolveGdsStore(std::span<const std::uint32_t> packet, std::size_t limit);
 struct MemoryCopy {
     std::uint64_t source;
     std::uint64_t destination;

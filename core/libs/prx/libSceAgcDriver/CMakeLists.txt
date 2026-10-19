@@ -433,6 +433,20 @@ if(BUILD_TESTING)
         set_tests_properties(agc_handoff_spin PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+
+    add_test_executable(agc_draw_prepare_tests tests/DrawPrepare.cpp Execution/src/Driver/Draw/DrawPrepare.cpp)
+    target_include_directories(agc_draw_prepare_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_draw_prepare_tests PRIVATE libc)
+    configure_windows_unwind(agc_draw_prepare_tests)
+    add_test(NAME agc_draw_prepare COMMAND agc_draw_prepare_tests)
+    add_test(NAME agc_draw_prepare_off COMMAND agc_draw_prepare_tests off)
+    set_tests_properties(agc_draw_prepare agc_draw_prepare_off PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_draw_prepare agc_draw_prepare_off PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    set_property(TEST agc_draw_prepare APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PARALLEL_DRAW_PREPARE=set:3")
+    set_property(TEST agc_draw_prepare_off APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PARALLEL_DRAW_PREPARE=unset:")
 endif()
 
 if(WIN32)

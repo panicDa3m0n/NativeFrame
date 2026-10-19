@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -926,7 +927,7 @@ struct PipelineStore {
         std::vector<std::byte> key;
         std::shared_ptr<Pipeline> pipeline;
     };
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     // Least recently used first.
     std::list<Entry> entries;
     std::unordered_map<std::uint64_t, std::list<Entry>::iterator> index;

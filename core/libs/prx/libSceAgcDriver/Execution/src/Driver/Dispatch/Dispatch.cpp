@@ -312,7 +312,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     if (readsClear) {
-        if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
+        static const bool templateItems = std::getenv("APS5_NO_PIPELINE_DISPATCH_TEMPLATES") == nullptr;
+        if (cached && keepVariant != nullptr && (templateItems || keepVariant->recipe.load(std::memory_order_acquire) != nullptr)) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;

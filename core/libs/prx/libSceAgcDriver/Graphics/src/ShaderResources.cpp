@@ -962,8 +962,11 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
     return cache.entries.end();
 }
 
+std::atomic<std::uint64_t> storageCacheSerial{1};
+
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    storageCacheSerial.fetch_add(1, std::memory_order_relaxed);
     auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
@@ -1069,6 +1072,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.entries.push_front(std::move(entry));
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
+            storageCacheSerial.fetch_add(1, std::memory_order_relaxed);
             texture->SetCached(true);
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
@@ -1326,6 +1330,10 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
 
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource) {
     return cachedStorageTexture(context, {}, resource, 0);
+}
+
+std::uint64_t StorageCacheSerial() {
+    return storageCacheSerial.load(std::memory_order_relaxed);
 }
 
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress) {
@@ -3079,6 +3087,11 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         }
     }
     return OwnRefreshFallback::Count;
+}
+
+bool PendingCpuWritesPossible(const Context& context) {
+    if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
+    return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {

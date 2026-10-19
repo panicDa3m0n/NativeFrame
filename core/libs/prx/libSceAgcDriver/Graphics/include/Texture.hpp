@@ -363,6 +363,7 @@ public:
     bool Refresh();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
+    static std::uint64_t RefreshesChanged();
     static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;

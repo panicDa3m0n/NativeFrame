@@ -300,6 +300,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_SYNC_SITES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | leaves only the per-source and per-thread sync counts, with no per-site attribution |
 | `APS5_NO_SYNC_THROUGH` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes every pending-write sync a full Sync instead of the targeted unlocked wait |
 | `APS5_NO_TABLE_REUSE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | disables reusing a materialized image table |
+| `APS5_NO_TARGET_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | looks every resident color target up again instead of reusing the previous lookup of its slot while the tracker generation, the collect epoch, the pending-image serial and the storage cache are unchanged and no copied writer or completion label is pending |
 | `APS5_NO_TARGET_WRITEBACK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | skips writing render targets back to guest memory after the draw |
 | `APS5_NO_TEMPLATE_DATA_REFRESH` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | keys the ShaderData and FlattenedSrt words into compute keys instead of refreshing a template's data buffers |
 | `APS5_NO_TEXTURE_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | builds every texture and storage-image object fresh instead of caching it |
@@ -429,6 +430,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_VERIFY_RECIPE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | makes the ordinary prepare path beside a recipe hit and compares the answers |
 | `APS5_VERIFY_REGISTER_KEYS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawRegisterKey.cpp` |  | checks the incremental register fingerprint against the full state |
 | `APS5_VERIFY_SET_LAYOUTS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | checks the draw's set layouts against those described from the shaders |
+| `APS5_VERIFY_TARGET_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | with the resident target memo on, runs the full target lookup beside every memo hit and stops at the first hit whose lookup returns another image or has to refresh it |
 | `APS5_WAIT_LOCK` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | always takes the GPU mutex on a wait (no unlocked label lookup) |
 | `APS5_WAIT_LOCK_ENTRY` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | takes the GPU mutex blocking on the entry instead of trying it |
 | `APS5_WATCH_MEMORY` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | watches named guest ranges (`<hex address>:<hex bytes>[,...]`) across dispatches; needs `APS5_SYNC_DISPATCH=1` |

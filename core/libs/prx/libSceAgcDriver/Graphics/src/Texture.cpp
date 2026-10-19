@@ -101,6 +101,7 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
+std::atomic<std::uint64_t> refreshesChanged{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> wholeSurfaceGathers{0}, wholeSurfaceShadowed{0};
 
@@ -2261,6 +2262,7 @@ bool StorageTexture::Refresh() {
     } else {
         uploadedKeys = keys;
     }
+    refreshesChanged.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
@@ -2318,6 +2320,10 @@ void StorageTexture::takeRefreshProof(bool aliased) {
 
 std::uint64_t StorageTexture::RefreshesProved() {
     return refreshesProved.load(std::memory_order_relaxed);
+}
+
+std::uint64_t StorageTexture::RefreshesChanged() {
+    return refreshesChanged.load(std::memory_order_relaxed);
 }
 
 std::uint64_t StorageTexture::UntrackedCompares() {

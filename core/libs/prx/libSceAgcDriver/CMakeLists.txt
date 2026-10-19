@@ -2241,6 +2241,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_depth_plane_reuse_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_resident_target_memo_off COMMAND agc_driver_resident_target_memo_tests)
+    set_tests_properties(agc_driver_resident_target_memo_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_TARGET_MEMO=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_resident_target_memo_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_pipelined_dispatch_moved_off COMMAND agc_driver_pipelined_dispatch_moved_tests)
     set_tests_properties(agc_driver_pipelined_dispatch_moved_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_DISPATCH_TEMPLATES=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)

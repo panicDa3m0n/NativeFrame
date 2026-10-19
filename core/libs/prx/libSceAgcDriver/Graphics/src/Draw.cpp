@@ -849,6 +849,16 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
     return *writers;
 }
 
+namespace {
+
+std::atomic<std::uint64_t> residentTargetMemoHits{0};
+
+}
+
+std::uint64_t ResidentTargetMemoHits() {
+    return residentTargetMemoHits.load(std::memory_order_relaxed);
+}
+
 const char* IndirectDrawPathName(IndirectDrawPath path) {
     return IndirectDrawPathNames[static_cast<std::size_t>(path)];
 }
@@ -1292,22 +1302,81 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
+bool TargetMemoEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_TARGET_MEMO") != nullptr;
+    return !disabled;
+}
+
+bool TargetMemoVerified() {
+    static const bool verify = std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr;
+    return verify;
+}
+
+bool SameColorTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.packing == b.packing && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.slot == b.slot && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.exportIndex == b.exportIndex && a.uintExport == b.uintExport && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples && a.dccControl == b.dccControl;
+}
+
+struct ResidentTargetMemo {
+    ColorTarget color{};
+    std::weak_ptr<StorageTexture> resident;
+    const Recorder* recorder = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t generation = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t cache = 0;
+};
+
+ResidentTargetMemo& residentTargetMemo(const ColorTarget& color) {
+    static std::array<ResidentTargetMemo, 8> memos;
+    return memos[color.slot % memos.size()];
+}
+
+std::shared_ptr<StorageTexture> memoizedResidentTarget(const Context& context, const ColorTarget& color) {
+    const auto& memo = residentTargetMemo(color);
+    if (memo.recorder == nullptr || memo.recorder != Recorder::Active() || memo.device != context.device || !SameColorTarget(memo.color, color)) return {};
+    if (memo.generation != GuestMemory::TrackerGeneration() || memo.epoch != GuestMemory::CollectEpoch() || memo.pending != StorageTexture::PendingSerial() || memo.cache != StorageCacheSerial()) return {};
+    if (PendingCpuWritesPossible(context)) return {};
+    return memo.resident.lock();
+}
+
+void verifyResidentTarget(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& memoized, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+    const auto changed = StorageTexture::RefreshesChanged();
+    auto again = lookup();
+    if (again != nullptr) {
+        materializeRegisterClear(context, color, *again);
+        materializeCmaskClear(context, color, again);
+    }
+    Require(again == memoized && StorageTexture::RefreshesChanged() == changed, "APS5_VERIFY_TARGET_MEMO: a memoized resident target differs from the lookup's, or the lookup had to refresh it");
+}
+
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
-    std::shared_ptr<StorageTexture> resident;
-    try {
-        resident = lookup();
-        if (resident != nullptr) materializeRegisterClear(context, color, *resident);
-    } catch (const std::exception& error) {
-        static AgcDriver::Mutex reportMutex;
-        static std::set<std::uint64_t> reported;
-        std::lock_guard lock(reportMutex);
-        if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
+    const bool memoized = TargetMemoEnabled() && GuestMemory::GpuMutex().HeldByThisThread();
+    std::shared_ptr<StorageTexture> resident = memoized ? memoizedResidentTarget(context, color) : nullptr;
+    if (resident != nullptr) {
+        resident->NoteProved();
+        residentTargetMemoHits.fetch_add(1, std::memory_order_relaxed);
+        if (TargetMemoVerified()) verifyResidentTarget(context, color, resident, lookup);
+    } else {
+        try {
+            resident = lookup();
+            if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        } catch (const std::exception& error) {
+            static AgcDriver::Mutex reportMutex;
+            static std::set<std::uint64_t> reported;
+            std::lock_guard lock(reportMutex);
+            if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
+        }
+        if (resident != nullptr) materializeCmaskClear(context, color, resident);
+        if (memoized) {
+            if (resident != nullptr) residentTargetMemo(color) = {color, resident, Recorder::Active(), context.device, GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), StorageTexture::PendingSerial(), StorageCacheSerial()};
+            else residentTargetMemo(color) = {};
+        }
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident);
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;

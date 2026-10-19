@@ -1196,6 +1196,38 @@ ThreadCollectMemo& threadCollectMemo() {
     return *memo;
 }
 
+#ifdef _WIN32
+bool cleanMemoEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_CLEAN_COLLECT_MEMO") != nullptr;
+    return !disabled;
+}
+
+struct CleanCollectMemo {
+    struct Entry {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t serial = 0;
+        std::uint64_t unwatched = 0;
+    };
+    std::array<Entry, 1024> entries{};
+    static std::size_t SlotOf(std::uint64_t begin) {
+        return static_cast<std::size_t>(((begin >> 12) * 0x9e3779b97f4a7c15ull) >> 54);
+    }
+};
+
+CleanCollectMemo& threadCleanMemo() {
+    struct Slot {};
+    auto* memo = HostThreadSlot<CleanCollectMemo*, Slot>::Get();
+    if (memo == nullptr) {
+        ShaderRecompiler::ThreadOwned(memo);
+        HostThreadSlot<CleanCollectMemo*, Slot>::Set(memo);
+    }
+    return *memo;
+}
+
+std::atomic<std::uint64_t> cleanMemoHits{0}, cleanMemoEntries{0};
+#endif
+
 struct EpochCollectMap {
     std::uint64_t epoch = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
@@ -1328,6 +1360,16 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
+#ifdef _WIN32
+        if (cleanMemoEnabled()) {
+            const auto serial = GuestArena::GuestArenaCleanSerial_nid_postfix();
+            const auto& entry = threadCleanMemo().entries[CleanCollectMemo::SlotOf(first)];
+            if (entry.serial == serial && entry.unwatched == unwatched && entry.begin == first && stop <= entry.end) {
+                cleanMemoHits.fetch_add(1, std::memory_order_relaxed);
+                return tracker.generation.load(std::memory_order_relaxed);
+            }
+        }
+#endif
         for (const auto& entry : threadCollectMemo().entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
@@ -1341,6 +1383,16 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+#ifdef _WIN32
+    if (useMemo && !sharedCollectMemo() && cleanMemoEnabled()) {
+        std::uint64_t serial = 0;
+        if (GuestArena::GuestArenaRangeClean_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &serial)) {
+            threadCleanMemo().entries[CleanCollectMemo::SlotOf(first)] = {first, stop, serial, unwatched};
+            cleanMemoEntries.fetch_add(1, std::memory_order_relaxed);
+            return tracker.generation;
+        }
+    }
+#endif
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {

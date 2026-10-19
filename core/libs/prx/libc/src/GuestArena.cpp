@@ -416,6 +416,14 @@ bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t byt
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
 }
 
+std::uint64_t GuestArenaCleanSerial_nid_postfix() {
+    return WindowsMappings::Get().CleanSerial();
+}
+
+bool GuestArenaRangeClean_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial) {
+    return WindowsMappings::Get().RangeClean(address, bytes, serial);
+}
+
 bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear, WindowsMappings::Collection::Armed);
 }

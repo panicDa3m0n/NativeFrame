@@ -1737,6 +1737,38 @@ static void CheckCleanResidentPagesRearm() {
 #endif
 }
 
+static void CheckCleanSerialFollowsArmedRanges() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 0x100000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &physical) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, physical, bytes) == 0);
+    const auto base = reinterpret_cast<std::uintptr_t>(mapped);
+    const auto collect = [&](std::size_t offset, std::size_t length) {
+        std::array<void*, bytes / 4096> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(base + offset, length, pages.data(), &count, true));
+        return count;
+    };
+    std::uint64_t serial = 0;
+    Require(!GuestArena::GuestArenaRangeClean_nid_postfix(base, 0x40000, &serial));
+    Require(collect(0, 0x40000) == 0x40000 / 4096 && collect(0, 0x40000) == 0);
+    const bool armed = std::getenv("APS5_NO_RESIDENT_REARM") == nullptr;
+    Require(GuestArena::GuestArenaRangeClean_nid_postfix(base, 0x40000, &serial) == armed);
+    Require(!GuestArena::GuestArenaRangeClean_nid_postfix(base + 0x80000, 0x1000, &serial));
+    const auto before = GuestArena::GuestArenaCleanSerial_nid_postfix();
+    Require(collect(0, 0x40000) == 0 && GuestArena::GuestArenaCleanSerial_nid_postfix() == before);
+    static_cast<volatile unsigned char*>(mapped)[0x1000] = 5;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Require(GuestArena::GuestArenaCleanSerial_nid_postfix() == (armed ? before + 1 : before));
+    Require(!GuestArena::GuestArenaRangeClean_nid_postfix(base, 0x40000, &serial));
+    Require(collect(0, 0x40000) == 1);
+    Require(sceKernelMunmap(mapped, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, bytes) == 0);
+#endif
+}
+
 static void CheckImportAccessDoesNotInventSharedWrites() {
 #ifdef _WIN32
     constexpr std::size_t bytes = 0x100000;
@@ -3149,6 +3181,7 @@ int main(int argc, char** argv) {
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckLargeResidentWritesStopFaulting();
     CheckCleanResidentPagesRearm();
+    CheckCleanSerialFollowsArmedRanges();
     CheckImportAccessDoesNotInventSharedWrites();
     CheckResidentCollectPreservesPartialWrites();
     CheckResidentCollectionDuringHostWrites();

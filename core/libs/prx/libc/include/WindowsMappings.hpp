@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstddef>
@@ -208,6 +209,19 @@ public:
         protectSubpages(base, written, view.protection, "resume shared memory write");
         view.armed &= static_cast<std::uint8_t>(~written);
         return true;
+    }
+
+    std::uint64_t CleanSerial() const {
+        return cleanSerial.load(std::memory_order_acquire);
+    }
+
+    bool RangeClean(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial) {
+        std::lock_guard lock(mutex);
+        *serial = cleanSerial.load(std::memory_order_relaxed);
+        auto it = cleanRanges.upper_bound(address);
+        if (it == cleanRanges.begin()) return false;
+        --it;
+        return it->first <= address && it->second >= address + bytes;
     }
 
     bool HandleRead(std::uintptr_t address) {
@@ -865,6 +879,9 @@ private:
     }
 
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
+        auto it = cleanRanges.lower_bound(start);
+        if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
+        if (it != cleanRanges.end() && it->first < end) cleanSerial.fetch_add(1, std::memory_order_release);
         forget(cleanRanges, start, end);
     }
 
@@ -1047,6 +1064,7 @@ private:
     }
 
     Ranges cleanRanges;
+    std::atomic<std::uint64_t> cleanSerial{1};
     Ranges collectableRanges;
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;

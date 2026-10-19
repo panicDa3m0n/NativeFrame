@@ -35,6 +35,7 @@ public:
     static bool Sequencing();
 
     void Submit(Job job, std::vector<Range> earlyWrites);
+    void SubmitReady(std::function<void()> finish);
     bool IndirectRegistersConflict(std::span<const std::uint32_t> packet);
     void Flush(std::uint32_t reason = 0x200);
     bool Idle();

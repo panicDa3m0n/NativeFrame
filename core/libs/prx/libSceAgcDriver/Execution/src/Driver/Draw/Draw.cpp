@@ -203,10 +203,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     phaseTiming.Phase(DrawRowDecode);
     if (DrawPrepare::Threads() != 0) {
-        if (pipelined && !drawParameters.indirect && registerKey && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawRecipe() && !verifyDrawDataHits() && deferredLabels().labels.empty()) {
+        if (pipelined && !drawParameters.indirect && registerKey && !drawRelocationEnabled() && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawRecipe() && !verifyDrawDataHits() && deferredLabels().labels.empty()) {
             auto job = std::make_shared<ParallelDraw>();
             job->localDevice = localDevice;
-            job->submission = &submission;
+            job->submission.serial = submission.serial;
+            job->submission.queue = submission.queue;
+            job->submission.shaders = submission.shaders;
             job->decode = decode;
             job->programs = std::move(programs);
             job->pixel = pixel;
@@ -766,7 +768,7 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
     std::shared_lock<std::shared_mutex> patchLock(variantPatchMutex(), std::defer_lock);
     if (!synchronous) patchLock.lock();
     DrawPrepare::Prepared prepared;
-    const auto& submission = *input->submission;
+    const auto& submission = input->submission;
     auto localDevice = input->localDevice;
     auto decode = input->decode;
     const auto relocatedDecode = decode;

@@ -462,8 +462,12 @@ void Driver::execute(const Submission& submission) {
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
                 };
-                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
-                else seal();
+                const auto sealInOrder = [seal, pipelined] {
+                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
+                    else seal();
+                };
+                if (pipelined && DrawPrepare::Threads() != 0) DrawPrepare::Queue0().SubmitReady(sealInOrder);
+                else sealInOrder();
             }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
@@ -484,6 +488,7 @@ void Driver::execute(const Submission& submission) {
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
+    if (pipelined) DrawPrepare::Queue0().Flush(0x201);
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
         if (submission.rewindTail == nullptr) {

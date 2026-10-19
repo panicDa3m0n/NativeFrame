@@ -76,6 +76,20 @@ void DrawPrepare::Submit(Job job, std::vector<Range> earlyWrites) {
     if (profile) Report();
 }
 
+void DrawPrepare::SubmitReady(std::function<void()> finish) {
+    std::unique_lock orderLock(orderMutex);
+    if (order.empty()) {
+        orderLock.unlock();
+        finish();
+        return;
+    }
+    auto slot = std::make_shared<Slot>();
+    slot->prepared.finish = std::move(finish);
+    slot->readSerial = indirectSerial;
+    slot->ready = true;
+    order.push_back(std::move(slot));
+}
+
 void DrawPrepare::Flush(std::uint32_t reason) {
     if (Threads() == 0 || sequencingThread) return;
     std::lock_guard orderLock(orderMutex);

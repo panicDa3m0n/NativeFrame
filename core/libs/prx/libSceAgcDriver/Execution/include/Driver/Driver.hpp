@@ -171,7 +171,7 @@ private:
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
     struct ParallelDraw {
         std::shared_ptr<VulkanDevice> localDevice;
-        const Submission* submission = nullptr;
+        Submission submission{};
         std::shared_ptr<const DrawDecode> decode;
         std::vector<DrawProgram> programs;
         ShaderRecompiler::ShaderPixelStageInfo pixel;

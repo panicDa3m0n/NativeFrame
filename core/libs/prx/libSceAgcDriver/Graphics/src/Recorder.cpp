@@ -1490,21 +1490,22 @@ void Recorder::endOpenRenderPass(bool barrier) {
     pass = {};
 }
 
-void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
+void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end, std::uint32_t value) {
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
     keyStoreCount.fetch_add(1, std::memory_order_relaxed);
     if (seed != nullptr) open->kept.push_back(seed);
-    // The same range queued twice lands once: nothing wrote over it in between, or the writer
-    // would have recorded the first store first.
-    for (const auto& store : open->keyStores) {
+    // The same range queued twice lands once, with the later value: nothing wrote over it in
+    // between, or the writer would have recorded the first store first.
+    for (auto& store : open->keyStores) {
         if (store.buffer == buffer && store.first == first && store.last == last) {
+            store.value = value;
             keyStoresJoined.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
-    open->keyStores.push_back({buffer, first, last, std::move(seed), begin, end});
+    open->keyStores.push_back({buffer, first, last, std::move(seed), begin, end, value});
     if (KeyStoresEach()) recordKeyStores(false);
 }
 
@@ -1539,7 +1540,7 @@ void Recorder::recordKeyStores(bool forWriter) {
     for (const auto& store : stores) {
         const VkDeviceSize fillBegin = std::min((store.first + 3) & ~VkDeviceSize{3}, store.last);
         const VkDeviceSize fillEnd = std::max(store.last & ~VkDeviceSize{3}, fillBegin);
-        if (fillEnd > fillBegin) fill(commands, store.buffer, fillBegin, fillEnd - fillBegin, 0xffffffffu);
+        if (fillEnd > fillBegin) fill(commands, store.buffer, fillBegin, fillEnd - fillBegin, store.value);
         if (store.seed != nullptr) {
             VkBufferCopy copies[2];
             std::uint32_t copyCount = 0;

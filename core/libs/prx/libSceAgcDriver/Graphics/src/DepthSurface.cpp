@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -14,10 +15,12 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1214,10 +1217,86 @@ std::map<std::uint64_t, std::uint64_t>& htileReads() {
     return *reads;
 }
 
+// A uniform metadata fill the GPU stores (NoteDepthMetadataFill, after Driver::storeBufferFill
+// recorded it): `note` is the recorder's newest write note over the fill's range at that moment,
+// the fill's own. While it is the newest write pending over a target's HTILE, the words there are
+// `pattern`, and storeBackClearedHtile answers without waiting for the GPU to read them. Guarded
+// by htileReadsMutex.
+struct HtileFill {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint32_t pattern;
+    std::uint64_t note;
+    const Recorder* recorder;
+};
+
+std::vector<HtileFill>& htileFills() {
+    static auto* fills = new std::vector<HtileFill>();
+    return *fills;
+}
+
+// HTILE words storeBackClearedHtile stored through the GPU (the expanded words after a predicted
+// fill): while the recorder's newest write note over the range is still `note`, nothing wrote there
+// since. Guarded by htileReadsMutex.
+struct HtileGpuWords {
+    std::uint64_t note;
+    const Recorder* recorder;
+};
+
+std::map<std::uint64_t, HtileGpuWords>& htileGpuWords() {
+    static auto* words = new std::map<std::uint64_t, HtileGpuWords>();
+    return *words;
+}
+
 void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
     std::lock_guard lock(htileReadsMutex());
     auto& reads = htileReads();
     reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
+    auto& words = htileGpuWords();
+    words.erase(words.lower_bound(address), words.lower_bound(address + bytes));
+}
+
+// Debug aid: APS5_NO_HTILE_FILL_PREDICTION=1 reads every HTILE range a recorded GPU write is
+// pending over, waiting for the GPU, as before.
+bool htileFillPrediction() {
+    static const bool enabled = std::getenv("APS5_NO_HTILE_FILL_PREDICTION") == nullptr;
+    return enabled;
+}
+
+// APS5_PROFILE_DRAW: how storeBackClearedHtile answered over pending GPU writes ([htile-sync]).
+struct HtileSyncCounters {
+    std::atomic<std::uint64_t> predicted{0};
+    std::atomic<std::uint64_t> known{0};
+    std::atomic<std::uint64_t> waited{0};
+    std::atomic<std::uint64_t> waitedUs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+HtileSyncCounters& htileSync() {
+    static auto* counters = new HtileSyncCounters();
+    return *counters;
+}
+
+bool htileSyncProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+void reportHtileSync() {
+    auto& counters = htileSync();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (last == 0) {
+        counters.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto predicted = take(counters.predicted);
+    const auto known = take(counters.known);
+    const auto waited = take(counters.waited);
+    const auto waitedMs = static_cast<double>(take(counters.waitedUs)) / 1000.0;
+    std::fprintf(stderr, "[htile-sync] 10 s: HTILE reads over pending GPU writes answered from a recorded fill %llu, from stored words %llu, by waiting %llu (%.1f ms)\n", predicted, known, waited, waitedMs);
 }
 
 bool RoutesToNativeDepthOwner(const DepthTarget& target) {
@@ -1228,19 +1307,78 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
     return std::ranges::any_of(depthGuards(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
 }
 
+// The HTILE words over pending GPU writes, when they are known without reading: the words this
+// function stored through the GPU and nothing wrote over since (0, as an unchanged range), or a
+// recorded uniform fill that is the newest write over the range (the fill's clears, with its
+// expanded words stored through the GPU behind it, in the batch's order). Under GuestMemory::GpuMutex.
+std::optional<VkImageAspectFlags> predictedHtile(const Context& context, Recorder& recorder, const DepthTarget& target, std::size_t bytes, std::uint64_t collected) {
+    const auto htile = target.htileAddress;
+    const auto newest = recorder.NewestWriteNote(htile, bytes);
+    std::optional<HtileFill> fill;
+    {
+        std::lock_guard lock(htileReadsMutex());
+        if (const auto found = htileGpuWords().find(htile); found != htileGpuWords().end() && found->second.recorder == &recorder && found->second.note == newest) {
+            htileSync().known.fetch_add(1, std::memory_order_relaxed);
+            return VkImageAspectFlags{0};
+        }
+        for (auto entry = htileFills().rbegin(); entry != htileFills().rend(); ++entry) {
+            if (entry->recorder == &recorder && entry->address <= htile && htile + bytes <= entry->address + entry->bytes) {
+                fill = *entry;
+                break;
+            }
+        }
+    }
+    if (!fill || fill->note == 0 || fill->note != newest) return std::nullopt;
+    const auto writes = recorder.PendingWritesOver(htile, bytes);
+    const bool fillIsNewest = std::any_of(writes.begin(), writes.end(), [&](const Recorder::PendingWrite& write) { return write.note == fill->note && write.begin == fill->address && write.end == fill->address + fill->bytes; });
+    if (!fillIsNewest) return std::nullopt;
+    // Every word is the pattern: uniform, so the read path's slice condition holds.
+    const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(fill->pattern, target.htileStencil);
+    auto generation = collected;
+    auto note = fill->note;
+    if (cleared != 0) {
+        const auto* import = HostImportFor(context, htile, bytes);
+        if (import == nullptr) return std::nullopt;
+        const VkDeviceSize first = HostImportOffset(*import, htile);
+        const VkDeviceSize last = first + bytes;
+        if ((first & 3u) != 0 || (last & 3u) != 0) return std::nullopt;
+        recorder.QueueKeyStore(import->buffer, first, last, nullptr, htile, htile + bytes, expandedHtileWord(fill->pattern, target.htileStencil, cleared));
+        const std::array ranges{std::pair{htile, htile + static_cast<std::uint64_t>(bytes)}};
+        recorder.NotePendingWrites(ranges);
+        GuestMemory::MarkWritten(htile, bytes);
+        note = recorder.NewestWriteNote(htile, bytes);
+        generation = GuestMemory::CollectWrites(htile, bytes);
+    }
+    std::lock_guard lock(htileReadsMutex());
+    htileReads()[htile] = generation;
+    htileGpuWords()[htile] = {note, &recorder};
+    htileSync().predicted.fetch_add(1, std::memory_order_relaxed);
+    return cleared;
+}
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
     auto* recorder = RecorderFor(context);
-    if (recorder == nullptr || !recorder->PendingWriteOverlaps(target.htileAddress, bytes)) {
+    const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
+    const bool profiled = htileSyncProfiled();
+    if (profiled) reportHtileSync();
+    if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+    } else if (htileFillPrediction()) {
+        if (const auto known = predictedHtile(context, *recorder, target, bytes, collected)) return *known;
     }
+    const auto readStart = pending && profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
+    if (pending && profiled) {
+        htileSync().waited.fetch_add(1, std::memory_order_relaxed);
+        htileSync().waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - readStart).count()), std::memory_order_relaxed);
+    }
     const bool uniform = std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == words.front(); });
     VkImageAspectFlags cleared = target.firstSlice == 0 || uniform ? VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u) : 0u;
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
@@ -1685,6 +1823,15 @@ std::optional<float> DepthFillValue(std::uint32_t pattern, bool d16) {
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(surfacesMutex());
     forgetHtileReads(address, bytes);
+    {
+        auto* recorder = Recorder::Active();
+        const auto note = recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0;
+        std::lock_guard fillsLock(htileReadsMutex());
+        auto& fills = htileFills();
+        std::erase_if(fills, [&](const HtileFill& fill) { return fill.address < address + bytes && address < fill.address + fill.bytes; });
+        fills.push_back({address, bytes, pattern, note, recorder});
+        if (fills.size() > 64) fills.erase(fills.begin());
+    }
     for (const auto& surface : surfaces()) {
         if (!surface->active->load(std::memory_order_acquire)) continue;
         const auto& target = surface->target;

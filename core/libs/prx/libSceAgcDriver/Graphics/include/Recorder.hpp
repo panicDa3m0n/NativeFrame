@@ -74,9 +74,12 @@ public:
     // label store (RecordStore), or before a command that writes or reads a queued range (the
     // fill must precede a later key writer or reader in the batch: FlushKeyStores by the callers
     // that know their ranges). `seed` (kept) supplies an
-    // unaligned head or tail; [begin, end) is the guest range. Debug aid: APS5_DCC_KEYS_EACH=1
-    // records every store at once, as before (QueueKeyStore then records and returns).
-    void QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end);
+    // unaligned head or tail; [begin, end) is the guest range. `value` is the 32-bit word the fill
+    // repeats (0xffffffff for DCC keys; another value needs a 4-byte aligned range and no seed, as
+    // the expanded HTILE words of DepthSurface.cpp storeBackClearedHtile). Debug aid:
+    // APS5_DCC_KEYS_EACH=1 records every store at once, as before (QueueKeyStore then records and
+    // returns).
+    void QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end, std::uint32_t value = 0xffffffffu);
     bool HasQueuedKeyStores() const { return open != nullptr && !open->keyStores.empty(); }
     bool QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether `overlaps(begin, end)` holds for a queued store's range.
@@ -659,6 +662,7 @@ private:
             std::shared_ptr<void> seed;
             std::uint64_t begin;
             std::uint64_t end;
+            std::uint32_t value = 0xffffffffu;
         };
         std::vector<KeyStore> keyStores;
     };

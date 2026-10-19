@@ -4623,14 +4623,14 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                     recorder->Keep(piece.source);
                     stagingSources().device.fetch_add(length, std::memory_order_relaxed);
                 } else {
-                    CopyBuffer(context, commands, copySource, copyOffset + offset, region->buffer->Handle(), offset, length);
+                    CopyHostBuffer(context, commands, copySource, copyOffset + offset, region->buffer->Handle(), offset, length);
                     if (inputSnapshot == nullptr) recorder->NotePendingRead(piece.begin, static_cast<std::size_t>(length), Recorder::ReadKind::GpuCopy);
                     importBytes += length;
                 }
                 copiedBytes += length;
             }
         } else {
-            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+            CopyHostBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
             if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
             copiedBytes += bytes;
         }
@@ -4714,7 +4714,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
             // would have stored there itself had the range been bindable.
-            CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            CopyHostBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {

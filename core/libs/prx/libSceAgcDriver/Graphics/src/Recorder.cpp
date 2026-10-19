@@ -1404,6 +1404,10 @@ std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
     return pendingWrites.load(std::memory_order_acquire);
 }
 
+bool Recorder::ReadAwaitsGpuWork(std::uint64_t address, std::size_t bytes) {
+    return (!QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes)) || SnapshotWriteOverlaps(address, bytes);
+}
+
 bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
     return AgcDriver::Graphics::SnapshotOverlaps(snapshot, address, bytes);
 }

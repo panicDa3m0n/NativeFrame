@@ -142,6 +142,8 @@ struct MemoryCopy {
     std::size_t bytes;
 };
 std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet);
+std::optional<MemoryCopy> DecodeCopyToGds(std::span<const std::uint32_t> packet);
+std::optional<MemoryCopy> DecodeCopyFromGds(std::span<const std::uint32_t> packet);
 std::uint32_t DmaSource(std::span<const std::uint32_t> packet);
 std::uint32_t DmaDestination(std::span<const std::uint32_t> packet);
 inline constexpr std::uint32_t DmaSelectGds = 1;

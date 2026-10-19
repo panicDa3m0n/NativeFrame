@@ -115,8 +115,16 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit);
-        if (!store.has_value() && opcode == 0x50) store = Pm4::ResolveGdsStore(packet, gpuStoreLimit);
+        static const bool pendingDmaOnGpu = std::getenv("APS5_NO_PENDING_DMA_ON_GPU") == nullptr;
+        const auto memoryCopy = [&]() -> std::optional<Pm4::MemoryCopy> {
+            if (opcode != 0x50 || !pendingDmaOnGpu) return std::nullopt;
+            if (auto copy = Pm4::DecodeMemoryCopy(packet)) return copy;
+            if (auto copy = Pm4::DecodeCopyToGds(packet)) return copy;
+            return Pm4::DecodeCopyFromGds(packet);
+        }();
+        const bool sourcePending = memoryCopy.has_value() && Graphics::Recorder::ReadAwaitsGpuWork(memoryCopy->source, memoryCopy->bytes);
+        auto store = sourcePending ? std::optional<Pm4::StoreWrite>{} : Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+        if (!store.has_value() && !sourcePending && opcode == 0x50) store = Pm4::ResolveGdsStore(packet, gpuStoreLimit);
         if (store.has_value()) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
@@ -150,8 +158,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
         }
         if (drained && opcode == 0x50) {
-            const auto copy = Pm4::DecodeMemoryCopy(packet);
-            if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+            const auto copy = sourcePending ? memoryCopy : Pm4::DecodeMemoryCopy(packet);
+            if (copy.has_value() && (copy->bytes > gpuStoreLimit || sourcePending) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 if (const auto localDevice = device.Load()) {

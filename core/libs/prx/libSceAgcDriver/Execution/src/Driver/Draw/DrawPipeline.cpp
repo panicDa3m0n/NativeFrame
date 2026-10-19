@@ -199,6 +199,7 @@ void DrawPipeline::run() {
         }
         retire(std::move(done));
     }
+    runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void DrawPipeline::retire(Item&& item) {
@@ -227,7 +228,6 @@ void DrawPipeline::reap() {
         }
         batch.clear();
     }
-    runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void DrawPipeline::Stop() {

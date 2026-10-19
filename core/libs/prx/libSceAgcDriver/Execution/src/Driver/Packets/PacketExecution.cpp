@@ -244,7 +244,7 @@ void Driver::execute(const Submission& submission) {
             const bool indirectRegisters = !special && (opcode == 0x63 || opcode == 0x64 || opcode == 0x9f);
             if (indirectRegisters ? DrawPrepare::Queue0().IndirectRegistersConflict(packet) : special || !DrawPrepare::Transparent(packet, header, opcode)) DrawPrepare::Queue0().Flush(header == FlipPacketHeader ? 0x1ffu : opcode);
         }
-        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
+        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;

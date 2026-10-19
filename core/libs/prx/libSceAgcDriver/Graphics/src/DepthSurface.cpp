@@ -1821,11 +1821,19 @@ std::optional<float> DepthFillValue(std::uint32_t pattern, bool d16) {
 }
 
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+    auto* recorder = Recorder::Active();
+    std::uint64_t note = 0;
+    if (recorder != nullptr) {
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            note = recorder->NewestWriteNote(address, bytes);
+        } else {
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            note = recorder->NewestWriteNote(address, bytes);
+        }
+    }
     std::lock_guard lock(surfacesMutex());
     forgetHtileReads(address, bytes);
     {
-        auto* recorder = Recorder::Active();
-        const auto note = recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0;
         std::lock_guard fillsLock(htileReadsMutex());
         auto& fills = htileFills();
         std::erase_if(fills, [&](const HtileFill& fill) { return fill.address < address + bytes && address < fill.address + fill.bytes; });

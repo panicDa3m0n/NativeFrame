@@ -235,6 +235,11 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (pipelined && DrawPrepare::Threads() != 0) {
+            const bool special = predicated || header == FlipPacketHeader || header == RenderingWaitPacketHeader;
+            const bool indirectRegisters = !special && (opcode == 0x63 || opcode == 0x64 || opcode == 0x9f);
+            if (indirectRegisters ? DrawPrepare::Queue0().IndirectRegistersConflict(packet) : special || !DrawPrepare::Transparent(packet, header, opcode)) DrawPrepare::Queue0().Flush(header == FlipPacketHeader ? 0x1ffu : opcode);
+        }
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);

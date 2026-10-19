@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepare.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -245,6 +246,7 @@ void DrawPipeline::Stop() {
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    if (Active() && !GuestMemory::GpuMutex().HeldByThisThread()) DrawPrepare::Queue0().Flush();
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();

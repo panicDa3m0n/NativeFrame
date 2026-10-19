@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepare.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -168,6 +169,23 @@ private:
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    struct ParallelDraw {
+        std::shared_ptr<VulkanDevice> localDevice;
+        const Submission* submission = nullptr;
+        std::shared_ptr<const DrawDecode> decode;
+        std::vector<DrawProgram> programs;
+        ShaderRecompiler::ShaderPixelStageInfo pixel;
+        Pm4::DrawParameters drawParameters;
+        std::uint64_t drawKey = 0;
+        std::uint64_t shapeKey = 0;
+        std::uint64_t drawIdentity = 0;
+        std::shared_ptr<DrawEntry> entry;
+        std::shared_ptr<DrawEntry> dataEntry;
+        std::vector<DrawUserPatch> userPatches;
+        std::uint32_t paClVsOutCntl = 0;
+        std::uint32_t commitPacket = 0;
+    };
+    DrawPrepare::Prepared prepareParallelDraw(const std::shared_ptr<ParallelDraw>& input, bool synchronous);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -191,6 +192,15 @@ public:
             return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
         }
         if (view.resident) {
+            const auto run = std::prev(residentRuns.upper_bound(base));
+            if (residentRearm() && run->second.writeObserved) {
+                protectSubpages(base, view.armed, view.protection, "resume a rearmed resident guest page");
+                view.armed = 0;
+                forgetClean(base, base + pageBytes);
+                view.cleanStreak = 0;
+                if (view.observedFaults < VolatileFaults) ++view.observedFaults;
+                return true;
+            }
             resumeResidentWrites(base);
             return true;
         }
@@ -556,6 +566,8 @@ private:
         bool resident = false;
         std::shared_ptr<Physical> slot;
         std::uint32_t hostImports = 0;
+        std::uint16_t cleanStreak = 0;
+        std::uint8_t observedFaults = 0;
     };
     struct Run {
         std::uintptr_t end;
@@ -573,16 +585,68 @@ private:
         return (run.collected[bit >> 6] >> (bit & 63) & 1) != 0;
     }
 
+    static bool residentRearm() {
+        static const bool disabled = std::getenv("APS5_NO_RESIDENT_REARM") != nullptr;
+        return !disabled;
+    }
+
+    static constexpr std::uint16_t RearmCollects = 64;
+    static constexpr std::uint8_t VolatileFaults = 2;
+
+    static bool freshInside(const Run& run, std::uintptr_t start, std::uintptr_t first, std::uintptr_t stop) {
+        for (auto at = first; at < stop; at += 4096) {
+            if (!runCollected(run, (at - start) >> 12)) return true;
+        }
+        return false;
+    }
+
+    std::vector<std::uintptr_t> rearmObserved(std::uintptr_t first, std::uintptr_t stop) {
+        std::vector<std::uintptr_t> rearmed;
+        for (auto it = views.lower_bound(first); it != views.end() && it->first + pageBytes <= stop; ++it) {
+            auto& view = it->second;
+            if (!view.resident || view.armed != 0 || view.observedFaults >= VolatileFaults || view.cleanStreak < RearmCollects) continue;
+            if (!writable(view.protection) || view.hostWrites != 0 || view.hostImports != 0 || view.page->pins != 0) continue;
+            DWORD previous;
+            const auto readOnly = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+            if (!VirtualProtect(reinterpret_cast<void*>(it->first), pageBytes, readOnly, &previous)) fail("rearm a clean resident guest page");
+            view.armed = allSubpages;
+            view.cleanStreak = 0;
+            rearmed.push_back(it->first);
+        }
+        return rearmed;
+    }
+
+    void noteObservedStreaks(std::uintptr_t first, std::uintptr_t stop, const std::vector<std::uintptr_t>& written) {
+        auto next = written.begin();
+        for (auto it = views.lower_bound(first); it != views.end() && it->first + pageBytes <= stop; ++it) {
+            auto& view = it->second;
+            while (next != written.end() && *next < it->first) ++next;
+            const bool wrote = next != written.end() && *next < it->first + pageBytes;
+            if (view.armed != 0) continue;
+            view.cleanStreak = wrote ? 0 : static_cast<std::uint16_t>(std::min<unsigned>(view.cleanStreak + 1u, 0xffffu));
+        }
+    }
+
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
-        const bool armed = clear && run.fresh == 0 && !run.writeObserved && collection != Collection::Fresh && run.end - start >= 0x40000 && armResident(first, stop);
+        const bool rearm = residentRearm();
+        const bool armable = clear && !run.writeObserved && collection != Collection::Fresh && run.end - start >= 0x40000 && (run.fresh == 0 || (rearm && !freshInside(run, start, first, stop)));
+        const bool armed = armable && armResident(first, stop);
+        const bool observed = rearm && clear && run.writeObserved && collection != Collection::Fresh;
+        const auto rearmed = observed ? rearmObserved(first, stop) : std::vector<std::uintptr_t>{};
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
+            if (observed) {
+                std::vector<std::uintptr_t> written(reported);
+                for (ULONG_PTR index = 0; index < reported; ++index) written[index] = reinterpret_cast<std::uintptr_t>(pages[*count + index]);
+                noteObservedStreaks(first, stop, written);
+            }
             *count += reported;
             if (armed) rememberClean(from, stop);
+            for (const auto page : rearmed) rememberClean(page, page + pageBytes);
             return;
         }
         std::vector<std::uintptr_t> written;
@@ -618,6 +682,9 @@ private:
             }
         }
         if (collection == Collection::Fresh) flushReset(stop);
+        if (observed) noteObservedStreaks(first, stop, written);
+        if (armed) rememberClean(from, stop);
+        for (const auto page : rearmed) rememberClean(page, page + pageBytes);
     }
 
     void resumeResidentWrites(std::uintptr_t address) {

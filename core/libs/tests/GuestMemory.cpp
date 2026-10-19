@@ -1676,6 +1676,67 @@ static void CheckLargeResidentWritesStopFaulting() {
 #endif
 }
 
+static void CheckCleanResidentPagesRearm() {
+#ifdef _WIN32
+    if (std::getenv("APS5_NO_RESIDENT_REARM") != nullptr) return;
+    constexpr std::size_t bytes = 0x200000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &physical) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, physical, bytes) == 0);
+    auto* data = static_cast<unsigned char*>(mapped);
+    const auto collect = [&](std::size_t offset, std::size_t length) {
+        std::array<void*, bytes / 4096> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapped) + offset, length, pages.data(), &count, true));
+        return count;
+    };
+    const auto protection = [&](std::size_t offset) {
+        MEMORY_BASIC_INFORMATION memory{};
+        Require(VirtualQuery(data + offset, &memory, sizeof(memory)) == sizeof(memory));
+        return memory.Protect;
+    };
+    Require(collect(0, 0x40000) == 0x40000 / 4096);
+    Require(collect(0, 0x40000) == 0);
+    Require(protection(0) == PAGE_READONLY && protection(0x3c000) == PAGE_READONLY);
+    Require(protection(0x100000) == PAGE_READWRITE);
+    const auto before = g_accessViolations;
+    const auto handler = AddVectoredExceptionHandler(1, CountAccessViolations);
+    Require(handler != nullptr);
+    static_cast<volatile unsigned char*>(mapped)[0x8000] = 1;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Require(g_accessViolations == before + 1);
+    Require(collect(0, 0x40000) == 1);
+    for (unsigned int round = 0; round < 70; ++round) {
+        static_cast<volatile unsigned char*>(mapped)[0x20000] = static_cast<unsigned char>(round);
+        Require(collect(0, 0x40000) == 1);
+    }
+    Require(g_accessViolations == before + 1);
+    Require(protection(0x8000) == PAGE_READONLY);
+    Require(protection(0x20000) == PAGE_READWRITE);
+    static_cast<volatile unsigned char*>(mapped)[0x8001] = 2;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Require(g_accessViolations == before + 2);
+    Require(data[0x8001] == 2);
+    Require(collect(0, 0x40000) == 1);
+    for (unsigned int round = 0; round < 70; ++round) Require(collect(0, 0x40000) == 0);
+    Require(protection(0x8000) == PAGE_READONLY);
+    static_cast<volatile unsigned char*>(mapped)[0x8002] = 3;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Require(g_accessViolations == before + 3);
+    Require(collect(0, 0x40000) == 1);
+    for (unsigned int round = 0; round < 70; ++round) Require(collect(0, 0x40000) == 0);
+    Require(protection(0x8000) == PAGE_READWRITE);
+    static_cast<volatile unsigned char*>(mapped)[0x8003] = 4;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    Require(g_accessViolations == before + 3);
+    Require(collect(0, 0x40000) == 1 && collect(0, 0x40000) == 0);
+    Require(RemoveVectoredExceptionHandler(handler));
+    Require(sceKernelMunmap(mapped, bytes) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, bytes) == 0);
+#endif
+}
+
 static void CheckImportAccessDoesNotInventSharedWrites() {
 #ifdef _WIN32
     constexpr std::size_t bytes = 0x100000;
@@ -3087,6 +3148,7 @@ int main(int argc, char** argv) {
     CheckFailedCollectKeepsWrites();
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckLargeResidentWritesStopFaulting();
+    CheckCleanResidentPagesRearm();
     CheckImportAccessDoesNotInventSharedWrites();
     CheckResidentCollectPreservesPartialWrites();
     CheckResidentCollectionDuringHostWrites();

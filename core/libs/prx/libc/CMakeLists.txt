@@ -8,6 +8,8 @@ if(BUILD_TESTING)
         foreach(mode 0 1 2)
             add_test(NAME windows_mappings_release_mismatch_${mode} COMMAND windows_mappings_release_tests ${mode})
         endforeach()
+        set_tests_properties(windows_mappings_release windows_mappings_release_mismatch_0 windows_mappings_release_mismatch_1 windows_mappings_release_mismatch_2 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
     add_test_executable(guest_binary_word_tests ${LIBS_INCLUDE_DIR}/tests/GuestBinaryWord.cpp)

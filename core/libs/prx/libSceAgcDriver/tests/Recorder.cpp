@@ -8508,6 +8508,156 @@ void integerClearTests(const Device& device) {
     std::cout << "integer storage clears: " << tested << " formats ok\n";
 }
 
+bool wholeSurfaceShadowTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    const bool on = std::getenv("APS5_NO_WHOLE_SURFACE_SHADOW") == nullptr;
+    constexpr std::size_t surfaceA = 256 * 256 * 4;
+    constexpr std::size_t bytes = 17u << 20u;
+    constexpr std::uint64_t offsetB = surfaceA - 0x2000;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: whole-surface shadow not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* memory = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(memory, 0x55, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the whole-surface shadow block refused: not tested\n";
+        return false;
+    }
+    if (!Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: whole-surface shadow not tested\n";
+        return false;
+    }
+    CollectWritesUncached(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto surface = [&](std::uint64_t at, std::uint32_t width, std::uint32_t height, TextureTileMode tileMode) {
+        GuestTextureResource resource{};
+        resource.baseAddress = at;
+        resource.width = width;
+        resource.height = height;
+        resource.mipCount = 1;
+        resource.tileMode = tileMode;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        return resource;
+    };
+    const auto resourceA = surface(address, 256, 256, TextureTileMode::kR64KBX);
+    const auto resourceB = surface(address + offsetB, 64, 64, TextureTileMode::kLinear);
+    const auto layoutB = DescribeSurface(resourceB);
+    const auto pitchB = layoutB.mips.front().pitchBytes;
+    Require(DescribeSurface(resourceA).guestBytes == surfaceA && offsetB + layoutB.guestBytes <= bytes && offsetB + 63 * pitchB > surfaceA, "the whole-surface shadow surfaces have unexpected sizes");
+    const auto fill = [&](const std::shared_ptr<StorageTexture>& image, std::uint32_t width, std::uint32_t height, std::uint32_t seed) {
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        auto texels = pattern->Bytes();
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) {
+                for (std::uint32_t c = 0; c < 4; ++c) texels[(static_cast<std::size_t>(y) * width + x) * 4 + c] = std::byte{static_cast<std::uint8_t>(x * 3 + y * 5 + c * 11 + seed)};
+            }
+        }
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        recorder.Keep(pattern);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, pattern->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    const auto readImage = [&](const std::shared_ptr<StorageTexture>& image, std::uint32_t width, std::uint32_t height) {
+        Buffer readback(context, static_cast<std::size_t>(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        const auto pixels = readback.Bytes();
+        return std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()), reinterpret_cast<const std::uint8_t*>(pixels.data()) + pixels.size());
+    };
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    const auto publishAll = [&] {
+        static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "whole-surface shadow test", PublishScope::Whole));
+        static_cast<void>(PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Hook));
+        settle();
+        return std::vector<std::uint8_t>(memory, memory + bytes);
+    };
+    const std::string what = on ? "whole-surface shadow" : "whole-surface shadow (off)";
+    {
+        auto imageA = StorageTexture::Create(context, detiler, resourceA, 0);
+        fill(imageA, 256, 256, 1);
+        auto imageB = StorageTexture::Create(context, detiler, resourceB, 0);
+        imageB->Refresh();
+        settle();
+        if (on) Require(std::all_of(memory + offsetB, memory + surfaceA, [](std::uint8_t value) { return value == 0x55; }), what + ": the linear surface's upload published the tiled image's results over its memory");
+        const auto texelsB = readImage(imageB, 64, 64);
+        const auto stored = publishAll();
+        for (std::uint32_t y = 0; y < 64; ++y) {
+            Require(std::memcmp(texelsB.data() + static_cast<std::size_t>(y) * 64 * 4, stored.data() + offsetB + y * pitchB, 64 * 4) == 0, what + ": the linear surface's row " + std::to_string(y) + " differs from the bytes its memory holds");
+        }
+        Require(std::any_of(stored.begin() + static_cast<std::ptrdiff_t>(offsetB), stored.begin() + static_cast<std::ptrdiff_t>(surfaceA), [](std::uint8_t value) { return value != 0x55; }), what + ": the tiled image's results never reached its memory");
+        fill(imageB, 64, 64, 7);
+        imageA->Refresh();
+        settle();
+        if (on) Require(std::memcmp(memory, stored.data(), bytes) == 0, what + ": the linear surface's write-back reached guest memory before anything read it");
+        const auto texelsA = readImage(imageA, 256, 256);
+        const auto written = publishAll();
+        std::vector<std::uint8_t> expected = stored;
+        for (std::uint32_t y = 0; y < 64; ++y) {
+            for (std::uint32_t x = 0; x < 64; ++x) {
+                for (std::uint32_t c = 0; c < 4; ++c) expected[offsetB + y * pitchB + x * 4 + c] = static_cast<std::uint8_t>(x * 3 + y * 5 + c * 11 + 7);
+            }
+        }
+        const auto mismatch = std::mismatch(written.begin(), written.end(), expected.begin());
+        Require(mismatch.first == written.end(), what + ": guest byte +" + std::to_string(mismatch.first - written.begin()) + " after the linear surface's write-back is wrong");
+        auto freshA = StorageTexture::Create(context, detiler, resourceA, 0);
+        freshA->Refresh();
+        settle();
+        Require(readImage(freshA, 256, 256) == texelsA, what + ": the tiled image refreshed over the linear surface's results differs from one uploaded from guest memory");
+    }
+    settle();
+    std::cout << what << ": ok\n";
+    return true;
+}
+
 void denormalClearTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -9066,6 +9216,17 @@ int main(int argc, char** argv) {
                 return 77;
             }
             if (!unitShadowTests(device, recorder)) {
+                std::cout << "skipped, the device does not import watched host memory for unit shadows\n";
+                return 77;
+            }
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--whole-surface-shadow-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            if (!wholeSurfaceShadowTests(device, recorder)) {
                 std::cout << "skipped, the device does not import watched host memory for unit shadows\n";
                 return 77;
             }

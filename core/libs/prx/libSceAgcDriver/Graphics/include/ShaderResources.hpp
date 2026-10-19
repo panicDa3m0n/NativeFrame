@@ -653,7 +653,9 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
+    static std::size_t Hash(const Key& key) noexcept;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
@@ -684,16 +686,27 @@ private:
     void noteEvicted(const Key& key);
     void noteReturn(const Key& key);
     void noteUse(const Key& key);
+    void noteUse(std::size_t hash);
+    void noteReturn(std::size_t hash);
+    std::shared_ptr<ShaderResources> found(const Key& key, std::size_t hash);
+    struct HashedKey {
+        const Key* key;
+        std::size_t hash;
+    };
     struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
-            return static_cast<std::size_t>(hash);
-        }
+        using is_transparent = void;
+        std::size_t operator()(const Key& key) const noexcept { return Hash(key); }
+        std::size_t operator()(const HashedKey& key) const noexcept { return key.hash; }
+    };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(const Key& left, const Key& right) const noexcept { return left == right; }
+        bool operator()(const HashedKey& left, const Key& right) const noexcept { return *left.key == right; }
+        bool operator()(const Key& left, const HashedKey& right) const noexcept { return left == *right.key; }
     };
     mutable std::mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    std::unordered_map<Key, decltype(entries)::iterator, KeyHash, KeyEqual> index;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

@@ -997,8 +997,11 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
         std::shared_ptr<DrawEntry> dataEntry;
         std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
         std::vector<StageDataHit> stageData;
+        std::optional<Graphics::PreparedDrawKey> preparedKey;
     };
-    auto held = std::make_shared<Held>(Held{input, std::move(localDevice), std::move(decode), relocatedDecode, drawParameters, std::move(stages), std::move(snapshots), std::move(recipe), std::move(recipeStages), drawKey, std::move(results), std::move(memory), std::move(linked), std::move(stageCaptures), std::move(matched), std::move(matchedRegions), std::move(fresh), std::move(decodeReads), std::move(shaderMemory), std::move(entry), std::move(dataEntry), std::move(compiledStages), std::move(stageData)});
+    std::optional<Graphics::PreparedDrawKey> preparedKey;
+    if (Graphics::PreparedDrawKeys() && std::all_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr; })) preparedKey = Graphics::PrepareDrawKey(localDevice->Device(), stages, static_cast<std::uint32_t>(graphics.colors.size()));
+    auto held = std::make_shared<Held>(Held{input, std::move(localDevice), std::move(decode), relocatedDecode, drawParameters, std::move(stages), std::move(snapshots), std::move(recipe), std::move(recipeStages), drawKey, std::move(results), std::move(memory), std::move(linked), std::move(stageCaptures), std::move(matched), std::move(matchedRegions), std::move(fresh), std::move(decodeReads), std::move(shaderMemory), std::move(entry), std::move(dataEntry), std::move(compiledStages), std::move(stageData), std::move(preparedKey)});
     const auto commitQueue = submission.queue;
     const auto commitPacket = input->commitPacket;
     prepared.finish = [this, held, commitQueue, commitPacket, writes = std::move(writes)]() mutable {
@@ -1006,13 +1009,13 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
         DrawPipeline::Queue0().Enqueue([this, held, commitQueue, commitPacket, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(held->localDevice, commitQueue, held->decode->state, held->drawParameters, held->stages, held->snapshots, held->recipe, held->recipeStages, held->drawKey);
+            commitDraw(held->localDevice, commitQueue, held->decode->state, held->drawParameters, held->stages, held->snapshots, held->recipe, held->recipeStages, held->drawKey, held->preparedKey ? &*held->preparedKey : nullptr);
         }, std::move(writes));
     };
     return prepared;
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const Graphics::PreparedDrawKey* prepared) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -1030,7 +1033,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

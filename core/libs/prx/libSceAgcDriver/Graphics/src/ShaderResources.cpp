@@ -3394,18 +3394,32 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
+std::size_t ResourceCache::Hash(const Key& key) noexcept {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
+    return static_cast<std::size_t>(hash);
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
+    return Find(key, Hash(key));
+}
+
+std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key, std::size_t hash) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
-    if (found == index.end()) {
-        noteReturn(key);
+    return found(key, hash);
+}
+
+std::shared_ptr<ShaderResources> ResourceCache::found(const Key& key, std::size_t hash) {
+    const auto entry = index.find(HashedKey{&key, hash});
+    if (entry == index.end()) {
+        noteReturn(hash);
         noteMiss(key);
         return nullptr;
     }
-    entries.splice(entries.begin(), entries, found->second);
-    noteUse(key);
-    return found->second->second;
+    entries.splice(entries.begin(), entries, entry->second);
+    noteUse(hash);
+    return entry->second->second;
 }
 
 void ResourceCache::noteEvicted(const Key& key) {
@@ -3433,8 +3447,12 @@ void ResourceCache::noteEvicted(const Key& key) {
 }
 
 void ResourceCache::noteUse(const Key& key) {
+    noteUse(Hash(key));
+}
+
+void ResourceCache::noteUse(std::size_t hash) {
     if (fixedCapacity || capacity <= baseEntries) return;
-    usedKeys.insert(KeyHash{}(key));
+    usedKeys.insert(hash);
     if (++usesSinceCheck < capacity * shrinkWindow) return;
     const auto used = usedKeys.size();
     const auto uses = usesSinceCheck;
@@ -3450,8 +3468,12 @@ void ResourceCache::noteUse(const Key& key) {
 }
 
 void ResourceCache::noteReturn(const Key& key) {
+    noteReturn(Hash(key));
+}
+
+void ResourceCache::noteReturn(std::size_t hash) {
     if (fixedCapacity) return;
-    const auto found = evictedKeys.find(KeyHash{}(key));
+    const auto found = evictedKeys.find(hash);
     if (found == evictedKeys.end()) return;
     evictedOrder.erase(found->second);
     evictedKeys.erase(found);

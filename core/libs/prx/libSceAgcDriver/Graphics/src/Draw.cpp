@@ -754,7 +754,7 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+ResourceCache::Key DrawResourceKeyFor(VkDevice device, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
     ResourceCache::Key key;
     key.reserve(256);
     key.push_back(0xffffffffu);
@@ -762,7 +762,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         key.push_back(static_cast<std::uint32_t>(value));
         key.push_back(static_cast<std::uint32_t>(value >> 32u));
     };
-    append64(reinterpret_cast<std::uint64_t>(context.device));
+    append64(reinterpret_cast<std::uint64_t>(device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     for (const auto& shader : shaders) {
         const auto at = key.size();
@@ -778,6 +778,15 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         append64(indexBytes);
     }
     return key;
+}
+
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+    return DrawResourceKeyFor(context.device, shaders, target, colorAttachments, indexAddress, indexBytes, ranges);
+}
+
+bool VerifyPreparedDrawKeys() {
+    static const bool verify = std::getenv("APS5_VERIFY_PREPARED_DRAW_KEYS") != nullptr;
+    return verify;
 }
 
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
@@ -1323,7 +1332,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDrawKey* prepared) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1339,8 +1348,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        const bool usePrepared = prepared != nullptr && trimKey;
+        if (usePrepared && VerifyPreparedDrawKeys()) {
+            const auto computed = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, false);
+            Require(computed == prepared->key && ResourceCache::Hash(computed) == prepared->hash, "APS5_VERIFY_PREPARED_DRAW_KEYS: a prepared draw resource key differs from the committer's");
+        }
+        if (usePrepared) resolved.contentKey = prepared->key;
+        else resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (auto cached = usePrepared ? SharedResourceCache().Find(resolved.contentKey, prepared->hash) : SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -2015,7 +2030,19 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+bool PreparedDrawKeys() {
+    static const bool enabled = std::getenv("APS5_NO_PREPARED_DRAW_KEYS") == nullptr && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    return enabled;
+}
+
+PreparedDrawKey PrepareDrawKey(VkDevice device, std::span<const CompiledShader> shaders, std::uint32_t colorAttachments) {
+    PreparedDrawKey prepared;
+    prepared.key = DrawResourceKeyFor(device, shaders, ColorTarget{}, colorAttachments, 0, 0, false);
+    prepared.hash = ResourceCache::Hash(prepared.key);
+    return prepared;
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDrawKey* prepared) {
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
@@ -2177,7 +2204,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {

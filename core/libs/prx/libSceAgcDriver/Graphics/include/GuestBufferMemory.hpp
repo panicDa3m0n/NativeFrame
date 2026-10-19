@@ -253,6 +253,12 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    struct StagingSourceStatistics {
+        std::uint64_t keptBytes;
+        std::uint64_t deviceBytes;
+        std::uint64_t importBytes;
+    };
+    static StagingSourceStatistics StagingSources();
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -290,6 +296,7 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    void NoteStagedCopies();
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -331,6 +338,12 @@ public:
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
 private:
+    struct StagedPiece {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::shared_ptr<Buffer> source;
+        std::uint64_t sourceBase;
+    };
     struct Region {
         std::uint64_t begin;
         std::uint64_t end;
@@ -383,7 +396,12 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        std::uint64_t copyInGeneration = 0;
+        std::uint64_t copyBackGeneration = 0;
+        bool planned = false;
+        std::vector<StagedPiece> plannedPieces {};
     };
+    void planStagingCopy(Region& region, bool copiedBack, std::span<const Buffer* const> own);
 
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };

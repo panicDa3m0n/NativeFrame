@@ -3872,6 +3872,105 @@ CopyStats& Copies() {
     return stats;
 }
 
+struct StagingSourceCounters {
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::uint64_t> device{0};
+    std::atomic<std::uint64_t> import{0};
+};
+
+StagingSourceCounters& stagingSources() {
+    static StagingSourceCounters counters;
+    return counters;
+}
+
+bool residentStaging() {
+    static const bool enabled = std::getenv("APS5_NO_RESIDENT_STAGING") == nullptr;
+    return enabled;
+}
+
+constexpr std::uint64_t StagingBlockBytes = 65536;
+constexpr std::size_t StagedCopyLimit = 16384;
+
+struct StagedCopy {
+    std::uint64_t end;
+    VkDevice device;
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t base;
+    std::uint64_t generation;
+};
+
+struct StagedSource {
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t base;
+    std::uint64_t generation;
+};
+
+struct StagedCopyRegistry {
+    std::mutex mutex;
+    std::map<std::uint64_t, StagedCopy> ranges;
+};
+
+StagedCopyRegistry& stagedCopies() {
+    static StagedCopyRegistry registry;
+    return registry;
+}
+
+void cutStagedCopies(std::map<std::uint64_t, StagedCopy>& ranges, std::uint64_t begin, std::uint64_t end) {
+    auto at = ranges.lower_bound(begin);
+    if (at != ranges.begin()) {
+        auto before = std::prev(at);
+        if (before->second.end > begin) {
+            const auto tail = before->second;
+            before->second.end = begin;
+            if (tail.end > end) ranges.emplace(end, tail);
+        }
+    }
+    at = ranges.lower_bound(begin);
+    while (at != ranges.end() && at->first < end) {
+        if (at->second.end > end) {
+            const auto rest = at->second;
+            ranges.erase(at);
+            ranges.emplace(end, rest);
+            break;
+        }
+        at = ranges.erase(at);
+    }
+}
+
+void noteStagedCopy(VkDevice device, std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, std::uint64_t base, std::uint64_t generation) {
+    auto& registry = stagedCopies();
+    std::lock_guard lock(registry.mutex);
+    cutStagedCopies(registry.ranges, begin, end);
+    if (registry.ranges.size() >= StagedCopyLimit) {
+        const auto oldest = std::min_element(registry.ranges.begin(), registry.ranges.end(), [](const auto& left, const auto& right) { return left.second.generation < right.second.generation; });
+        registry.ranges.erase(oldest);
+    }
+    registry.ranges.emplace(begin, StagedCopy{end, device, buffer, base, generation});
+}
+
+void forgetStagedCopies(std::span<const Buffer* const> buffers) {
+    auto& registry = stagedCopies();
+    std::lock_guard lock(registry.mutex);
+    std::erase_if(registry.ranges, [&](const auto& entry) { return std::find(buffers.begin(), buffers.end(), entry.second.buffer.get()) != buffers.end(); });
+}
+
+std::vector<StagedSource> stagedSourcesIn(VkDevice device, std::uint64_t begin, std::uint64_t end, std::span<const Buffer* const> own) {
+    std::vector<StagedSource> found;
+    auto& registry = stagedCopies();
+    std::lock_guard lock(registry.mutex);
+    auto at = registry.ranges.upper_bound(begin);
+    if (at != registry.ranges.begin()) --at;
+    for (; at != registry.ranges.end() && at->first < end; ++at) {
+        const auto& copy = at->second;
+        if (copy.end <= begin || copy.device != device) continue;
+        if (std::find(own.begin(), own.end(), copy.buffer.get()) != own.end()) continue;
+        found.push_back({std::max(begin, at->first), std::min(end, copy.end), copy.buffer, copy.base, copy.generation});
+    }
+    return found;
+}
+
 // A shadow the device cannot provide (device memory or the allocation count exhausted: every
 // shadow is its own VkDeviceMemory, retained by cached builds) is no error: nullptr, and the
 // region takes the path it would take without staging (Region::unstaged).
@@ -3904,14 +4003,18 @@ void reportStaging() {
     auto last = stats.lastStagingReport.load();
     if (nowMs - last < 10000 || !stats.lastStagingReport.compare_exchange_strong(last, nowMs)) return;
     // One reporter per period (the exchange above), so the previous totals need no lock.
-    static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0;
+    static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0, lastKept = 0, lastDevice = 0;
+    const auto kept = stagingSources().kept.load();
+    const auto device = stagingSources().device.load();
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back, %.0f KiB kept, %.0f KiB from device copies\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0, (kept - lastKept) / 1024.0, (device - lastDevice) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    lastKept = kept;
+    lastDevice = device;
 }
 
 }
@@ -3921,6 +4024,11 @@ void ShutdownGuestBufferWorkers() {
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
+    std::vector<const Buffer*> staged;
+    for (const auto& region : regions) {
+        if (region.gpuCopy && region.deviceLocal && region.buffer != nullptr) staged.push_back(region.buffer.get());
+    }
+    if (!staged.empty()) forgetStagedCopies(staged);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     // A staged region whose last use recorded its copy-in but no copy-back (the use threw before
@@ -4462,13 +4570,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
-        copiedBytes += bytes;
+        if (!region->planned) region->copyInGeneration = GuestMemory::TrackerGeneration();
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -4504,7 +4612,31 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
-        CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        std::uint64_t importBytes = bytes;
+        if (region->planned) {
+            importBytes = 0;
+            for (const auto& piece : region->plannedPieces) {
+                const auto offset = piece.begin - region->begin;
+                const auto length = piece.end - piece.begin;
+                if (piece.source != nullptr) {
+                    CopyBuffer(context, commands, piece.source->Handle(), piece.begin - piece.sourceBase, region->buffer->Handle(), offset, length);
+                    recorder->Keep(piece.source);
+                    stagingSources().device.fetch_add(length, std::memory_order_relaxed);
+                } else {
+                    CopyBuffer(context, commands, copySource, copyOffset + offset, region->buffer->Handle(), offset, length);
+                    if (inputSnapshot == nullptr) recorder->NotePendingRead(piece.begin, static_cast<std::size_t>(length), Recorder::ReadKind::GpuCopy);
+                    importBytes += length;
+                }
+                copiedBytes += length;
+            }
+        } else {
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+            if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+            copiedBytes += bytes;
+        }
+        if (region->deviceLocal) stagingSources().import.fetch_add(importBytes, std::memory_order_relaxed);
+        region->planned = false;
+        region->plannedPieces.clear();
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -4521,7 +4653,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
@@ -4535,7 +4666,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             if (region->deviceLocal) {
                 stagedAny = true;
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
+                Copies().stagedInBytes.fetch_add(importBytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -5105,6 +5236,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::vector<const Buffer*> own;
+    if (residentStaging()) {
+        for (const auto& region : regions) {
+            if (region.gpuCopy && region.deviceLocal && region.buffer != nullptr) own.push_back(region.buffer.get());
+        }
+    }
     std::vector<Region*> copies;
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
@@ -5113,13 +5250,101 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        region.planned = false;
+        region.plannedPieces.clear();
+        if (!own.empty() && region.buffer != nullptr) planStagingCopy(region, region.copiedBack, own);
         region.copiedBack = false;
+        if (region.planned && region.plannedPieces.empty()) continue;
         copies.push_back(&region);
     }
+    if (!own.empty()) forgetStagedCopies(own);
     if (copies.empty()) return;
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
     recordGpuCopies(copies, false);
+}
+
+void GuestBufferMemory::planStagingCopy(Region& region, bool copiedBack, std::span<const Buffer* const> own) {
+    constexpr auto Page = GuestMemory::StoredPageBytes;
+    const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+    static_cast<void>(GuestMemory::CollectWrites(region.begin, bytes));
+    const auto now = GuestMemory::TrackerGeneration();
+    const auto firstPage = region.begin / Page;
+    const auto pages = static_cast<std::size_t>((region.end - 1) / Page - firstPage + 1);
+    std::vector<std::uint8_t> stale(pages, 1);
+    if (copiedBack && region.copyInGeneration != 0 && region.copyBackGeneration != 0) {
+        const auto firstBlock = region.begin / StagingBlockBytes;
+        const auto blocks = static_cast<std::size_t>((region.end - 1) / StagingBlockBytes - firstBlock + 1);
+        const std::vector<std::uint64_t> sinceIn(blocks, region.copyInGeneration);
+        std::vector<std::uint8_t> anyIn(blocks), cpuIn(blocks);
+        if (GuestMemory::ChangedBlocks(region.begin, bytes, sinceIn, anyIn, cpuIn) && GuestMemory::StoredPagesSince(region.begin, bytes, region.copyBackGeneration, stale)) {
+            for (std::size_t page = 0; page < pages; ++page) {
+                if (cpuIn[static_cast<std::size_t>((firstPage + page) * Page / StagingBlockBytes - firstBlock)] != 0) stale[page] = 1;
+            }
+        } else {
+            std::fill(stale.begin(), stale.end(), std::uint8_t{1});
+        }
+    }
+    const auto pageBegin = [&](std::size_t page) { return std::max(region.begin, (firstPage + page) * Page); };
+    const auto pageEnd = [&](std::size_t page) { return std::min(region.end, (firstPage + page + 1) * Page); };
+    std::uint64_t kept = 0;
+    std::size_t page = 0;
+    while (page < pages) {
+        if (stale[page] == 0) {
+            kept += pageEnd(page) - pageBegin(page);
+            ++page;
+            continue;
+        }
+        auto stop = page;
+        while (stop < pages && stale[stop] != 0) ++stop;
+        const auto from = pageBegin(page);
+        const auto to = pageEnd(stop - 1);
+        auto cursor = from;
+        for (auto& source : stagedSourcesIn(context.device, from, to, own)) {
+            const auto sourceFirst = source.begin / Page;
+            std::vector<std::uint8_t> written(static_cast<std::size_t>((source.end - 1) / Page - sourceFirst + 1), 1);
+            if (!GuestMemory::StoredPagesSince(source.begin, static_cast<std::size_t>(source.end - source.begin), source.generation, written)) continue;
+            std::size_t at = 0;
+            while (at < written.size()) {
+                if (written[at] != 0) {
+                    ++at;
+                    continue;
+                }
+                auto last = at;
+                while (last < written.size() && written[last] == 0) ++last;
+                const auto validFrom = std::max(source.begin, (sourceFirst + at) * Page);
+                const auto validTo = std::min(source.end, (sourceFirst + last) * Page);
+                if (validFrom > cursor) region.plannedPieces.push_back({cursor, validFrom, nullptr, 0});
+                region.plannedPieces.push_back({validFrom, validTo, source.buffer, source.base});
+                cursor = validTo;
+                at = last;
+            }
+        }
+        if (cursor < to) region.plannedPieces.push_back({cursor, to, nullptr, 0});
+        page = stop;
+    }
+    region.copyInGeneration = now;
+    region.planned = true;
+    stagingSources().kept.fetch_add(kept, std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::NoteStagedCopies() {
+    if (!residentStaging() || !uploaded || committed) return;
+    const auto generation = GuestMemory::TrackerGeneration();
+    for (auto& region : regions) {
+        if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.buffer == nullptr) continue;
+        region.copyBackGeneration = generation;
+        for (const auto& [begin, end] : writes) {
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) noteStagedCopy(context.device, from, to, region.buffer, region.begin, generation);
+        }
+    }
+}
+
+GuestBufferMemory::StagingSourceStatistics GuestBufferMemory::StagingSources() {
+    auto& counters = stagingSources();
+    return {counters.kept.load(std::memory_order_relaxed), counters.device.load(std::memory_order_relaxed), counters.import.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes) {

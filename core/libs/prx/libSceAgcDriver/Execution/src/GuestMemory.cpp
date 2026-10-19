@@ -1720,6 +1720,61 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
     return false;
 }
 
+bool StoredPagesSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::span<std::uint8_t> stored) {
+    std::fill(stored.begin(), stored.end(), std::uint8_t{1});
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0 || !tracker.covers(address, bytes)) return false;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return false;
+#endif
+    const auto end = address + bytes;
+    const auto firstPage = address / WritePageBytes;
+    const auto mark = [&](std::uint64_t from, std::uint64_t to, bool value) {
+        for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
+            const auto index = page - firstPage;
+            if (index < stored.size()) stored[index] = value ? 1 : 0;
+        }
+    };
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(end - 1);
+    for (auto block = first; block <= last; ++block) {
+        const auto begin = tracker.blockBegin(block);
+        const auto from = std::max(address, begin);
+        const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes);
+        if (tracker.stampOf(block) <= generation) {
+            mark(from, to, false);
+            continue;
+        }
+        bool cpuPrecise = false;
+        if (const auto found = tracker.cpuPages.find(block); found != tracker.cpuPages.end()) {
+            cpuPrecise = true;
+        } else if (tracker.cpuStampOf(block) > generation) {
+            continue;
+        }
+        const auto found = tracker.driverPieces.find(block);
+        if (found == tracker.driverPieces.end()) continue;
+        const auto& entry = found->second;
+        if (entry.whole > generation || entry.dropped > generation) continue;
+        mark(from, to, false);
+        if (cpuPrecise) {
+            const auto& pages = tracker.cpuPages.find(block)->second.pages;
+            for (auto page = (from - begin) / WritePageBytes; page <= (to - 1 - begin) / WritePageBytes; ++page) {
+                if (pages[page] > generation) mark(begin + page * WritePageBytes, begin + (page + 1) * WritePageBytes, true);
+            }
+        }
+        for (const auto& piece : entry.pieces) {
+            if (piece.generation <= generation || piece.end <= piece.begin) continue;
+            const auto pieceFrom = std::max(from, begin + piece.begin);
+            const auto pieceTo = std::min(to, begin + piece.end);
+            if (pieceFrom < pieceTo) mark(pieceFrom, pieceTo, true);
+        }
+    }
+    return true;
+}
+
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();

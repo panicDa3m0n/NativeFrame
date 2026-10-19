@@ -29,6 +29,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -187,6 +188,12 @@ constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
 constexpr std::uint32_t SampleDumpPushBytes = 40;
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
+std::atomic<std::uint64_t> snapshotRefreshes{0}, snapshotRefreshCompared{0}, snapshotRefreshCopied{0};
+
+bool SnapshotShadows() {
+    static const bool enabled = std::getenv("APS5_NO_SNAPSHOT_SHADOW") == nullptr;
+    return enabled;
+}
 
 struct SamplePoolCache {
     VkDevice device;
@@ -2686,29 +2693,73 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     differing.clear();
     spans.clear();
     const bool sole = entry.buffer.use_count() == 1;
+    const bool deviceLocal = (entry.buffer->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    std::byte* const shadow = deviceLocal ? entry.shadow.get() : nullptr;
+    std::byte* const base = shadow != nullptr ? shadow : held.data();
+    const bool compared = !deviceLocal || shadow != nullptr;
     GuestMemory::ChangedBlocks(address, bytes, generations, changed);
+    std::uint64_t spanned = 0;
     for (std::size_t k = 0; k < count; ++k) {
         if (changed[k] == GuestMemory::BlockUnchanged) continue;
         const auto from = std::max(address, aligned + k * block);
         const auto to = std::min(end, aligned + (k + 1) * block);
         const auto offset = static_cast<std::size_t>(from - address);
-        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+        spans.push_back({base + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+        spanned += to - from;
     }
     equal.assign(spans.size(), 0);
-    if ((entry.buffer->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) CompareSpans(spans, equal);
+    if (compared) CompareSpans(spans, equal);
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;
-        const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
+        const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - base);
         const auto length = spans[k].bytes;
         if (!sole) return false;
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    std::uint64_t copied = 0;
+    for (const auto& [offset, length] : differing) {
+        const auto* guest = reinterpret_cast<const std::byte*>(address + offset);
+        if (shadow != nullptr) {
+            std::memcpy(shadow + offset, guest, length);
+            std::memcpy(held.data() + offset, shadow + offset, length);
+        } else {
+            std::memcpy(held.data() + offset, guest, length);
+        }
+        copied += length;
+    }
+    snapshotRefreshes.fetch_add(1, std::memory_order_relaxed);
+    if (compared) snapshotRefreshCompared.fetch_add(spanned, std::memory_order_relaxed);
+    snapshotRefreshCopied.fetch_add(copied, std::memory_order_relaxed);
     return true;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+std::shared_ptr<std::byte[]> Recorder::FillDrawSnapshot(Buffer& buffer, std::uint64_t address, std::size_t bytes) {
+    const auto held = buffer.Bytes();
+    const auto* guest = reinterpret_cast<const std::byte*>(address);
+    const auto copied = std::min(bytes, held.size());
+    if ((buffer.Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && SnapshotShadows() && copied == held.size() && copied != 0) {
+        std::shared_ptr<std::byte[]> shadow;
+        try {
+            shadow = std::make_shared_for_overwrite<std::byte[]>(copied);
+        } catch (const std::bad_alloc&) {
+            shadow.reset();
+        }
+        if (shadow != nullptr) {
+            std::memcpy(shadow.get(), guest, copied);
+            std::memcpy(held.data(), shadow.get(), copied);
+            return shadow;
+        }
+    }
+    std::memcpy(held.data(), guest, copied);
+    return {};
+}
+
+Recorder::SnapshotRefreshStatistics Recorder::SnapshotRefreshes() {
+    return {snapshotRefreshes.load(std::memory_order_relaxed), snapshotRefreshCompared.load(std::memory_order_relaxed), snapshotRefreshCopied.load(std::memory_order_relaxed)};
+}
+
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::shared_ptr<std::byte[]> shadow) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
@@ -2723,7 +2774,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, std::move(shadow)});
     } catch (...) {
         pool.recency.pop_back();
         throw;

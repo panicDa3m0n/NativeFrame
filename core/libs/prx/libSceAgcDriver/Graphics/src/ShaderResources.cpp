@@ -5117,8 +5117,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (profiled && buffer != nullptr) InPlace().slowReused.fetch_add(bytes, std::memory_order_relaxed);
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.SnapshotProperties());
-                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                    auto shadow = Recorder::FillDrawSnapshot(*buffer, begin, bytes);
+                    recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, std::move(shadow));
                     if (profiled) {
                         InPlace().copied.fetch_add(bytes, std::memory_order_relaxed);
                         InPlace().copies.fetch_add(1, std::memory_order_relaxed);
@@ -5286,7 +5286,10 @@ void ShaderResources::ProfileInPlace(bool dispatch) const {
         uses += text;
     }
     const auto copies = take(counters.copies);
-    AgcDriver::ProfilePrint_nid_no_patch("[inplace] 10 s:%s snapshots: new %.0f (%.1f MiB copied), reused %.1f MiB fast %.1f MiB slow; left in place by reason: moved-only %.1f MiB, written %.1f MiB, pending writer %.1f MiB, budget %.1f MiB\n", uses.c_str(), copies, take(counters.copied) / MiB, take(counters.fastReused) / MiB, take(counters.slowReused) / MiB, take(counters.skipped[0]) / MiB, take(counters.skipped[1]) / MiB, take(counters.skipped[2]) / MiB, take(counters.skipped[3]) / MiB);
+    static Recorder::SnapshotRefreshStatistics reported{};
+    const auto refreshed = Recorder::SnapshotRefreshes();
+    AgcDriver::ProfilePrint_nid_no_patch("[inplace] 10 s:%s snapshots: new %.0f (%.1f MiB copied), reused %.1f MiB fast %.1f MiB slow (%llu refreshes compared %.1f MiB, copied %.1f MiB); left in place by reason: moved-only %.1f MiB, written %.1f MiB, pending writer %.1f MiB, budget %.1f MiB\n", uses.c_str(), copies, take(counters.copied) / MiB, take(counters.fastReused) / MiB, take(counters.slowReused) / MiB, static_cast<unsigned long long>(refreshed.refreshes - reported.refreshes), (refreshed.comparedBytes - reported.comparedBytes) / MiB, (refreshed.copiedBytes - reported.copiedBytes) / MiB, take(counters.skipped[0]) / MiB, take(counters.skipped[1]) / MiB, take(counters.skipped[2]) / MiB, take(counters.skipped[3]) / MiB);
+    reported = refreshed;
 }
 
 void ShaderResources::CheckFaults() const {

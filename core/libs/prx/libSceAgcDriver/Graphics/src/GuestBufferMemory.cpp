@@ -3792,7 +3792,7 @@ VkBufferUsageFlags gpuCopyUsage(bool addressable) {
 // byte the shader leaves alone must hold the import's bytes), bound in the import's place, and
 // copied back by RecordCopyBacks after the work, with the pending-write note and the direct-write
 // marks of an in-place write. Only builds whose every use records the work and calls
-// RecordCopyBacks take it (dispatches, see AllowDeviceStaging; a synchronous draw would store the
+// RecordCopyBacks take it (dispatches and recorded draws, see AllowDeviceStaging; a synchronous draw would store the
 // staging bytes from the CPU, which a device-local buffer cannot serve), and never address-based
 // ones (their pointers read the import in place, and AddressRanges needs a device address). The
 // shadow is per use, not resident: a reused build records its copy-in anew (RecordStagingCopies).

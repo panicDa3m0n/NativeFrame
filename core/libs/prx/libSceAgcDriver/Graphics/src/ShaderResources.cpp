@@ -1404,8 +1404,21 @@ void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
     }
 }
 
-ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots) : context(context), guestMemory(context) {
+namespace {
+
+bool DrawStagingEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_STAGING") == nullptr;
+    return enabled;
+}
+
+}
+
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool recorded) : context(context), guestMemory(context) {
     drawBuild = true;
+    if (recorded && DrawStagingEnabled()) {
+        guestMemory.AllowDeviceStaging();
+        drawStaging = true;
+    }
     prepareAddressBindings(shaders, snapshots);
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }

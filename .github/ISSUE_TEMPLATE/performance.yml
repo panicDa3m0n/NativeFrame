@@ -1,65 +1,66 @@
 name: Performance report
-description: A slow scene or a change in speed, measured with a performance trace so that reports can be compared.
+description: A measured frame time, a slow scene, or a change in speed between two commits or two switch settings.
 title: "perf: "
+labels: [performance]
 body:
   - type: markdown
     attributes:
       value: |
-        Capture the scene with `APS5_TRACE_FRAMES=<start>:<count>` (presents; `APS5_TRACE_SECONDS=<start>:<length>` also works), as described under [Performance trace](https://github.com/boykopovar/AnyPS5/blob/main/docs/dev/BUILD.md#performance-trace). It writes `aps5-trace-<commit>-<pid>.json.gz` and appends one line to `aps5-summary.jsonl`.
+        Reports are useful only when they can be compared. Please follow the procedure in [docs/research/test-bench.md](../blob/main/docs/research/test-bench.md):
 
         - Run the scene once and restart the title, so the shader and pipeline caches are warm.
-        - Use the same scene, window, resolution and settings for every capture you compare.
-        - Set no other `APS5_TRACE_*` or `APS5_PROFILE_*` switch and do not redirect the log; they cost time.
-        - Capture the base and the change on the same machine in the same session.
-
-        A trace holds timings, scope and thread names and counts, no game data. The summary line names the GPU, driver and OS.
+        - Measure the **real frame time** with `APS5_PRESENT_RATE` and **no** profiler (`APS5_PROFILE_DRAW` and `APS5_PROFILE_GPU` cost several milliseconds per frame). Profiles are welcome as a second, separate run, to show *where* the time goes.
+        - Compare on the same machine, scene and settings, in the same session; for a switch, on the same binary. Base, change, base again (A-B-A) is best.
+        - Performance traces (`aps5-trace-*.json.gz`) and summary lines (`aps5-summary.jsonl`) hold timings and counts only and may be attached. **Never attach frame captures (RenderDoc, Nsight, PIX), memory or shader dumps, or game files.**
   - type: input
     id: scene
     attributes:
       label: Title and scene
-      description: Title ID and what the window covers (menu, level, position, cutscene).
-      placeholder: PPSA01325, main menu after the intro
+      description: Title name and ID, and what the measurement covers (level, position, how long after loading).
+      placeholder: Example Game (PPSA01234), first level, standing at the start for 150 s
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and software
+      description: CPU, GPU, GPU driver version, RAM, OS version, resolution and window mode.
+    validations:
+      required: true
+  - type: textarea
+    id: runs
+    attributes:
+      label: Measured frames
+      description: One line per run, in the order they were run. Commit, every `APS5_*` variable set, run length, mean frame time (ms) from `APS5_PRESENT_RATE`.
+      placeholder: |
+        A  1a2b3c4d5  APS5_PRESENT_RATE=1                          150 s  74.1 ms
+        B  1a2b3c4d5  APS5_PRESENT_RATE=1 APS5_NO_EXAMPLE=1        150 s  77.9 ms
+        A  1a2b3c4d5  APS5_PRESENT_RATE=1                          150 s  74.6 ms
+      render: text
     validations:
       required: true
   - type: textarea
     id: observed
     attributes:
-      label: What is slow or what changed
-      description: What you see (frame time, stutter, a phase that grew) and, for a comparison, the two commits.
+      label: What you observe
+      description: What is slow or what changed, and anything you noticed (stutter, CPU or GPU usage, which thread is busy).
     validations:
       required: true
   - type: textarea
-    id: summary
+    id: profile
     attributes:
-      label: Summary lines
-      description: The line of aps5-summary.jsonl for each capture. It holds the commit, the APS5_* switches, GPU, driver, OS, resolution and frame times.
-      render: json
-    validations:
-      required: true
-  - type: textarea
-    id: trace
-    attributes:
-      label: Traces
-      description: Attach each aps5-trace-<commit>-<pid>.json.gz (drag it into this field). They open in ui.perfetto.dev.
-    validations:
-      required: true
-  - type: textarea
-    id: digest
-    attributes:
-      label: Digest
-      description: The output of `python3 tools/trace_digest.py <trace>` (with `--stacks <file>.collapsed.txt` if you sampled the worker).
-  - type: textarea
-    id: stacks
-    attributes:
-      label: Worker stacks
-      description: Optional. The collapsed-stack file of APS5_SAMPLE_WORKER (<file stem>.collapsed.txt), attached. It opens in speedscope.app.
+      label: Profile (optional)
+      description: Output of a separate run with `APS5_PROFILE_DRAW` or `APS5_PROFILE_GPU`, `tools/trace_digest.py` output, or `APS5_SAMPLE_THREADS` collapsed stacks (attach the file).
+      render: text
   - type: checkboxes
     id: protocol
     attributes:
-      label: Capture
+      label: Protocol
       options:
-        - label: The caches were warm (the scene ran once and the title was restarted)
+        - label: Caches were warm (the scene ran once and the title was restarted)
           required: true
-        - label: No other APS5_TRACE_* or APS5_PROFILE_* switch was set and the log was not redirected
+        - label: Frame times above come from runs without a profiler
           required: true
-        - label: Captures compared here come from the same machine, scene and settings
+        - label: Runs compared here come from the same machine, scene and settings, in one session
+        - label: This report contains no frame captures, dumps or game files
+          required: true

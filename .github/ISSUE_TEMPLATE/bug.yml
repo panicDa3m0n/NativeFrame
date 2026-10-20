@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in NativeFrame behaves wrongly, crashes or fails to build.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never attach game files, executables, system libraries, memory or shader dumps, or frame captures.** Issues that contain them are deleted. Logs are fine once you have removed anything personal.
+
+        If the problem is a title that stops or misbehaves, use the **Title compatibility report** form instead. For a security problem, read SECURITY.md and do not open a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: Commands, settings and steps. For a build failure, the full configure and build commands.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: NativeFrame commit
+      description: Output of `git rev-parse --short HEAD`.
+      placeholder: 1a2b3c4d5
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System
+      description: OS and version, CPU, GPU, GPU driver version, toolchain (for build problems), and every `APS5_*` environment variable you set.
+      placeholder: |
+        Windows 11 24H2, Ryzen 7 7800X3D, RTX 4070, NVIDIA 616.64, WinLibs GCC 15.2.0 r7
+        APS5_PRESENT_RATE=1
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The relevant part of the log or of the error output, as text. Remove user names and paths you do not want to share.
+      render: text
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Rules
+      options:
+        - label: This issue contains no game files, executables, dumps or frame captures
+          required: true
+        - label: I use my own legally obtained copy of any game involved
+          required: true

@@ -1,0 +1,49 @@
+name: Technical proposal
+description: A design change, with the measurement that motivates it and a way to verify it.
+title: "proposal: "
+labels: [proposal]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Good proposals start from a measurement and end with a way to prove the change correct. See [docs/research](../blob/main/docs/research/README.md) for the current model and the open problems.
+
+        Cite public sources only: open-source projects (with file and commit), published ISA documents, Vulkan specifications, articles. **Never quote or link leaked or confidential SDK material.**
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and measurement
+      description: What costs time or breaks today, and how you know (numbers, profile, hardware).
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed design
+      description: What changes, in which components (worker, committer, recorder, memory tracker, recompiler...), and what stays the same.
+    validations:
+      required: true
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness
+      description: Which ordering or coherence rules the change relies on (CPU writes, GPU writes, labels, render passes), and what could go stale.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How to verify
+      description: The switch that turns it off, the test that should fail with a deliberate mistake, a verification mode if it skips work, and the measurement that decides whether to keep it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and prior art
+      description: Other designs you considered and how other open-source projects solve the same problem.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and costs
+      description: Memory, complexity, effects on other titles or other GPU vendors.

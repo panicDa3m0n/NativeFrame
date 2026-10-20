@@ -1,19 +1,20 @@
 ### What
 
+### Why
+<!-- The measurement or the problem that motivates the change. -->
+
 ### Tested
-<!-- OS, title or homebrew, what was checked. "Not tested" is a valid answer. A performance change: the summary lines of main and of this PR from the same machine and scene, with the traces attached, captured as the Performance report issue form describes. -->
+<!-- OS, CPU, GPU and driver; tests run and their result; the deliberate mistake the new test catches. For a performance change: real frame times (APS5_PRESENT_RATE, no profiler) with the switch off and on, same binary, same session, as CONTRIBUTING.md describes. "Not tested" is a valid answer. -->
 
 ### Checklist
-<!-- Rules behind each item: https://github.com/boykopovar/AnyPS5/blob/main/CONTRIBUTING.md -->
-- [ ] Based on current `main`; no other open PR implements the same functions
-- [ ] One topic per PR; follow-ups go in a new PR
-- [ ] No comments in code except [technical debt](https://github.com/boykopovar/AnyPS5/blob/main/docs/dev/CONVENTIONS.md)
-- [ ] Unimplemented paths throw (`NotImplemented_nid_no_patch`); silent stubs are listed under Silent stubs in their library's [technical debt](https://github.com/boykopovar/AnyPS5/tree/main/docs/dev/debt) file
-- [ ] No notes, investigation `.md` files or images added to the repository (attach them to this PR)
-- [ ] New third-party code is a submodule built from source
+<!-- Rules behind each item: CONTRIBUTING.md -->
+- [ ] One topic, based on current `main`
+- [ ] Code follows `docs/dev/CONVENTIONS.md`; unimplemented paths throw
 - [ ] Generic behaviour, not specific to one title
+- [ ] Performance change: behind an `APS5_NO_*` switch, documented in `docs/dev/ENVIRONMENT.md`, with a test that fails on a deliberate mistake
+- [ ] No game files, executables, dumps or frame captures in the repository or in this pull request
 - [ ] Depends on: <!-- #PR, or none -->
 - [ ] Fixes: <!-- issue it closes as Fixes #N, or none -->
-- [ ] Unblocks: <!-- title ID and Game bring-up discussion, e.g. PPSA01325 #3232, or none -->
-- [ ] GPUs tested: <!-- for AGC, shader recompiler or VideoOut changes: vendor, model, driver and OS of each GPU the GPU tests ran on; otherwise n/a -->
+- [ ] Unblocks: <!-- title ID and compatibility issue it moves forward, e.g. PPSA01234 #12, or none -->
+- [ ] GPUs tested: <!-- vendor, model, driver and OS for driver, recompiler or VideoOut changes; otherwise n/a -->
 - [ ] AI-assisted: <!-- yes / no -->

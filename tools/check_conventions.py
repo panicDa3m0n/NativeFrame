@@ -500,7 +500,7 @@ def allowed_notes(path):
         return path == "AGENTS.md"
     if p.suffix.lower() not in NOTES:
         return None
-    return path in ("README.md", "CONTRIBUTING.md") or p.parts[0] == ".github" or p.parts[:2] in (("docs", "dev"), ("docs", "user"))
+    return path in ("README.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md") or p.parts[0] == ".github" or p.parts[:2] in (("docs", "dev"), ("docs", "user"), ("docs", "research"))
 
 
 def python_comments(text):

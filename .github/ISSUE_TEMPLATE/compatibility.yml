@@ -1,0 +1,74 @@
+name: Title compatibility report
+description: How far a title gets with NativeFrame, on your hardware.
+title: "compat: <title name> (<title ID>)"
+labels: [compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One report per title and per significant change. **Never attach game files, executables, system libraries, memory or shader dumps, or frame captures.** Describe what you see in words; a log excerpt as text is fine.
+
+        NativeFrame does not provide and does not discuss ways to obtain or decrypt games. You need your own, legally obtained, unpacked copy.
+  - type: input
+    id: title
+    attributes:
+      label: Title
+      description: Name of the game, its title ID (the public catalog number, e.g. PPSA01234) and its version.
+      placeholder: Example Game, PPSA01234, version 01.002
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Furthest stage reached
+      options:
+        - Conversion fails
+        - Converts, but stops before the first frame
+        - Shows frames, stops before the menu
+        - Reaches the menu
+        - In game, with problems
+        - Playable
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What happens
+      description: Where it stops or what is wrong (missing function, error message, graphics or audio problem, input).
+    validations:
+      required: true
+  - type: input
+    id: fps
+    attributes:
+      label: Frame rate
+      description: If it runs, the mean frame time or frame rate in a named scene, measured with `APS5_PRESENT_RATE` and no profiler.
+      placeholder: about 70 ms per frame (14 FPS) in the first level, after the cutscene
+  - type: input
+    id: commit
+    attributes:
+      label: NativeFrame commit
+      placeholder: 1a2b3c4d5
+    validations:
+      required: true
+  - type: textarea
+    id: system
+    attributes:
+      label: System and switches
+      description: OS, CPU, GPU, GPU driver version, and every `APS5_*` environment variable you set.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: The last relevant lines of the log, as text (for a stop: the error and the lines before it).
+      render: text
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Rules
+      options:
+        - label: This report contains no game files, executables, dumps, frame captures or screenshots of game assets
+          required: true
+        - label: I use my own legally obtained copy of this title
+          required: true

@@ -29,6 +29,14 @@ class AgentFileTests(unittest.TestCase):
         self.assertTrue(allowed_notes("README.md"))
         self.assertIs(allowed_notes("core/x.cpp"), None)
 
+    def test_project_documents_are_allowed_and_notes_elsewhere_are_not(self):
+        for path in ("CODE_OF_CONDUCT.md", "SECURITY.md", "docs/research/cpu-chain.md"):
+            with self.subTest(path=path):
+                self.assertIs(allowed_notes(path), True)
+        for path in ("docs/research/CLAUDE.md", "docs/notes.md", "core/SECURITY.md", "investigation.md"):
+            with self.subTest(path=path):
+                self.assertIs(allowed_notes(path), False)
+
 
 if __name__ == "__main__":
     unittest.main()

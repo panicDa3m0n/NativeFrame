@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/panicDa3m0n/NativeFrame/security/advisories/new
+    about: Report vulnerabilities privately, as described in SECURITY.md.
+  - name: Problem that also happens in AnyPS5
+    url: https://github.com/boykopovar/AnyPS5
+    about: If the same problem happens with upstream AnyPS5, it belongs there too. Follow AnyPS5's own rules.

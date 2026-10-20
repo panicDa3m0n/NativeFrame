@@ -49,7 +49,7 @@ bool UnitShadowEnabled();
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
 // so the neighbours' results in the rest of the unit reach the import before the write stamps it).
 enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
-enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Count };
+enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Rehome, Border, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
@@ -127,6 +127,24 @@ struct ShadowDestination {
     std::shared_ptr<ShadowSlabPin> pin;
 };
 std::optional<ShadowDestination> ShadowDestinationFor(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
+// Range slabs (APS5_RANGE_SLABS, O16.T16, study scritture-gpu-vram.md section 3.2-3.3): a slab that
+// covers exactly the units of one buffer range the GPU writes, so a range of 12, 16 or 32 MiB binds
+// as one buffer. Every unit has one owner, its grid slab or one range slab (ShadowDestinationFor and
+// SlabBoundary follow the owner). A range slab is authoritative only for the merged guest ranges
+// written into it, and inside them only on the 4 KiB pages no store reached since their unit's
+// generation (GuestMemory::StoredPagesSince: the CPU wins the page, not the unit); a publish copies
+// exactly those bytes. RangeShadowDestination returns the destination of a writer of [begin, end):
+// in the range slab that already owns its units, or in a new one; a range overlapping other range
+// slabs makes one slab over all of them (their bytes copied device to device, then retired), and a
+// grid unit with results is published before a range slab takes it. `seedUnits` names the bytes of
+// [begin, end) outside the written ranges, which the caller seeds from the import before binding.
+// nullopt when APS5_RANGE_SLABS is unset or the budget refuses (the caller stages as before).
+bool RangeSlabsEnabled();
+std::optional<ShadowDestination> RangeShadowDestination(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
+// After a writer's MarkShadowed into range slabs: the first and last page of each range, when they
+// hold bytes outside it, publish their written bytes at once, so a store into those neighbours does
+// not take the GPU's bytes of the page with it (the units stay fresh). Returns the pieces copied.
+std::size_t PublishShadowBorders(const HostImport& import, std::span<const ShadowedRange> ranges);
 // A seed copy (import -> slab of a partly covered unit) the caller recorded: counted and traced.
 void NoteShadowSeed(std::uint64_t begin, std::uint64_t end);
 // The first slab boundary above `address` (a guest address inside the import).
@@ -135,7 +153,8 @@ std::uint64_t SlabBoundary(const HostImport& import, std::uint64_t address);
 VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::uint64_t address);
 // After a retile's copies were recorded: the units of `ranges` (guest) hold the newest bytes at
 // `generation`, unpublished. A unit whose slab is no longer the one the copies went into is not
-// marked (counted `slab lost`). Bumps StorageTexture's pending serial.
+// marked (counted `slab lost`). In a range slab the ranges join its written ranges. Bumps
+// StorageTexture's pending serial.
 void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation);
 // retireImport: publishes the fresh units whose memory `registered` still names as a readable
 // registered range into the (old) import buffer, hands the slabs to the batch and drops the shadow.

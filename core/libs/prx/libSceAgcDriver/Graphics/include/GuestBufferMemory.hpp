@@ -247,6 +247,10 @@ public:
     // calls RecordCopyBacks (a dispatch or a recorded draw), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    void AllowDrawStaging() {
+        stagingAllowed = true;
+        drawWindow = true;
+    }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
@@ -453,6 +457,7 @@ private:
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
+    bool drawWindow = false;
     bool adjustedRegions = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then

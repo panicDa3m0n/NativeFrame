@@ -115,6 +115,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_DRAW_CACHE_ENTRIES` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawCache.cpp` | 4096 | number of entries in the draw cache; 0 keeps the default 4096 |
 | `APS5_DRAW_DRAIN` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketMemory.cpp` |  | treats draw packets as drains, waiting for them instead of recording ahead |
 | `APS5_DRAW_KEY_ALL_USER_WORDS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawRegisterKey.cpp` |  | includes all 32 user words in a draw's register key instead of the used count |
+| `APS5_DRAW_SHADOW_MAX_KIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 16384 | upper bound in KiB of the written staging window for recorded draws (never below `APS5_WRITTEN_SHADOW_MAX_KIB`) |
 | `APS5_DRAW_SNAPSHOT_MAX_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 64 | upper bound in MiB on the snapshot bytes a draw's bindings may take |
 | `APS5_DRAW_TRANSITIONS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | keeps the per-draw upload and download barriers and layout transitions instead of the lean recorded path |
 | `APS5_DRAW_UPLOAD_MAX` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 4096 | largest draw snapshot in bytes copied into the per-recorder upload chunk; 0 turns the chunk off |

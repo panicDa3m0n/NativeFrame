@@ -194,6 +194,14 @@ void DrawPipeline::run() {
         try {
             const PerformanceTimer timing("DrawPipeline.Commit");
             if (commit != nullptr) (*commit)();
+            // APS5_COMMIT_DELAY_US (diagnostic, causal profiling): the committer spins this long after
+            // each commit, so the frame's growth per microsecond tells how much of it waits on the
+            // committer.
+            static const auto commitDelay = std::chrono::microseconds(std::getenv("APS5_COMMIT_DELAY_US") != nullptr ? std::strtoll(std::getenv("APS5_COMMIT_DELAY_US"), nullptr, 10) : 0);
+            if (commitDelay.count() > 0) {
+                const auto until = std::chrono::steady_clock::now() + commitDelay;
+                while (std::chrono::steady_clock::now() < until) {}
+            }
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

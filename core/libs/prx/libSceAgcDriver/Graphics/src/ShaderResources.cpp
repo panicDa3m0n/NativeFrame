@@ -5106,16 +5106,6 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
-namespace {
-// A moved data-word override (MovedReadOnlyBuffers) is copied into the recorder's draw upload ring like
-// a small snapshot, instead of a buffer of its own per draw (cached in movedWordBuffers, eight slots).
-// APS5_NO_DRAW_WORD_UPLOAD=1 makes the own buffers as before.
-bool WordUploads() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_WORD_UPLOAD") == nullptr;
-    return enabled;
-}
-}
-
 std::size_t ShaderResources::DrawUploadLimit() {
     static const std::size_t limit = [] {
         const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
@@ -5144,16 +5134,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            if (WordUploads()) {
-                auto slice = recorder.DrawUpload(override->size);
-                std::memcpy(slice.bytes, override->words.data(), override->size);
-                for (const auto& patch : dataPatches) {
-                    if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
-                }
-                selected.push_back(index);
-                result->snapshots.push_back({0, std::move(slice.buffer), slice.offset, override->size});
-                continue;
-            }
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
             std::shared_ptr<Buffer> buffer;

@@ -90,6 +90,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_CAPTURE_TRACE` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp` |  | writes capture events to capture-trace.log |
 | `APS5_CHECK_INDIRECT_ARGS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | reads GPU-side indirect draw records back on the CPU and prints the first ones |
 | `APS5_COLLECT_WINDOW_KIB` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` | 4 on Windows, 64 elsewhere | KiB of the aligned window a collect walks within a queue epoch, a power of two from 4 to 16384; later collects inside a walked window are answered by the epoch memo |
+| `APS5_COMMIT_HYSTERESIS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp` |  | a producer waiting for room in the draw pipeline waits until the queue is down to half its depth, and the committer wakes it only then (measured slower in Crash Site: the producer refills in bursts while the committer runs dry) |
 | `APS5_COMPLETION_STORE_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes a store made by a completion action wait for later batches over its range |
 | `APS5_COPY_DESTINATION_STRICT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | refuses a CPU copy whose destination has any pending writer, not only an unsettled one |
 | `APS5_COPY_HLE_CPU_MAX` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` | 262144 | largest copy in bytes the CPU side of the copy HLE handles |
@@ -190,7 +191,6 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_CLEAN_COLLECT_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | collects every range again in each epoch instead of answering ranges the guest arena reported clean and armed, while its clean serial is unchanged, without a walk |
 | `APS5_NO_CLEARED_VIEW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | keeps fast-cleared surfaces as CPU snapshots instead of viewing the cleared storage image |
 | `APS5_NO_COLLECT_MEMO` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | disables the per-thread memo of write-watch collects |
-| `APS5_NO_COMMIT_HYSTERESIS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp` |  | wakes a producer waiting for room in the draw pipeline at every commit instead of letting it wait until the queue is down to half its depth |
 | `APS5_NO_CONTEXT_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | rebuilds the Graphics::Context on every call instead of returning the cached one |
 | `APS5_NO_COPY_ALIAS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | keeps every device copy a transfer instead of aliasing the source storage image |
 | `APS5_NO_COPY_HLE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` |  | disables the copy-kernel HLE, so matching copies run as compute |
@@ -276,6 +276,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_PRESENT_EPOCH` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | keeps the presenter at collect epoch 0 instead of adopting the newest epoch a worker started |
 | `APS5_NO_PRESYNC` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | disables the stage-A pre-sync of pending writes |
 | `APS5_NO_PROC_TABLE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | resolves the device's Vulkan entry points per call instead of filling the function table once |
+| `APS5_NO_PRODUCER_SPIN` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp` |  | a producer that finds the draw pipeline full sleeps at once instead of spinning for room for the handoff window (APS5_HANDOFF_SPIN_US) first, so every commit that frees a slot wakes it |
 | `APS5_NO_QUEUED_LABELS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/DeferredLabels.cpp` |  | disables the queued-label table |
 | `APS5_NO_RECORDED_CLEAR` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | waits for a storage image's fast clear in a batch of its own instead of recording it |
 | `APS5_NO_RECORDER_SYNC_DRAWS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | gives the draws the recorder waits for their own batch instead of recording them with the wait |

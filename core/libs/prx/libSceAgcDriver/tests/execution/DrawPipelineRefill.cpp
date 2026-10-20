@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -34,21 +35,24 @@ int main() {
             std::puts("draw pipeline refill tests skipped (pipeline depth below 4)");
             return 0;
         }
-        const bool hysteresis = std::getenv("APS5_NO_COMMIT_HYSTERESIS") == nullptr;
+        const bool spin = std::getenv("APS5_NO_PRODUCER_SPIN") == nullptr && std::getenv("APS5_HANDOFF_SPIN_US") == nullptr && std::thread::hardware_concurrency() > 8;
+        const bool hysteresis = std::getenv("APS5_COMMIT_HYSTERESIS") != nullptr;
+        const auto commitTime = hysteresis ? std::chrono::microseconds(300) : std::chrono::microseconds(20);
         std::atomic<std::uint64_t> next{0};
         std::atomic<bool> ordered{true};
         const auto wakesBefore = pipeline.ProducerWakes();
         for (std::uint64_t index = 0; index < Commits; ++index) {
-            pipeline.Enqueue([&next, &ordered, index] {
+            pipeline.Enqueue([&next, &ordered, index, commitTime] {
                 if (next.fetch_add(1, std::memory_order_acq_rel) != index) ordered.store(false, std::memory_order_release);
-                hold(std::chrono::microseconds(300));
+                hold(commitTime);
             }, {});
         }
         pipeline.Drain(DrawPipeline::DrainReason::Packet);
         const auto wakes = pipeline.ProducerWakes() - wakesBefore;
         check(ordered.load(std::memory_order_acquire) && next.load(std::memory_order_acquire) == Commits, "commits ran out of order or were lost");
-        if (hysteresis) check(wakes <= Commits / 3, "a producer waiting for room was woken " + std::to_string(wakes) + " times for " + std::to_string(Commits) + " commits");
-        else check(wakes >= (Commits - depth) * 3 / 4, "APS5_NO_COMMIT_HYSTERESIS=1 woke the producer only " + std::to_string(wakes) + " times for " + std::to_string(Commits) + " commits");
+        if (hysteresis) check(wakes <= Commits / 3, "APS5_COMMIT_HYSTERESIS=1 woke a producer waiting for room " + std::to_string(wakes) + " times for " + std::to_string(Commits) + " commits");
+        else if (spin) check(wakes <= Commits / 4, "a producer spinning for room was still woken " + std::to_string(wakes) + " times for " + std::to_string(Commits) + " commits");
+        else check(wakes >= (Commits - depth) * 3 / 4, "APS5_NO_PRODUCER_SPIN=1 woke the producer only " + std::to_string(wakes) + " times for " + std::to_string(Commits) + " commits");
         std::printf("draw pipeline refill tests passed (%llu producer wakes for %llu commits)\n", static_cast<unsigned long long>(wakes), static_cast<unsigned long long>(Commits));
         return 0;
     } catch (const std::exception& error) {

@@ -44,7 +44,7 @@ std::size_t DrawPipeline::Depth() {
 }
 
 std::size_t DrawPipeline::RefillMark() {
-    static const std::size_t mark = std::getenv("APS5_NO_COMMIT_HYSTERESIS") != nullptr || Depth() == 0 ? (Depth() == 0 ? 0 : Depth() - 1) : Depth() / 2;
+    static const std::size_t mark = Depth() == 0 ? 0 : std::getenv("APS5_COMMIT_HYSTERESIS") != nullptr ? Depth() / 2 : Depth() - 1;
     return mark;
 }
 
@@ -111,9 +111,17 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() <= RefillMark(); });
-        --idleWaiters;
+        static const bool spin = std::getenv("APS5_NO_PRODUCER_SPIN") == nullptr;
+        if (spin) {
+            lock.unlock();
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) <= RefillMark(); });
+            lock.lock();
+        }
+        if (items.size() > RefillMark()) {
+            ++idleWaiters;
+            idle.wait(lock, [&] { return items.size() <= RefillMark(); });
+            --idleWaiters;
+        }
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }

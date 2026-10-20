@@ -161,6 +161,27 @@ public:
         return entries.size();
     }
 
+    std::shared_ptr<const VertexInputLayout> TryGetByShape(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+        if (attributes.empty()) return nullptr;
+        const auto key = shapeHash(attributes);
+        std::lock_guard lock(mutex);
+        const auto range = shapes.equal_range(key);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (!sameShape(attributes, it->second.shape)) continue;
+            ValidateVertexAddresses(attributes);
+            return it->second.layout;
+        }
+        if (shapes.size() >= capacity) return nullptr;
+        auto layout = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
+        shapes.emplace(key, ShapeEntry{layout, std::vector<ShaderRecompiler::VertexAttribute>(attributes.begin(), attributes.end())});
+        return layout;
+    }
+
+    std::size_t ShapeCount() const {
+        std::lock_guard lock(mutex);
+        return shapes.size();
+    }
+
 private:
     std::shared_ptr<const VertexInputLayout> get(std::uint64_t variant, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
         std::lock_guard lock(mutex);
@@ -200,6 +221,24 @@ private:
                 (x.resource.fields[1] & 0xffff0000u) == (y.resource.fields[1] & 0xffff0000u) && x.resource.fields[3] == y.resource.fields[3] && NullVertexDescriptor(x) == NullVertexDescriptor(y);
         });
     }
+    static std::uint64_t shapeHash(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+        std::uint64_t hash = 0xcbf29ce484222325ull;
+        const auto mix = [&hash](std::uint64_t value) {
+            hash ^= value;
+            hash *= 0x100000001b3ull;
+        };
+        for (const auto& attribute : attributes) {
+            mix(attribute.location);
+            mix(attribute.components);
+            mix(attribute.formatComponents);
+            mix(attribute.fetchIndex);
+            mix(attribute.resource.fields[1] & 0xffff0000u);
+            mix(attribute.resource.fields[3]);
+            mix(NullVertexDescriptor(attribute) ? 1u : 0u);
+        }
+        mix(attributes.size());
+        return hash;
+    }
     static std::size_t bypassIndex(std::uint64_t variant) {
         return static_cast<std::size_t>((variant ^ (variant >> 32u)) & 65535u);
     }
@@ -222,6 +261,11 @@ private:
     mutable std::mutex mutex;
     std::list<std::uint64_t> order;
     std::unordered_map<std::uint64_t, Entry> entries;
+    struct ShapeEntry {
+        std::shared_ptr<const VertexInputLayout> layout;
+        std::vector<ShaderRecompiler::VertexAttribute> shape;
+    };
+    std::unordered_multimap<std::uint64_t, ShapeEntry> shapes;
 };
 
 inline std::uint32_t VertexBufferOutOfBoundsSelect(const ShaderRecompiler::VertexAttribute& attribute) {

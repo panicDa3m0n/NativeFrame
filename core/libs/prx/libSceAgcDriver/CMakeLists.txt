@@ -571,6 +571,24 @@ target_link_libraries(agc_vertex_input_tests PRIVATE shader_recompiler_agc_drive
 set_target_properties(agc_vertex_input_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_vertex_input_tests)
 
+add_test_executable(agc_vertex_input_shapes_tests EXCLUDE_FROM_ALL tests/VertexInputShapes.cpp)
+target_include_directories(agc_vertex_input_shapes_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+)
+target_link_libraries(agc_vertex_input_shapes_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_vertex_input_shapes_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vertex_input_shapes_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_vertex_input_shapes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_vertex_input_shapes COMMAND agc_vertex_input_shapes_tests)
+    set_tests_properties(agc_vertex_input_shapes PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_vertex_input_shapes PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_guarded_memory_loads_tests EXCLUDE_FROM_ALL tests/GuardedMemoryLoads.cpp)
 target_link_libraries(agc_guarded_memory_loads_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_guarded_memory_loads_tests PROPERTIES CXX_EXTENSIONS OFF)

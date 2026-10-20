@@ -1207,7 +1207,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.vertexInput = recipe->vertexInput;
     } else if (!attributes.empty()) {
-        if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+        if (context.vertexInputs != nullptr) {
+            static const bool byShape = std::getenv("APS5_NO_VERTEX_SHAPE_CACHE") == nullptr;
+            inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (inputs.retainedVertexInput == nullptr && byShape) inputs.retainedVertexInput = context.vertexInputs->TryGetByShape(attributes);
+        }
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
     }
     inputs.vertexOffsets.assign(attributes.size(), 0);

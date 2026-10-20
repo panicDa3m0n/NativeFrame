@@ -4670,6 +4670,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (Graphics::Recorder::GpuTimingEnabled()) {
+        std::uint64_t hostBytes = 0, deviceBytes = 0;
+        resources.PlacementBytes(hostBytes, deviceBytes);
+        Graphics::Recorder::NoteProgramPlacement(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId, hostBytes, deviceBytes, resources.UsesAddressTable());
+    }
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, Graphics::HostImportOffset(*argumentImport, arguments));

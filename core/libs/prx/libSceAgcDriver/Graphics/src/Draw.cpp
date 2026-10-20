@@ -2201,6 +2201,28 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+// The frame map (Recorder::TagGpuTiming): a draw's pass is named by its first color target, else
+// its depth target; the draw notes the bytes its set and its inputs bind in guest memory.
+void noteDrawPlacement(Recorder& recorder, std::uint32_t timing, const State& state, std::span<const std::shared_ptr<StorageTexture>> targets, const ShaderResources& resources, const DrawInputs& inputs) {
+    std::uint64_t tag = 1;
+    if (!targets.empty() && targets.front() != nullptr) tag = targets.front()->Descriptor().baseAddress;
+    else if (state.depth) tag = state.depth->address;
+    recorder.TagGpuTiming(timing, tag);
+    std::uint64_t hostBytes = 0, deviceBytes = 0;
+    resources.PlacementBytes(hostBytes, deviceBytes);
+    for (const auto& [begin, end] : inputs.inPlaceReads) hostBytes += end - begin;
+    Recorder::NoteDrawPlacement(tag, state.renderExtent.width, state.renderExtent.height, hostBytes, deviceBytes);
+}
+
+// APS5_PROFILE_GPU_DRAWS: a draw's own range is keyed by its fragment stage's variant, else by
+// its first stage's.
+std::uint64_t drawProgramKey(std::span<const CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program != nullptr) return shader.program->PipelineVariantId() & ~Recorder::DrawProgramKeyBit;
+    }
+    return shaders.empty() || shaders.front().program == nullptr ? 0 : shaders.front().program->PipelineVariantId() & ~Recorder::DrawProgramKeyBit;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -2293,6 +2315,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (Recorder::GpuTimingEnabled()) noteDrawPlacement(*recorder, drawTiming, state, record.targets, resources, inputs);
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2352,6 +2375,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    const auto itemTiming = Recorder::DrawTimingEnabled() ? recorder->BeginDrawTiming(drawProgramKey(shaders)) : Recorder::NoTiming;
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     else {
         recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
@@ -2365,6 +2389,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    recorder->EndGpuTiming(itemTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -2894,6 +2919,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (recorded && Recorder::GpuTimingEnabled()) noteDrawPlacement(*recorder, drawTiming, state, owners, *resources, inputs);
     if (recorded && Recorder::BarrierValidate()) {
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());

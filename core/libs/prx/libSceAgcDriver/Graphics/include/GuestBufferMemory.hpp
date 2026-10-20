@@ -337,6 +337,11 @@ public:
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    // The frame map (Recorder::NoteDrawPlacement): the bytes of the regions bound in guest memory
+    // (in place through an import, or from a host-visible staging buffer), which the GPU reads and
+    // writes through the bus, and of those bound in device memory (device-local staging buffers and
+    // range slabs). An address-based build's leased heaps are not counted.
+    void PlacementBytes(std::uint64_t& hostBytes, std::uint64_t& deviceBytes) const;
     struct SplitReads {
         std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;

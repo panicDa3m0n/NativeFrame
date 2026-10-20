@@ -473,6 +473,21 @@ public:
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    // The frame map of the [gputime] line (O16.T18): a draw class range belongs to the pass `tag`
+    // (its first color target's guest address, else its depth target's), and every draw and
+    // dispatch notes the bytes its set binds in place in guest memory, read and written through
+    // the bus, against those it binds in device memory (GuestBufferMemory::PlacementBytes). An
+    // address-based dispatch maps whole heaps: it is counted apart.
+    void TagGpuTiming(std::uint32_t index, std::uint64_t tag);
+    static void NoteDrawPlacement(std::uint64_t tag, std::uint32_t width, std::uint32_t height, std::uint64_t hostBytes, std::uint64_t deviceBytes);
+    static void NoteProgramPlacement(std::uint64_t program, std::uint64_t hostBytes, std::uint64_t deviceBytes, bool addressBased);
+    // APS5_PROFILE_GPU_DRAWS=1 (with APS5_PROFILE_GPU): each draw's commands get a range of their
+    // own inside its pass, keyed by DrawProgramKey (the fragment stage's variant, else the first
+    // stage's); reported apart from the programs and classes ("draw programs"). Begun on the open
+    // command buffer, so an open render pass stays open.
+    static bool DrawTimingEnabled();
+    static constexpr std::uint64_t DrawProgramKeyBit = 1ull << 63u;
+    std::uint32_t BeginDrawTiming(std::uint64_t key);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -590,6 +605,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint64_t> timedTags;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;

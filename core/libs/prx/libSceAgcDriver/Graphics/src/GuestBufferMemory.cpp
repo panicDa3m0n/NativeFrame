@@ -5953,6 +5953,16 @@ void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::u
     }
 }
 
+void GuestBufferMemory::PlacementBytes(std::uint64_t& hostBytes, std::uint64_t& deviceBytes) const {
+    hostBytes = deviceBytes = 0;
+    if (!uploaded || committed) return;
+    for (const auto& region : regions) {
+        const auto bytes = region.end - region.begin;
+        if (region.shadow || (region.direct == nullptr && region.deviceLocal)) deviceBytes += bytes;
+        else hostBytes += bytes;
+    }
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     InPlaceReads(result);

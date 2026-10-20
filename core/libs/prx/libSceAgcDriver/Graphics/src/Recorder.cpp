@@ -1837,6 +1837,20 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+// The frame map (TagGpuTiming, NoteDrawPlacement, NoteProgramPlacement), per pass tag or program.
+struct PlacementTotals {
+    std::uint64_t ranges = 0;
+    double ms = 0;
+    std::uint64_t uses = 0;
+    std::uint64_t addressBased = 0;
+    std::uint64_t hostBytes = 0;
+    std::uint64_t deviceBytes = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+};
+std::map<std::uint64_t, PlacementTotals> placementByPass;
+std::map<std::uint64_t, PlacementTotals> placementByProgram;
+std::map<std::uint64_t, TimingTotals> timingByDrawProgram;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -2015,6 +2029,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedTags.push_back(0);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2025,6 +2040,42 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+bool Recorder::DrawTimingEnabled() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return enabled;
+}
+
+std::uint32_t Recorder::BeginDrawTiming(std::uint64_t key) {
+    if (!DrawTimingEnabled() || open == nullptr || open->commands == VK_NULL_HANDLE) return NoTiming;
+    return beginTiming(DrawProgramKeyBit | key);
+}
+
+void Recorder::TagGpuTiming(std::uint32_t index, std::uint64_t tag) {
+    if (index == NoTiming || open == nullptr || index >= open->timedTags.size()) return;
+    open->timedTags[index] = tag;
+}
+
+void Recorder::NoteDrawPlacement(std::uint64_t tag, std::uint32_t width, std::uint32_t height, std::uint64_t hostBytes, std::uint64_t deviceBytes) {
+    if (!GpuTimingEnabled()) return;
+    std::lock_guard lock(timingMutex);
+    auto& totals = placementByPass[tag];
+    ++totals.uses;
+    totals.hostBytes += hostBytes;
+    totals.deviceBytes += deviceBytes;
+    totals.width = width;
+    totals.height = height;
+}
+
+void Recorder::NoteProgramPlacement(std::uint64_t program, std::uint64_t hostBytes, std::uint64_t deviceBytes, bool addressBased) {
+    if (!GpuTimingEnabled()) return;
+    std::lock_guard lock(timingMutex);
+    auto& totals = placementByProgram[program];
+    ++totals.uses;
+    if (addressBased) ++totals.addressBased;
+    totals.hostBytes += hostBytes;
+    totals.deviceBytes += deviceBytes;
 }
 
 void Recorder::CountSamples() {
@@ -2498,11 +2549,23 @@ void Recorder::readGpuTiming(Batch& batch) {
             continue;
         }
         const auto key = batch.timedKeys[i];
+        if ((key & DrawProgramKeyBit) != 0) {
+            // A draw's own range lies inside its pass's: apart from the classes and the union.
+            auto& totals = timingByDrawProgram[key & ~DrawProgramKeyBit];
+            ++totals.count;
+            totals.ms += ns / 1e6;
+            continue;
+        }
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId);
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
+        if (key == ClassKey(CommandClass::Draw) && i < batch.timedTags.size()) {
+            auto& pass = placementByPass[batch.timedTags[i]];
+            ++pass.ranges;
+            pass.ms += ns / 1e6;
+        }
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
@@ -2534,9 +2597,45 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
-    AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    const auto mibPerPresent = [&](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0 * perPresent; };
+    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) {
+        AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+        if (const auto found = placementByProgram.find(hot[i].first); found != placementByProgram.end() && found->second.uses != 0) {
+            const auto& place = found->second;
+            AgcDriver::ProfilePrint_nid_no_patch(" (bus %.1f vram %.1f MiB per present%s)", mibPerPresent(place.hostBytes), mibPerPresent(place.deviceBytes), place.addressBased != 0 ? ", address-based" : "");
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("; by class:%s", classes.c_str());
+    // The draw class by pass: its ranges' time (a continued draw lies inside its pass's range),
+    // and per present the draws and the bytes they bind in guest memory (bus) and in device memory.
+    std::vector<std::pair<std::uint64_t, PlacementTotals>> passes(placementByPass.begin(), placementByPass.end());
+    std::sort(passes.begin(), passes.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    double passMs = 0, drawMs = 0;
+    std::uint64_t passBus = 0, passDevice = 0;
+    for (const auto& [tag, place] : passes) {
+        passMs += place.ms;
+        passBus += place.hostBytes;
+        passDevice += place.deviceBytes;
+    }
+    if (const auto found = timingByKey.find(ClassKey(CommandClass::Draw)); found != timingByKey.end()) drawMs = found->second.ms;
+    AgcDriver::ProfilePrint_nid_no_patch("; draw passes: %zu targets, %.0f ms of the draw class's %.0f ms, bus %.1f vram %.1f MiB per present:", passes.size(), passMs, drawMs, mibPerPresent(passBus), mibPerPresent(passDevice));
+    for (std::size_t i = 0; i < passes.size() && i < 12; ++i) {
+        const auto& [tag, place] = passes[i];
+        AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx %ux%u x%llu %.0fms (%.1f draws, bus %.1f vram %.1f MiB per present)", static_cast<unsigned long long>(tag), place.width, place.height, static_cast<unsigned long long>(place.ranges), place.ms, static_cast<double>(place.uses) * perPresent, mibPerPresent(place.hostBytes), mibPerPresent(place.deviceBytes));
+    }
+    if (!timingByDrawProgram.empty()) {
+        std::vector<std::pair<std::uint64_t, TimingTotals>> drawPrograms(timingByDrawProgram.begin(), timingByDrawProgram.end());
+        std::sort(drawPrograms.begin(), drawPrograms.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        double drawProgramMs = 0;
+        for (const auto& [program, totals] : drawPrograms) drawProgramMs += totals.ms;
+        AgcDriver::ProfilePrint_nid_no_patch("; draw programs: %zu variants, %.0f ms inside the passes:", drawPrograms.size(), drawProgramMs);
+        for (std::size_t i = 0; i < drawPrograms.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(drawPrograms[i].first), static_cast<unsigned long long>(drawPrograms[i].second.count), drawPrograms[i].second.ms);
+        timingByDrawProgram.clear();
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("\n");
     timingByKey.clear();
+    placementByPass.clear();
+    placementByProgram.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
     lock.unlock();

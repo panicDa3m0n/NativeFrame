@@ -99,7 +99,7 @@ Never attach game files, executables, dumps of memory or shaders, or frame captu
 NativeFrame is developed with the help of AI coding assistants (Claude, by Anthropic), and it is open about how.
 
 - The maintainer sets the direction and the rules. Day-to-day work runs through an AI assistant acting from the maintainer's account: writing changes, reviewing pull requests (including yours) and merging the ones that meet the rules.
-- Those rules do not depend on who reviews. Every change reaches `main` through a pull request; the Conventions, Linux and Windows checks must pass; force pushes and deletion of `main` are blocked for everyone.
+- Those rules do not depend on who reviews. Every change reaches `main` through a pull request; the Conventions check must pass, and so must the Linux and Windows builds for anything beyond documentation (documentation-only changes skip them); force pushes and deletion of `main` are blocked for everyone.
 - Measurements are run on real hardware, and every number in [docs/research](docs/research/README.md) says how it was taken.
 - AI assistance is declared here and, as upstream asks, on each pull request sent to AnyPS5.
 

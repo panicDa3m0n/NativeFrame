@@ -340,6 +340,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_POLL_TRY_EACH` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | tries the poll service on every tick instead of at the poll interval |
 | `APS5_PREBUILD_THREADS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp` | 1 | number of threads in the one-thread pool that prebuilds registration-form shader libraries |
 | `APS5_PRESENT_POLL_FENCE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | polls the present fence every 50 us instead of blocking on it |
+| `APS5_PRESENT_RATE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Presentation.cpp` |  | without APS5_PROFILE_DRAW, prints every 10 s how many frames were presented and the mean frame time, so the frame rate is measured without the draw profile |
 | `APS5_PROBE_DISPATCH` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | probes one dispatch at a hex program address (optionally `:index`) with debug output |
 | `APS5_PROFILE_DRAW` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | prints the per-phase driver and draw timing totals |
 | `APS5_PROFILE_GPU` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records the GPU time of recorded work by key from batch timestamps |

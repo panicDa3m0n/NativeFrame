@@ -113,6 +113,7 @@ private:
     bool orderReleased(std::uint32_t queue, std::uint64_t received) const;
     void noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked);
     void reportPresents(double waitedMs, std::size_t inFlight);
+    void reportPresentRate();
     static bool stampValidate();
     static bool dataHits();
     static bool verifyDataHits();

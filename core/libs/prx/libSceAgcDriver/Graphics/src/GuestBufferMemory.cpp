@@ -3836,11 +3836,6 @@ std::uint64_t atomicStageMax() {
     return bytes;
 }
 
-std::uint64_t drawShadowMax() {
-    static const std::uint64_t bytes = kibSetting("APS5_DRAW_SHADOW_MAX_KIB", 16384);
-    return bytes;
-}
-
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
     return deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
@@ -4059,8 +4054,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
-    const auto windowMax = drawWindow ? std::max(writtenShadowMax(), drawShadowMax()) : writtenShadowMax();
-    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(windowMax, SweptShadowMax) : windowMax);
+    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {

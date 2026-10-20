@@ -42,7 +42,7 @@ constexpr std::size_t BufferBytes = 65536;
 constexpr std::uint32_t Width = 256;
 constexpr std::uint32_t Height = 128;
 constexpr std::size_t PixelBytes = std::size_t{Width} * Height * 4u;
-constexpr std::size_t StoreBytes = std::size_t{4} << 20u;
+constexpr std::size_t StoreBytes = 2 * PixelBytes;
 constexpr std::uint32_t Stored = 0xa5a5a5a5u;
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{

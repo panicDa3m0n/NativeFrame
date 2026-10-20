@@ -1562,6 +1562,164 @@ void noteSpecProbeUncacheable() {
     reportSpecProbes(profile);
 }
 
+// O16.T9 speculative bindings (APS5_SPEC_BINDINGS=1, see DrawSpeculation): made on the prepare
+// thread (speculateDrawBindings), checked and taken by the commit (takeSpeculativeBindings); the
+// [spec-bindings] line every 10 s counts both sides by outcome.
+enum SpecMade : std::size_t { MadeReady, MadeNoTemplate, MadeNotPublished, MadeMoved, MadePending, MadeLarge, MadeUntracked, MadeFailed, SpecMadeCount };
+constexpr std::array<const char*, SpecMadeCount> SpecMadeNames{"made", "no template", "in-place reads not published", "moved refused", "pending writer", "large snapshot", "unwatched or changed range", "exception"};
+enum SpecTaken : std::size_t { TakenBindings, TakenEmpty, RejectedTemplate, RejectedMoved, RejectedInPlace, RejectedEpoch, RejectedRegistry, RejectedUnwatch, RejectedPending, RejectedChanged, SpecTakenCount };
+constexpr std::array<const char*, SpecTakenCount> SpecTakenNames{"taken", "taken without snapshots", "other template", "other moved buffers", "other in-place reads", "other epoch", "registry changed", "a range unwatched", "pending writer", "range stamped"};
+
+struct SpecBindingsProfile {
+    std::atomic<std::int64_t> lastReport{0};
+    std::array<std::atomic<std::uint64_t>, SpecMadeCount> made{};
+    std::array<std::atomic<std::uint64_t>, SpecTakenCount> taken{};
+    std::atomic<std::uint64_t> madeNanoseconds{0}, takeNanoseconds{0}, takes{0}, verified{0}, verifyByteDifferences{0};
+};
+
+SpecBindingsProfile& SpecBindingsCounts() {
+    static SpecBindingsProfile profile;
+    return profile;
+}
+
+bool VerifySpecBindings() {
+    static const bool enabled = std::getenv("APS5_VERIFY_SPEC_BINDINGS") != nullptr;
+    return enabled;
+}
+
+std::shared_ptr<DrawSpeculation> speculateDrawBindings(const PreparedDrawKey& prepared, std::span<const CompiledShader> shaders) {
+    const auto start = std::chrono::steady_clock::now();
+    auto speculation = std::make_shared<DrawSpeculation>();
+    auto outcome = MadeReady;
+    try {
+        auto candidate = SharedResourceCache().Peek(prepared.key, prepared.hash).lock();
+        auto inPlace = candidate != nullptr ? candidate->PublishedInPlaceReads() : nullptr;
+        if (candidate == nullptr) outcome = MadeNoTemplate;
+        else if (inPlace == nullptr) outcome = MadeNotPublished;
+        else {
+            speculation->registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            const auto pending = Recorder::PendingWriteSnapshot();
+            auto moved = candidate->SpeculativeMovedBuffers(shaders, pending.get());
+            if (!moved) outcome = MadeMoved;
+            else {
+                // Before the copies: a stamp landing during them reads as newer at the commit.
+                speculation->unwatch = GuestMemory::UnwatchSerial();
+                speculation->tracker = GuestMemory::TrackerGeneration();
+                auto made = candidate->SpeculateDrawBindings(*moved, *inPlace, pending.get());
+                // A copied range the tracker does not watch could take a CPU store no stamp reports;
+                // a watched one stamped during the copy may hold torn bytes: the commit copies both.
+                const auto tracked = [&] {
+                    if (made.ranges.empty()) return true;
+                    std::vector<GuestMemory::UnchangedQuery> queries;
+                    queries.reserve(made.ranges.size());
+                    for (const auto& [address, bytes] : made.ranges) queries.push_back({address, bytes, speculation->tracker});
+                    return GuestMemory::UnchangedSinceAll(queries);
+                };
+                if (made.refusal == ShaderResources::SpecRefusal::PendingWriter) outcome = MadePending;
+                else if (made.refusal == ShaderResources::SpecRefusal::Large) outcome = MadeLarge;
+                else if (!tracked()) outcome = MadeUntracked;
+                else {
+                    speculation->resources = std::move(candidate);
+                    speculation->moved = std::move(*moved);
+                    speculation->inPlace = std::move(inPlace);
+                    speculation->bindings = std::move(made.bindings);
+                    speculation->ranges = std::move(made.ranges);
+                    speculation->ready = true;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        outcome = MadeFailed;
+        speculation->ready = false;
+        speculation->bindings.reset();
+    }
+    auto& profile = SpecBindingsCounts();
+    profile.made[outcome].fetch_add(1, std::memory_order_relaxed);
+    profile.madeNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    return speculation;
+}
+
+void reportSpecBindings(SpecBindingsProfile& profile) {
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = profile.lastReport.load();
+    if (last == 0) {
+        profile.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::string made, taken;
+    std::uint64_t madeTotal = 0;
+    for (std::size_t i = 0; i < SpecMadeCount; ++i) {
+        const auto count = profile.made[i].exchange(0, std::memory_order_relaxed);
+        madeTotal += count;
+        made += " " + std::string(SpecMadeNames[i]) + " " + std::to_string(count);
+    }
+    for (std::size_t i = 0; i < SpecTakenCount; ++i) taken += " " + std::string(SpecTakenNames[i]) + " " + std::to_string(profile.taken[i].exchange(0, std::memory_order_relaxed));
+    const auto madeNs = profile.madeNanoseconds.exchange(0, std::memory_order_relaxed);
+    const auto takes = profile.takes.exchange(0, std::memory_order_relaxed);
+    const auto takeNs = profile.takeNanoseconds.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[spec-bindings] (10 s): prepare:%s (%.2f us per draw); commit:%s (%.2f us per check); verified %llu, byte differences %llu%c", made.c_str(), madeTotal == 0 ? 0.0 : static_cast<double>(madeNs) / static_cast<double>(madeTotal) / 1e3, taken.c_str(), takes == 0 ? 0.0 : static_cast<double>(takeNs) / static_cast<double>(takes) / 1e3, static_cast<unsigned long long>(profile.verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.verifyByteDifferences.exchange(0, std::memory_order_relaxed)), 10);
+}
+
+// Whether the commit takes the prepare thread's bindings (into `bindings`, null for a draw that
+// binds no snapshot); false leaves the draw to PrepareDrawBindings. Called where PrepareDrawBindings
+// would run: after the queued stores over the draw's memory landed (their stamps count here).
+bool takeSpeculativeBindings(const DrawSpeculation* speculation, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+    if (speculation == nullptr || !speculation->ready) return false;
+    const auto start = std::chrono::steady_clock::now();
+    auto& profile = SpecBindingsCounts();
+    const auto finish = [&](SpecTaken outcome) {
+        profile.taken[outcome].fetch_add(1, std::memory_order_relaxed);
+        profile.takes.fetch_add(1, std::memory_order_relaxed);
+        profile.takeNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        reportSpecBindings(profile);
+        return outcome == TakenBindings || outcome == TakenEmpty;
+    };
+    if (speculation->resources.get() != &resources) return finish(RejectedTemplate);
+    if (!std::equal(moved.begin(), moved.end(), speculation->moved.begin(), speculation->moved.end())) return finish(RejectedMoved);
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    resources.InPlaceReads(reads);
+    if (reads != *speculation->inPlace) return finish(RejectedInPlace);
+    if (!speculation->epochSame) return finish(RejectedEpoch);
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != speculation->registry) return finish(RejectedRegistry);
+    if (GuestMemory::UnwatchSerial() != speculation->unwatch) return finish(RejectedUnwatch);
+    for (const auto& [address, bytes] : speculation->ranges) {
+        if (recorder.PendingWriteOverlaps(address, bytes)) return finish(RejectedPending);
+    }
+    if (!speculation->ranges.empty() && GuestMemory::TrackerGeneration() != speculation->tracker) {
+        thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+        auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+        queries.clear();
+        for (const auto& [address, bytes] : speculation->ranges) queries.push_back({address, bytes, speculation->tracker});
+        if (!GuestMemory::UnchangedSinceAll(queries)) return finish(RejectedChanged);
+    }
+    if (VerifySpecBindings()) {
+        // The commit's own bindings are recorded; the speculation must have made the same choices.
+        auto own = resources.PrepareDrawBindings(recorder, moved);
+        const auto* made = speculation->bindings.get();
+        Require((own == nullptr) == (made == nullptr), "APS5_VERIFY_SPEC_BINDINGS: the speculation and the commit disagree on whether the draw binds snapshots");
+        if (own != nullptr) {
+            Require(own->snapshots.size() == made->snapshots.size(), "APS5_VERIFY_SPEC_BINDINGS: the speculation and the commit chose a different number of snapshots");
+            for (std::size_t i = 0; i < own->snapshots.size(); ++i) {
+                const auto& mine = own->snapshots[i];
+                const auto& theirs = made->snapshots[i];
+                Require(mine.address == theirs.address && mine.bytes == theirs.bytes, "APS5_VERIFY_SPEC_BINDINGS: the speculation and the commit chose different snapshots");
+                if (std::memcmp(mine.Bytes().data(), theirs.Bytes().data(), mine.bytes) != 0) profile.verifyByteDifferences.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        profile.verified.fetch_add(1, std::memory_order_relaxed);
+        bindings = std::move(own);
+        return finish(bindings != nullptr ? TakenBindings : TakenEmpty);
+    }
+    bindings = speculation->bindings;
+    if (bindings != nullptr) {
+        recorder.Keep(bindings);
+        for (const auto& snapshot : bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
+    return finish(bindings != nullptr ? TakenBindings : TakenEmpty);
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -1883,6 +2041,7 @@ struct RecordedDraw {
     std::vector<VkImage> multisampleImages;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    const DrawSpeculation* speculation = nullptr;
     bool listed = false;
     bool completion = false;
     bool waited = false;
@@ -2073,7 +2232,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    std::shared_ptr<ShaderResources::DrawBindings> drawBindings;
+    if (!takeSpeculativeBindings(record.speculation, resources, record.moved, *recorder, drawBindings)) drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -2285,7 +2445,21 @@ PreparedDrawKey PrepareDrawKey(VkDevice device, std::span<const CompiledShader> 
     prepared.key = DrawResourceKeyFor(device, shaders, ColorTarget{}, colorAttachments, 0, 0, false);
     prepared.hash = ResourceCache::Hash(prepared.key);
     if (SpecProbe()) prepared.probe = probeSpeculation(prepared, shaders);
+    if (SpecBindings()) prepared.speculation = speculateDrawBindings(prepared, shaders);
     return prepared;
+}
+
+bool SpecBindings() {
+    static const bool enabled = std::getenv("APS5_SPEC_BINDINGS") != nullptr;
+    return enabled;
+}
+
+std::shared_ptr<DrawSpeculation> SpeculateDrawBindings(const PreparedDrawKey& prepared, std::span<const CompiledShader> shaders) {
+    return speculateDrawBindings(prepared, shaders);
+}
+
+bool TakeSpeculativeBindings(const DrawSpeculation* speculation, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+    return takeSpeculativeBindings(speculation, resources, moved, recorder, bindings);
 }
 
 bool SpecProbe() {
@@ -2647,6 +2821,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.recorder = recorder;
         record.resources = resources;
         record.moved = resolved.moved;
+        record.speculation = prepared != nullptr ? prepared->speculation.get() : nullptr;
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;

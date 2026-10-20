@@ -42,13 +42,43 @@ struct DrawSpeculationProbe {
     std::uint64_t epoch = 0;
     bool epochSame = true;
 };
+// O16.T9 (APS5_SPEC_BINDINGS=1): a draw's bindings made by its prepare thread from the template its
+// key found (ShaderResources::SpeculateDrawBindings), with what the commit checks before it takes
+// them instead of making its own (recordDraw): the same template, moved buffers and in-place
+// reads, the queue-0 epoch and the allocation registry unchanged, no pending GPU write over a
+// copied range and no tracker stamp over one since `tracker` (read before the copies; every range
+// was watched and unchanged after them, and no range was unwatched since `unwatch`). Without
+// `ready` there is nothing to take. APS5_VERIFY_SPEC_BINDINGS=1 makes the commit's own bindings
+// beside a taken speculation, records those, and aborts when the choices differ.
+struct DrawSpeculation {
+    std::shared_ptr<ShaderResources> resources;
+    std::vector<ShaderResources::MovedBuffer> moved;
+    std::shared_ptr<const ShaderResources::InPlaceRanges> inPlace;
+    std::shared_ptr<ShaderResources::DrawBindings> bindings;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    std::uint64_t tracker = 0;
+    std::uint64_t unwatch = 0;
+    std::uint64_t registry = 0;
+    // The queue-0 epoch token at the start of the prepare job and whether the job was sequenced
+    // under the same token (set by the execution layer before the commit).
+    std::uint64_t epoch = 0;
+    bool epochSame = true;
+    bool ready = false;
+};
 struct PreparedDrawKey {
     ResourceCache::Key key;
     std::size_t hash = 0;
     std::shared_ptr<DrawSpeculationProbe> probe;
+    std::shared_ptr<DrawSpeculation> speculation;
 };
 bool PreparedDrawKeys();
 bool SpecProbe();
+bool SpecBindings();
+// The two halves of a DrawSpeculation outside a parallel-prepared draw (tests): what a prepare
+// thread makes for a key whose template SharedResourceCache holds, and the commit's check, which
+// takes the bindings (null for a draw without snapshots) or returns false for PrepareDrawBindings.
+std::shared_ptr<DrawSpeculation> SpeculateDrawBindings(const PreparedDrawKey& prepared, std::span<const CompiledShader> shaders);
+bool TakeSpeculativeBindings(const DrawSpeculation* speculation, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings);
 PreparedDrawKey PrepareDrawKey(VkDevice device, std::span<const CompiledShader> shaders, std::uint32_t colorAttachments);
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDrawKey* prepared = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);

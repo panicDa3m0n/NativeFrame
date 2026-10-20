@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -185,9 +186,28 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::vector<std::uint32_t> words;
+        bool operator==(const MovedBuffer&) const = default;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // O16.T9 (APS5_SPEC_BINDINGS=1): a draw's bindings made on a prepare thread, off the GPU mutex,
+    // from the parts of this object a build fixes (allocations, bindings, descriptor writes, data
+    // patches, the written ranges), for the commit to take after its checks (DrawSpeculation in
+    // Draw.hpp). The in-place reads, which change under the mutex, are the copy the last
+    // PrepareDrawBindings published; `pending` is the recorder's published pending-write snapshot
+    // (Recorder::PendingWriteSnapshot), standing in for PendingWriteOverlaps. Snapshots go to a ring
+    // of the calling thread; a draw with a range behind pending GPU work or over the upload limit
+    // gets none (the commit makes them).
+    using InPlaceRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    std::shared_ptr<const InPlaceRanges> PublishedInPlaceReads() const { return publishedInPlace.load(std::memory_order_acquire); }
+    std::optional<std::vector<MovedBuffer>> SpeculativeMovedBuffers(std::span<const CompiledShader> shaders, const InPlaceRanges* pending) const;
+    enum class SpecRefusal : std::size_t { None, PendingWriter, Large };
+    struct SpeculativeBindings {
+        std::shared_ptr<DrawBindings> bindings;
+        std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+        SpecRefusal refusal = SpecRefusal::None;
+    };
+    SpeculativeBindings SpeculateDrawBindings(std::span<const MovedBuffer> moved, const InPlaceRanges& inPlace, const InPlaceRanges* pending) const;
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -568,6 +588,12 @@ private:
         std::shared_ptr<Buffer> buffer;
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
+    // The in-place reads the last PrepareDrawBindings saw (PublishedInPlaceReads); written under
+    // the GPU mutex only, read by prepare threads.
+    mutable std::atomic<std::shared_ptr<const InPlaceRanges>> publishedInPlace;
+    void publishInPlaceReads(const InPlaceRanges& reads) const;
+    void writeDrawDescriptors(DrawBindings& result, std::span<const std::size_t> selected) const;
+    std::optional<std::vector<MovedBuffer>> movedBuffers(std::span<const CompiledShader> shaders, const Recorder* recorder, const InPlaceRanges* pending) const;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write

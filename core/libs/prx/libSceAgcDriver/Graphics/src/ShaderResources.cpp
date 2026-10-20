@@ -4995,6 +4995,14 @@ ShaderResources::DrawBindings::~DrawBindings() {
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
+    return movedBuffers(shaders, &recorder, nullptr);
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::SpeculativeMovedBuffers(std::span<const CompiledShader> shaders, const InPlaceRanges* pending) const {
+    return movedBuffers(shaders, nullptr, pending);
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::movedBuffers(std::span<const CompiledShader> shaders, const Recorder* recorder, const InPlaceRanges* pending) const {
     std::vector<MovedBuffer> moved;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
     for (const auto& shader : shaders) {
@@ -5034,7 +5042,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                const bool pendingWriter = recorder != nullptr ? recorder->PendingWriteOverlaps(begin, bytes) : Recorder::SnapshotOverlaps(pending, begin, bytes);
+                if (guestMemory.WritesOverlap(begin, bytes) || pendingWriter || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
@@ -5116,6 +5125,40 @@ bool WordBufferReuse() {
 }
 }
 
+namespace {
+// APS5_SPEC_BINDINGS=1: prepare threads make a draw's bindings (ShaderResources::SpeculateDrawBindings).
+bool SpecBindingsOn() {
+    static const bool enabled = std::getenv("APS5_SPEC_BINDINGS") != nullptr;
+    return enabled;
+}
+
+// A prepare thread's draw upload ring (the recorder's DrawUpload is the committer's). Never
+// destroyed: a thread that outlives the device must not destroy a chunk after it, and a chunk of
+// a replaced device is let go without destroying it either.
+struct SpeculativeRing {
+    std::shared_ptr<Buffer> chunk;
+    VkDeviceSize used = 0;
+    VkDevice device = VK_NULL_HANDLE;
+};
+
+Recorder::UploadSlice SpeculativeUpload(const Context& context, std::size_t bytes) {
+    thread_local SpeculativeRing* ring = new SpeculativeRing;
+    if (ring->device != context.device) {
+        if (ring->chunk != nullptr) static_cast<void>(new std::shared_ptr<Buffer>(std::move(ring->chunk)));
+        ring->chunk.reset();
+        ring->device = context.device;
+    }
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    auto offset = (ring->used + alignment - 1) & ~(alignment - 1);
+    if (ring->chunk == nullptr || offset + bytes > ring->chunk->Bytes().size()) {
+        ring->chunk = std::make_shared<Buffer>(context, std::max(Recorder::DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.SnapshotProperties());
+        offset = 0;
+    }
+    ring->used = offset + bytes;
+    return {ring->chunk, offset, ring->chunk->Bytes().data() + offset};
+}
+}
+
 std::size_t ShaderResources::DrawUploadLimit() {
     static const std::size_t limit = [] {
         const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
@@ -5131,6 +5174,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
+    if (SpecBindingsOn()) publishInPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
@@ -5249,6 +5293,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    writeDrawDescriptors(*result, selected);
+    recorder.Keep(result);
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    return result;
+}
+
+void ShaderResources::writeDrawDescriptors(DrawBindings& result, std::span<const std::size_t> selected) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
@@ -5267,16 +5318,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
-    result->cache = context.descriptorCache;
+    result.cache = context.descriptorCache;
     if (described[0] || splitSets) {
-        result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
-        result->layout = _layout;
-        Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        result.allocation = result.cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
+        result.layout = _layout;
+        Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (described[1] || splitSets) {
-        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
-        result->fragmentLayout = fragment.layout;
-        Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        result.fragmentAllocation = result.cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
+        result.fragmentLayout = fragment.layout;
+        Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
@@ -5293,23 +5344,84 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto original = setOf(binding) == 0 ? _set : fragment.set;
         while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
             auto& write = *nextWrite++;
-            write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+            write.dstSet = setOf(binding) == 0 ? result.allocation.set : result.fragmentAllocation.set;
             if (binding.allocations.empty()) continue;
             const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
             write.pBufferInfo = buffers.data() + offset;
             for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
-                const auto& snapshot = result->snapshots[snapshotIndex];
+                const auto& snapshot = result.snapshots[snapshotIndex];
                 buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
             }
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
-    return result;
+}
+
+void ShaderResources::publishInPlaceReads(const InPlaceRanges& reads) const {
+    const auto current = publishedInPlace.load(std::memory_order_relaxed);
+    if (current != nullptr && *current == reads) return;
+    publishedInPlace.store(std::make_shared<const InPlaceRanges>(reads), std::memory_order_release);
+}
+
+ShaderResources::SpeculativeBindings ShaderResources::SpeculateDrawBindings(std::span<const MovedBuffer> moved, const InPlaceRanges& reads, const InPlaceRanges* pending) const {
+    SpeculativeBindings out;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return out;
+    const auto maxSnapshotBytes = maxDrawSnapshotBytes;
+    const auto uploadLimit = DrawUploadLimit();
+    std::size_t totalSnapshotBytes = 0;
+    auto result = std::make_shared<DrawBindings>();
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    selected.clear();
+    // The same choices as PrepareDrawBindings, with the published reads and pending writes.
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (override != moved.end() && !override->words.empty()) {
+            auto slice = SpeculativeUpload(context, override->size);
+            std::memcpy(slice.bytes, override->words.data(), override->size);
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+            selected.push_back(index);
+            result->snapshots.push_back({0, std::move(slice.buffer), slice.offset, override->size});
+            continue;
+        }
+        std::uint64_t address = item.address;
+        std::size_t size = item.size;
+        if (override != moved.end()) {
+            address = override->address;
+            size = override->size;
+        } else {
+            if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            if (!direct) continue;
+            if (Recorder::SnapshotOverlaps(pending, item.address, item.size)) {
+                out.refusal = SpecRefusal::PendingWriter;
+                return out;
+            }
+        }
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (bytes == 0 || bytes > uploadLimit) {
+            out.refusal = SpecRefusal::Large;
+            return out;
+        }
+        auto slice = SpeculativeUpload(context, bytes);
+        std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
+        selected.push_back(index);
+        result->snapshots.push_back({begin, std::move(slice.buffer), slice.offset, bytes});
+        out.ranges.emplace_back(begin, bytes);
+        totalSnapshotBytes += bytes;
+    }
+    if (selected.empty()) return out;
+    writeDrawDescriptors(*result, selected);
+    out.bindings = std::move(result);
+    return out;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

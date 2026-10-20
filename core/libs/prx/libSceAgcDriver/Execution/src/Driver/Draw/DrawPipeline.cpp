@@ -43,6 +43,16 @@ std::size_t DrawPipeline::Depth() {
     return depth;
 }
 
+std::size_t DrawPipeline::RefillMark() {
+    static const std::size_t mark = std::getenv("APS5_NO_COMMIT_HYSTERESIS") != nullptr || Depth() == 0 ? (Depth() == 0 ? 0 : Depth() - 1) : Depth() / 2;
+    return mark;
+}
+
+std::uint64_t DrawPipeline::ProducerWakes() {
+    std::lock_guard lock(mutex);
+    return producerWakes;
+}
+
 std::size_t DrawPipeline::QueuedItems() {
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
@@ -102,7 +112,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
         ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() < Depth(); });
+        idle.wait(lock, [&] { return items.size() <= RefillMark(); });
         --idleWaiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
@@ -200,7 +210,10 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             outstanding.fetch_sub(1, std::memory_order_release);
-            if (idleWaiters != 0) idle.notify_all();
+            if (idleWaiters != 0 && items.size() <= RefillMark()) {
+                ++producerWakes;
+                idle.notify_all();
+            }
         }
         retire(std::move(done));
     }

@@ -29,6 +29,8 @@ public:
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
+    static std::size_t RefillMark();
+    std::uint64_t ProducerWakes();
     static std::size_t QueuedItems();
     static bool PipelineIndirect();
     static bool DrainBeforeRead(std::uint64_t address, std::size_t bytes);
@@ -101,6 +103,7 @@ private:
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
+    std::uint64_t producerWakes = 0;
     bool committerWaiting = false;
     bool stopped = false;
     bool closing = false;

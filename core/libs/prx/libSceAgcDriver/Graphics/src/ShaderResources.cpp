@@ -3474,6 +3474,13 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key, std::size_t
     return found(key, hash);
 }
 
+std::weak_ptr<ShaderResources> ResourceCache::Peek(const Key& key, std::size_t hash) {
+    std::lock_guard lock(mutex);
+    const auto entry = index.find(HashedKey{&key, hash});
+    if (entry == index.end()) return {};
+    return entry->second->second;
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::found(const Key& key, std::size_t hash) {
     const auto entry = index.find(HashedKey{&key, hash});
     if (entry == index.end()) {

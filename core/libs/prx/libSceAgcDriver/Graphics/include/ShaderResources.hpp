@@ -667,6 +667,10 @@ public:
     static std::size_t Hash(const Key& key) noexcept;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
+    // The entry under the key without touching the LRU, the miss and return counts or the Find
+    // count, as a weak reference: a reader off the GPU mutex (the O16.T8 speculation probe) never
+    // becomes the last owner of an entry removed meanwhile.
+    std::weak_ptr<ShaderResources> Peek(const Key& key, std::size_t hash);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

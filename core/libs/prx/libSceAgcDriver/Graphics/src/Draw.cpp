@@ -1404,6 +1404,164 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+// The O16.T8 speculation probe (APS5_SPEC_PROBE=1, see DrawSpeculationProbe). The prepare side
+// (probeSpeculation) takes lock-free reads only; the commit side reads the same stamps and ranges
+// before this draw's own collects and proofs (probeAtCommit) and counts which part of the
+// speculation would have held (noteSpecProbe, the [spec-probe] line every 10 s).
+std::atomic<std::uint64_t> probedCommits{0};
+
+enum SpecTemplate : std::size_t { SpecSame, SpecOther, SpecLost, SpecLate, SpecNone, SpecTemplateCount };
+constexpr std::array<const char*, SpecTemplateCount> SpecTemplateNames{"same", "other", "lost", "late", "none"};
+enum SpecStamp : std::size_t { StampWriteGeneration, StampPublishGeneration, StampPendingSerial, StampStorageCache, StampRegistry, StampTracker, StampEpoch, SpecStampCount };
+constexpr std::array<const char*, SpecStampCount> SpecStampNames{"write-gen", "publish-gen", "pending-serial", "storage-cache", "registry", "tracker", "epoch"};
+
+struct SpecProbeCommit {
+    std::array<bool, SpecStampCount> same{};
+    std::uint32_t becamePending = 0;
+    std::uint32_t changed = 0;
+    std::uint32_t unwatched = 0;
+    std::uint64_t distance = 0;
+    std::uint64_t nanoseconds = 0;
+};
+
+struct SpecProbeProfile {
+    std::atomic<std::int64_t> lastReport{0};
+    std::atomic<std::uint64_t> draws{0}, uncacheable{0}, speculable{0}, rangesHold{0}, moved{0};
+    std::array<std::atomic<std::uint64_t>, SpecTemplateCount> templates{};
+    std::array<std::atomic<std::uint64_t>, SpecStampCount> stampsSame{};
+    std::atomic<std::uint64_t> ranges{0}, pendingAtPrepare{0}, becamePending{0}, changed{0}, unwatched{0};
+    std::atomic<std::uint64_t> distance{0}, maxDistance{0}, nanoseconds{0}, maxNanoseconds{0}, probeNanoseconds{0};
+};
+
+SpecProbeProfile& SpecProbes() {
+    static SpecProbeProfile profile;
+    return profile;
+}
+
+void raiseTo(std::atomic<std::uint64_t>& maximum, std::uint64_t value) {
+    auto current = maximum.load(std::memory_order_relaxed);
+    while (value > current && !maximum.compare_exchange_weak(current, value, std::memory_order_relaxed)) {}
+}
+
+std::shared_ptr<DrawSpeculationProbe> probeSpeculation(const PreparedDrawKey& prepared, std::span<const CompiledShader> shaders) {
+    const auto start = std::chrono::steady_clock::now();
+    auto probe = std::make_shared<DrawSpeculationProbe>();
+    probe->at = start;
+    probe->commits = probedCommits.load(std::memory_order_relaxed);
+    // The stamps before what they prove: a change after these loads shows at the commit.
+    probe->writeGeneration = Recorder::WriteGeneration();
+    probe->publishGeneration = Recorder::PublishGeneration();
+    probe->pendingSerial = StorageTexture::PendingSerial();
+    probe->storageCacheSerial = StorageCacheSerial();
+    probe->registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    probe->tracker = GuestMemory::TrackerGeneration();
+    probe->candidate = SharedResourceCache().Peek(prepared.key, prepared.hash);
+    probe->found = !probe->candidate.expired();
+    // The draw's read-only guest buffers (PrepareDrawBindings' snapshot candidates, as this draw's
+    // V#s give them): the ones the published pending-write snapshot shows behind GPU work stay
+    // with the commit.
+    const auto pending = Recorder::PendingWriteSnapshot();
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) continue;
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) continue;
+                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                const auto address = descriptor.Base48();
+                const auto bytes = static_cast<std::size_t>(descriptor.GetSize());
+                if (address == 0 || bytes == 0) continue;
+                if (Recorder::SnapshotOverlaps(pending.get(), address, bytes)) {
+                    ++probe->pendingAtPrepare;
+                    continue;
+                }
+                probe->ranges.emplace_back(address, bytes);
+            }
+        }
+    }
+    probe->probeNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    return probe;
+}
+
+SpecProbeCommit probeAtCommit(const DrawSpeculationProbe& probe) {
+    SpecProbeCommit commit;
+    const auto now = std::chrono::steady_clock::now();
+    commit.distance = probedCommits.fetch_add(1, std::memory_order_relaxed) - probe.commits;
+    commit.nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - probe.at).count());
+    commit.same[StampWriteGeneration] = Recorder::WriteGeneration() == probe.writeGeneration;
+    commit.same[StampPublishGeneration] = Recorder::PublishGeneration() == probe.publishGeneration;
+    commit.same[StampPendingSerial] = StorageTexture::PendingSerial() == probe.pendingSerial;
+    commit.same[StampStorageCache] = StorageCacheSerial() == probe.storageCacheSerial;
+    commit.same[StampRegistry] = GuestAllocations::GuestAllocationsGeneration_nid_postfix() == probe.registry;
+    commit.same[StampTracker] = GuestMemory::TrackerGeneration() == probe.tracker;
+    commit.same[StampEpoch] = probe.epochSame;
+    // A range the commit finds behind a pending GPU write would have been copied stale; one whose
+    // tracker blocks were stamped after the prepare (a collect that found CPU stores, a GPU write
+    // marked at a predecessor's commit) fails the stamp check. Uncollected CPU stores are not
+    // walked here, so `changed` is what the commit's tracker shows, not a fresh walk.
+    auto* recorder = Recorder::Active();
+    for (const auto& [address, bytes] : probe.ranges) {
+        if (recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) ++commit.becamePending;
+        else if (!GuestMemory::UnchangedSince(address, bytes, probe.tracker)) ++(GuestMemory::Watched(address, bytes) ? commit.changed : commit.unwatched);
+    }
+    return commit;
+}
+
+void reportSpecProbes(SpecProbeProfile& profile) {
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = profile.lastReport.load();
+    if (last == 0) {
+        profile.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto draws = take(profile.draws);
+    std::string templates, stamps;
+    for (std::size_t i = 0; i < SpecTemplateCount; ++i) templates += " " + std::string(SpecTemplateNames[i]) + " " + std::to_string(take(profile.templates[i]));
+    for (std::size_t i = 0; i < SpecStampCount; ++i) stamps += " " + std::string(SpecStampNames[i]) + " " + std::to_string(take(profile.stampsSame[i]));
+    const auto speculable = take(profile.speculable);
+    const auto distance = take(profile.distance);
+    const auto nanoseconds = take(profile.nanoseconds);
+    const auto probeNanoseconds = take(profile.probeNanoseconds);
+    const auto per = [&](unsigned long long total) { return draws == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(draws); };
+    std::fprintf(stderr, "[spec-probe] (10 s): %llu draws, %llu uncacheable; template:%s; stamps unchanged:%s; ranges %llu (pending at prepare %llu), became pending %llu, changed %llu, unwatched %llu; draws with every range holding %llu; moved non-empty %llu; speculable %llu (f %.1f %%); distance %.1f commits (max %llu), %.0f us (max %.0f); probe %.2f us per draw%c", draws, take(profile.uncacheable), templates.c_str(), stamps.c_str(), take(profile.ranges), take(profile.pendingAtPrepare), take(profile.becamePending), take(profile.changed), take(profile.unwatched), take(profile.rangesHold), take(profile.moved), speculable, draws == 0 ? 0.0 : 100.0 * (1.0 - static_cast<double>(speculable) / static_cast<double>(draws)), per(distance), take(profile.maxDistance), per(nanoseconds) / 1e3, static_cast<double>(take(profile.maxNanoseconds)) / 1e3, per(probeNanoseconds) / 1e3, 10);
+}
+
+void noteSpecProbe(const DrawSpeculationProbe& probe, const SpecProbeCommit& commit, const std::shared_ptr<ShaderResources>& resources, std::size_t moved, bool hit) {
+    auto& profile = SpecProbes();
+    // Owner equivalence: the candidate is compared without locking it (an expired one differs).
+    const bool sameObject = hit && !probe.candidate.owner_before(resources) && !resources.owner_before(probe.candidate);
+    const auto outcome = probe.found ? (hit ? (sameObject ? SpecSame : SpecOther) : SpecLost) : (hit ? SpecLate : SpecNone);
+    profile.draws.fetch_add(1, std::memory_order_relaxed);
+    profile.templates[outcome].fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < SpecStampCount; ++i) {
+        if (commit.same[i]) profile.stampsSame[i].fetch_add(1, std::memory_order_relaxed);
+    }
+    profile.ranges.fetch_add(probe.ranges.size(), std::memory_order_relaxed);
+    profile.pendingAtPrepare.fetch_add(probe.pendingAtPrepare, std::memory_order_relaxed);
+    profile.becamePending.fetch_add(commit.becamePending, std::memory_order_relaxed);
+    profile.changed.fetch_add(commit.changed, std::memory_order_relaxed);
+    profile.unwatched.fetch_add(commit.unwatched, std::memory_order_relaxed);
+    const bool rangesHold = commit.becamePending == 0 && commit.changed == 0 && commit.unwatched == 0;
+    if (rangesHold) profile.rangesHold.fetch_add(1, std::memory_order_relaxed);
+    if (moved != 0) profile.moved.fetch_add(1, std::memory_order_relaxed);
+    if (outcome == SpecSame && rangesHold && commit.same[StampEpoch] && commit.same[StampRegistry]) profile.speculable.fetch_add(1, std::memory_order_relaxed);
+    profile.distance.fetch_add(commit.distance, std::memory_order_relaxed);
+    raiseTo(profile.maxDistance, commit.distance);
+    profile.nanoseconds.fetch_add(commit.nanoseconds, std::memory_order_relaxed);
+    raiseTo(profile.maxNanoseconds, commit.nanoseconds);
+    profile.probeNanoseconds.fetch_add(probe.probeNanoseconds, std::memory_order_relaxed);
+    reportSpecProbes(profile);
+}
+
+void noteSpecProbeUncacheable() {
+    auto& profile = SpecProbes();
+    profile.uncacheable.fetch_add(1, std::memory_order_relaxed);
+    reportSpecProbes(profile);
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -1437,6 +1595,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         }
         if (usePrepared) resolved.contentKey = prepared->key;
         else resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        const auto* probe = usePrepared ? prepared->probe.get() : nullptr;
+        std::optional<SpecProbeCommit> probed;
+        if (probe != nullptr) probed = probeAtCommit(*probe);
         if (auto cached = usePrepared ? SharedResourceCache().Find(resolved.contentKey, prepared->hash) : SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
@@ -1455,8 +1616,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
+        if (probed) noteSpecProbe(*probe, *probed, resolved.resources, resolved.moved.size(), outcome.kind == KindTemplateHit);
     } else {
         countCache(&DrawProfile::uncacheable);
+        if (prepared != nullptr && prepared->probe != nullptr) noteSpecProbeUncacheable();
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
@@ -2121,7 +2284,13 @@ PreparedDrawKey PrepareDrawKey(VkDevice device, std::span<const CompiledShader> 
     PreparedDrawKey prepared;
     prepared.key = DrawResourceKeyFor(device, shaders, ColorTarget{}, colorAttachments, 0, 0, false);
     prepared.hash = ResourceCache::Hash(prepared.key);
+    if (SpecProbe()) prepared.probe = probeSpeculation(prepared, shaders);
     return prepared;
+}
+
+bool SpecProbe() {
+    static const bool enabled = std::getenv("APS5_SPEC_PROBE") != nullptr;
+    return enabled;
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDrawKey* prepared) {

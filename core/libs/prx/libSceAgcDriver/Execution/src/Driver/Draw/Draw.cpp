@@ -767,6 +767,7 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
     static const QueueState idleQueue{};
     std::shared_lock<std::shared_mutex> patchLock(variantPatchMutex(), std::defer_lock);
     if (!synchronous) patchLock.lock();
+    const auto jobEpoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
     DrawPrepare::Prepared prepared;
     const auto& submission = input->submission;
     auto localDevice = input->localDevice;
@@ -1001,11 +1002,13 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
     };
     std::optional<Graphics::PreparedDrawKey> preparedKey;
     if (Graphics::PreparedDrawKeys() && std::all_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr; })) preparedKey = Graphics::PrepareDrawKey(localDevice->Device(), stages, static_cast<std::uint32_t>(graphics.colors.size()));
+    if (preparedKey && preparedKey->probe != nullptr) preparedKey->probe->epoch = jobEpoch;
     auto held = std::make_shared<Held>(Held{input, std::move(localDevice), std::move(decode), relocatedDecode, drawParameters, std::move(stages), std::move(snapshots), std::move(recipe), std::move(recipeStages), drawKey, std::move(results), std::move(memory), std::move(linked), std::move(stageCaptures), std::move(matched), std::move(matchedRegions), std::move(fresh), std::move(decodeReads), std::move(shaderMemory), std::move(entry), std::move(dataEntry), std::move(compiledStages), std::move(stageData), std::move(preparedKey)});
     const auto commitQueue = submission.queue;
     const auto commitPacket = input->commitPacket;
     prepared.finish = [this, held, commitQueue, commitPacket, writes = std::move(writes)]() mutable {
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        if (held->preparedKey && held->preparedKey->probe != nullptr) held->preparedKey->probe->epochSame = held->preparedKey->probe->epoch == epoch;
         DrawPipeline::Queue0().Enqueue([this, held, commitQueue, commitPacket, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);

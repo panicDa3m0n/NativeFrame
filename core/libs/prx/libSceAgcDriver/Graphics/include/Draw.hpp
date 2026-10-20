@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -17,11 +18,37 @@ struct HostImport;
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
+// O16.T8 probe (APS5_SPEC_PROBE=1, studies/committer-fuori-dal-lock.md P0): what a prepare thread
+// would take off the GPU mutex for a draw, taken beside the prepared key with lock-free reads only
+// (the template under the key, the draw's read-only guest buffer ranges clean in the published
+// pending-write snapshot, the stamps that would prove them). The commit compares and counts (the
+// [spec-probe] line); nothing else reads it, so no decision changes.
+struct DrawSpeculationProbe {
+    std::weak_ptr<ShaderResources> candidate;
+    bool found = false;
+    std::uint64_t tracker = 0;
+    std::uint64_t writeGeneration = 0;
+    std::uint64_t publishGeneration = 0;
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t storageCacheSerial = 0;
+    std::uint64_t registry = 0;
+    std::uint64_t commits = 0;
+    std::chrono::steady_clock::time_point at;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    std::uint32_t pendingAtPrepare = 0;
+    std::uint64_t probeNanoseconds = 0;
+    // The queue-0 epoch token at the start of the prepare job and whether the job was sequenced
+    // under the same token (set by the execution layer before the commit).
+    std::uint64_t epoch = 0;
+    bool epochSame = true;
+};
 struct PreparedDrawKey {
     ResourceCache::Key key;
     std::size_t hash = 0;
+    std::shared_ptr<DrawSpeculationProbe> probe;
 };
 bool PreparedDrawKeys();
+bool SpecProbe();
 PreparedDrawKey PrepareDrawKey(VkDevice device, std::span<const CompiledShader> shaders, std::uint32_t colorAttachments);
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDrawKey* prepared = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);

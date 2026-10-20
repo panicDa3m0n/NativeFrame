@@ -3,9 +3,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -25,6 +27,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Large written buffers in range slabs (APS5_BUFFER_SHADOW=1, O16.T13): a recorded use of a written
 // region of at least 1 MiB inside a watched import binds a range slab, gets only the bytes the slab
@@ -39,7 +42,14 @@
 //   SemiSoloMancanti: a use after a use seeds nothing (the slab holds every byte);
 //   TimbroScrittore: the use stamps the region, so consumers see its bytes change;
 //   RiusoSlabCambiato: a reused upload whose slab grew meanwhile is refused;
-//   RitiroImport: an import retired between the upload and the copy-back still gets the bytes.
+//   LettoreLegaSlab (O16.T14): a read-only use of a range the slab holds whole reads the slab and
+//     sees the writers' bytes; one reaching past the slab binds the import;
+//   SemeDelLettore: a CPU page stored after the writer reaches the reader (the slab no longer holds
+//     the page, so the reader binds the import);
+//   IstantaneaEvitata and SpecBindingsOmbra: a reader of the slab is no in-place read, so neither a
+//     draw's bindings nor a speculation copy it from the CPU;
+//   RiusoLettore: a reused reader whose slab grew meanwhile is refused;
+//   RitiroImport: an import retired after the uses gives its slabs back.
 // --evict (APS5_UNIT_SHADOW_MIB=16, Sfratto): three 12 MiB writers each land in the import and the
 // live slab bytes stay within the budget. Without the switch (_off) the regions take today's paths.
 
@@ -122,6 +132,31 @@ public:
         use.memory->Upload(false);
         use.info = use.memory->Descriptor(element, bytes, use.adjustment);
         return use;
+    }
+
+    Use Read(std::uint64_t element, std::size_t bytes) const {
+        Use use{std::make_unique<GuestBufferMemory>(context)};
+        use.memory->AllowDeviceStaging();
+        use.memory->AddReadable(element, bytes);
+        use.memory->Upload(false);
+        use.info = use.memory->Descriptor(element, bytes, use.adjustment);
+        return use;
+    }
+
+    // What a reader shader sees: the bound bytes, copied out after the use.
+    std::vector<std::byte> Readback(const Use& use, std::size_t bytes) const {
+        auto host = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{use.info.offset + use.adjustment, 0, bytes};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, use.info.buffer, host->Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(host);
+        Finish(use);
+        Settle();
+        host->Invalidate();
+        const auto seen = host->Bytes();
+        return {seen.begin(), seen.end()};
     }
 
     // The shader: `value` over [offset, offset + bytes) of the element.
@@ -230,6 +265,73 @@ int RunCases(const Context& context, Recorder& recorder, WatchedBlock& watched, 
             refused = true;
         }
         Require(refused, "a reused upload whose range slab grew meanwhile was accepted");
+        uses.Settle();
+    }
+
+    // LettoreLegaSlab and IstantaneaEvitata: region A is the slab's whole (the writers above).
+    {
+        auto reader = uses.Read(a, RegionBytes);
+        Require(uses.InSlab(reader) == shadowing, shadowing ? "a read-only range the slab holds whole was not bound to the slab" : "a read-only range was not bound in place without APS5_BUFFER_SHADOW");
+        Require(reader.memory->InPlaceReads().empty() == shadowing, shadowing ? "a reader of the slab still counts as an in-place read" : "a reader in place is missing from the in-place reads");
+        const auto seen = uses.Readback(reader, RegionBytes);
+        Require(std::memcmp(seen.data(), bytes + Unit, RegionBytes) == 0, "the reader did not read the writers' bytes");
+        auto past = uses.Read(a + RegionBytes - Page, 2 * Page);
+        Require(!uses.InSlab(past), "a read-only range reaching past the slab was not bound to the import");
+        const auto pastSeen = uses.Readback(past, 2 * Page);
+        Require(std::memcmp(pastSeen.data(), bytes + Unit + RegionBytes - Page, 2 * Page) == 0, "the reader past the slab did not read the import");
+    }
+
+    // SemeDelLettore: a CPU page on region B after its writer.
+    {
+        std::memset(bytes + (4u << 20u) + 2 * Page, 0x31, Page);
+        AgcDriver::GuestMemory::CollectWritesUncached(b, RegionBytes);
+        auto reader = uses.Read(b, RegionBytes);
+        const auto seen = uses.Readback(reader, RegionBytes);
+        Require(Holds(seen.data() + 2 * Page, Page, 0x31), "a CPU page stored after the writer did not reach the reader");
+        Require(std::memcmp(seen.data(), bytes + (4u << 20u), RegionBytes) == 0, "the reader of region B does not see its bytes");
+    }
+
+    // IstantaneaEvitata and SpecBindingsOmbra through a build: a read-only element over region A.
+    {
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(a >> 32u) & 0xffffu, static_cast<std::uint32_t>(RegionBytes), 0x31000000u};
+        binding.bufferWritten = {false};
+        program.bindings.push_back(binding);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        auto resources = std::make_shared<ShaderResources>(context, compute);
+        const auto bindings = resources->PrepareDrawBindings(recorder);
+        if (shadowing) Require(bindings == nullptr, "a draw's bindings copied a buffer the slab holds");
+        else Require(bindings != nullptr && bindings->snapshots.size() == 1, "a draw's bindings did not copy the in-place buffer without APS5_BUFFER_SHADOW");
+        const auto speculated = resources->SpeculateDrawBindings({}, resources->InPlaceReads(), nullptr);
+        if (shadowing) Require(speculated.bindings == nullptr && speculated.ranges.empty(), "a speculation copied a buffer the slab holds");
+        resources->MarkGpuWrites(recorder);
+        uses.Settle();
+    }
+
+    // RiusoLettore.
+    if (shadowing) {
+        auto reader = uses.Read(a, RegionBytes);
+        Require(uses.InSlab(reader), "the reader of region A is not bound to the slab");
+        uses.Finish(reader);
+        uses.Settle();
+        reader.memory->RecordStagingCopies(recorder);
+        uses.Finish(reader);
+        uses.Settle();
+        const auto grown = RangeShadowDestination(context, import, a, a + RegionBytes + Unit);
+        Require(grown.has_value(), "the range reaching over region A got no destination");
+        bool refused = false;
+        try {
+            reader.memory->RecordStagingCopies(recorder);
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        Require(refused, "a reused reader whose range slab grew meanwhile was accepted");
         uses.Settle();
     }
 

@@ -144,6 +144,12 @@ bool RangeSlabsEnabled();
 // of a recorded use takes a range slab (GuestBufferMemory), and its written bytes are published
 // right after its work (PublishReason::Writer) in place of today's copy-back.
 bool BufferShadowEnabled();
+// O16.T14 P3: the source of a GPU reader of [begin, end) (a read-only buffer region): the range
+// slab that already owns every unit of it, when the slab is authoritative for every byte of the
+// range (no seed needed: the reader then reads what the import holds); none is made or grown.
+// nullopt otherwise, and with APS5_NO_BUFFER_SHADOW_READERS (the reader binds the import).
+bool BufferShadowReaders();
+std::optional<ShadowDestination> RangeShadowSource(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
 // Moves whenever range units are marked or a range slab is made, grown, evicted or retired (a
 // buffer writer's MarkShadowed does not move StorageTexture::PendingSerial).
 std::uint64_t BufferShadowSerial();

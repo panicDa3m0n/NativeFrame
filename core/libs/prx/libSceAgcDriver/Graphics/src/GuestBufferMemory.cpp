@@ -3854,7 +3854,7 @@ std::uint64_t bufferShadowMax() {
 // build and by a reuse, refusals (no destination; a reuse whose slab moved), seed and published
 // bytes.
 struct BufferShadowStatistics {
-    std::atomic<std::uint64_t> taken{0}, reused{0}, refused{0}, moved{0}, seedBytes{0}, publishedBytes{0};
+    std::atomic<std::uint64_t> taken{0}, reused{0}, refused{0}, moved{0}, seedBytes{0}, publishedBytes{0}, readers{0}, readerBytes{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -3874,8 +3874,8 @@ void reportBufferShadow() {
     if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
     static std::uint64_t lastTaken = 0, lastReused = 0, lastSeed = 0, lastPublished = 0;
     const auto taken = stats.taken.load(), reused = stats.reused.load(), seed = stats.seedBytes.load(), published = stats.publishedBytes.load();
-    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published; last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
-        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0,
+    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published, %llu read-only regions bound to slabs by builds (%.1f MiB not read in place); last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
+        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0, static_cast<unsigned long long>(stats.readers.load()), stats.readerBytes.load() / 1048576.0,
         static_cast<unsigned long long>(taken - lastTaken), static_cast<unsigned long long>(reused - lastReused), (seed - lastSeed) / 1048576.0, (published - lastPublished) / 1048576.0);
     lastTaken = taken;
     lastReused = reused;
@@ -4139,6 +4139,35 @@ bool GuestBufferMemory::shadowEligible(const Region& region, bool addressable) c
     if (!BufferShadowEnabled() || !stagingAllowed || addressable || region.unstaged || region.shadow || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     return bytes >= bufferShadowMin() && bytes <= bufferShadowMax() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+}
+
+bool GuestBufferMemory::takeShadowSource(Region& region, const HostImport& import) {
+    if (!BufferShadowReaders() || !stagingAllowed || region.unstaged || region.sparse || region.mirror != nullptr || WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) return false;
+    auto source = RangeShadowSource(context, import, region.begin, region.end);
+    if (!source.has_value()) return false;
+    HostImport key{};
+    key.base = import.base;
+    key.bytes = import.bytes;
+    key.buffer = import.buffer;
+    key.lead = import.lead;
+    region.shadow = true;
+    region.shadowReader = true;
+    region.shadowSlab = source->slab;
+    region.shadowPin = source->pin;
+    region.shadowOffset = source->offset;
+    region.shadowImport = key;
+    region.shadowSeeds.clear();
+    region.gpuCopy = true;
+    region.deviceLocal = true;
+    region.copySource = import.buffer;
+    region.copySourceBase = import.base - import.lead;
+    region.copiedBack = false;
+    region.direct = nullptr;
+    region.buffer.reset();
+    region.snapshot.clear();
+    bufferShadowStats().readers.fetch_add(1, std::memory_order_relaxed);
+    bufferShadowStats().readerBytes.fetch_add(region.end - region.begin, std::memory_order_relaxed);
+    return true;
 }
 
 bool GuestBufferMemory::takeShadow(Region& region, const HostImport& import) {
@@ -4574,6 +4603,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
             if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            // A read-only range a range slab holds whole is read from the slab instead (after the
+            // flush: a storage write-back into the slab's units lands in it, one into the import
+            // takes the authority of its pages, and the source is then refused).
+            if (recorder != nullptr && !addressable && takeShadowSource(region, *region.direct)) gpuCopies.push_back(&region);
             continue;
         }
         if (copyOnGpu) {
@@ -5951,7 +5984,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         if (region.shadow) {
             // The descriptors name the slab and offset the build took: a slab grown, evicted or
             // retired since makes the reuse fail (the build is made again).
-            auto destination = RangeShadowDestination(context, region.shadowImport, region.begin, region.end);
+            auto destination = region.shadowReader ? RangeShadowSource(context, region.shadowImport, region.begin, region.end) : RangeShadowDestination(context, region.shadowImport, region.begin, region.end);
             if (!destination.has_value() || destination->slab != region.shadowSlab || destination->offset != region.shadowOffset) {
                 bufferShadowStats().moved.fetch_add(1, std::memory_order_relaxed);
                 throw std::runtime_error("the range slab of a reused build's region moved");

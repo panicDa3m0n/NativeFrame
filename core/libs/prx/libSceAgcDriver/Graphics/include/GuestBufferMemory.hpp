@@ -412,6 +412,9 @@ private:
         // from a staging buffer, and MarkDirectWrites marks them fresh and published in the slab.
         // `shadowImport` names the import (base, bytes, buffer, lead).
         bool shadow = false;
+        // O16.T14: a read-only region bound to a range slab that holds every byte of it (see
+        // RangeShadowSource): no seed, no copy-back, out of the in-place reads.
+        bool shadowReader = false;
         std::shared_ptr<ShadowSlab> shadowSlab {};
         std::shared_ptr<ShadowSlabPin> shadowPin {};
         VkDeviceSize shadowOffset = 0;
@@ -465,6 +468,7 @@ private:
     bool stagingEligible(const Region& region, bool addressable) const;
     bool shadowEligible(const Region& region, bool addressable) const;
     bool takeShadow(Region& region, const HostImport& import);
+    bool takeShadowSource(Region& region, const HostImport& import);
     void verifyShadowSeeded(Recorder& recorder, VkCommandBuffer commands, std::span<Region* const> copies) const;
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with

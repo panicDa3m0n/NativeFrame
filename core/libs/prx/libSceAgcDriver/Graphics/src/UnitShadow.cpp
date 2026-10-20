@@ -598,10 +598,15 @@ bool evictOne(Shadows& registry) {
 // A destination in the range slab owning units [first, last] at guest `begin`: the units are
 // collected and settled first (written bytes that lost their authority leave the written ranges);
 // the bytes of [seedBegin, seedEnd) outside the written ranges are the caller's seeds.
-std::optional<ShadowDestination> rangeDestination(const std::shared_ptr<UnitShadow>& shadow, const HostImport& import, std::uint64_t first, std::uint64_t last, std::uint64_t begin, std::uint64_t seedBegin, std::uint64_t seedEnd) {
+// `uncached`: the collect walks the span whatever the epoch did (a writer, whose copy-back lands over
+// the import); a reader's collect follows the epoch, as an in-place read's would.
+std::optional<ShadowDestination> rangeDestination(const std::shared_ptr<UnitShadow>& shadow, const HostImport& import, std::uint64_t first, std::uint64_t last, std::uint64_t begin, std::uint64_t seedBegin, std::uint64_t seedEnd, bool uncached = true) {
     const auto spanBegin = std::max(shadow->UnitBegin(first), shadow->importBase);
     const auto spanEnd = std::min(shadow->UnitBegin(last + 1), shadow->ImportEnd());
-    if (spanEnd > spanBegin) GuestMemory::CollectWritesUncached(spanBegin, static_cast<std::size_t>(spanEnd - spanBegin));
+    if (spanEnd > spanBegin) {
+        if (uncached) GuestMemory::CollectWritesUncached(spanBegin, static_cast<std::size_t>(spanEnd - spanBegin));
+        else static_cast<void>(GuestMemory::CollectWrites(spanBegin, static_cast<std::size_t>(spanEnd - spanBegin)));
+    }
     std::lock_guard lock(Registry().mutex);
     const auto owner = shadow->owner[first];
     if (owner == 0) return std::nullopt;
@@ -796,6 +801,33 @@ std::optional<ShadowDestination> RangeShadowDestination(const Context& context, 
         if (TraceEnabled()) std::fprintf(stderr, "[shadow] range slab of import 0x%llx: units %llu..%llu (%.1f MiB), %zu absorbed, %zu grid pieces rehomed\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(spanFirst), static_cast<unsigned long long>(spanLast), needed / 1048576.0, absorbed.size(), rehome.size());
     }
     return rangeDestination(shadow, import, first, last, begin, begin, end);
+}
+
+bool BufferShadowReaders() {
+    static const bool enabled = BufferShadowEnabled() && std::getenv("APS5_NO_BUFFER_SHADOW_READERS") == nullptr;
+    return enabled;
+}
+
+std::optional<ShadowDestination> RangeShadowSource(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
+    if (!BufferShadowReaders() || end <= begin || begin < import.base || end > import.base + import.bytes) return std::nullopt;
+    std::shared_ptr<UnitShadow> shadow;
+    std::uint64_t first = 0, last = 0;
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        shadow = find(registry, import);
+        if (shadow == nullptr || shadow->context.device != context.device || shadow->rangeOwned == 0) return std::nullopt;
+        first = shadow->UnitOf(begin);
+        last = shadow->UnitOf(end - 1);
+        const auto owner = shadow->owner[first];
+        if (owner == 0 || shadow->ranges[owner - 1].slab == nullptr) return std::nullopt;
+        for (auto unit = first + 1; unit <= last; ++unit) {
+            if (shadow->owner[unit] != owner) return std::nullopt;
+        }
+    }
+    auto source = rangeDestination(shadow, import, first, last, begin, begin, end, false);
+    if (!source.has_value() || !source->seedUnits.empty()) return std::nullopt;
+    return source;
 }
 
 std::size_t PublishShadowBorders(const HostImport& import, std::span<const ShadowedRange> ranges) {

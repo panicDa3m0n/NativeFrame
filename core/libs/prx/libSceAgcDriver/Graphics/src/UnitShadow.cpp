@@ -23,7 +23,7 @@ namespace {
 
 constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
-constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "rehome", "border"};
+constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "rehome", "border", "writer"};
 
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
@@ -48,6 +48,11 @@ std::atomic<std::int64_t> tracePublishesLeft{[] {
     return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
 }()};
 std::atomic<std::int64_t> traceSeedsLeft{64};
+std::atomic<std::uint64_t> bufferShadowSerial{1};
+
+void bumpBufferShadowSerial() {
+    bufferShadowSerial.fetch_add(1, std::memory_order_acq_rel);
+}
 
 bool TraceEnabled() {
     static const bool enabled = std::getenv("APS5_TRACE_SHADOW") != nullptr;
@@ -255,14 +260,16 @@ void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t l
 
 // The bytes of [from, to) inside `unit` (owned by a range slab) that slab is authoritative for: its
 // written ranges on the pages no store reached since the unit's generation; none for a unit never
-// marked or dropped. Under the registry mutex (the tracker's is taken after it).
-GuestRanges authoritativeParts(const UnitShadow& shadow, std::uint64_t unit, std::uint64_t from, std::uint64_t to) {
+// marked or dropped. `unchanged`: the caller's tracker query found no stamp over the unit newer
+// than its generation, so every written byte holds (no page query). Under the registry mutex (the
+// tracker's is taken after it).
+GuestRanges authoritativeParts(const UnitShadow& shadow, std::uint64_t unit, std::uint64_t from, std::uint64_t to, bool unchanged = false) {
     GuestRanges result;
     const auto* range = shadow.RangeOf(unit);
     if (range == nullptr || shadow.generation[unit] == 0) return result;
     const auto [unitBegin, unitEnd] = shadow.UnitRange(unit);
     const auto written = clippedRanges(range->written, std::max(from, unitBegin), std::min(to, unitEnd));
-    if (written.empty()) return result;
+    if (written.empty() || unchanged) return written;
     constexpr auto PageBytes = static_cast<std::uint64_t>(GuestMemory::StoredPageBytes);
     std::array<std::uint8_t, UnitBytes / PageBytes + 1> stored{};
     const auto firstPage = unitBegin / PageBytes;
@@ -286,11 +293,13 @@ GuestRanges authoritativeParts(const UnitShadow& shadow, std::uint64_t unit, std
 // unit was dropped) leave the written ranges, so the new generation does not make them current
 // again. The caller collected the units first.
 void settleRangeUnits(UnitShadow& shadow, std::uint64_t first, std::uint64_t last) {
+    std::vector<std::uint8_t> changed, cpu;
+    changedUnits(shadow, first, last, changed, cpu);
     for (auto unit = first; unit <= last; ++unit) {
         auto* range = shadow.RangeOf(unit);
         if (range == nullptr) continue;
         const auto [unitBegin, unitEnd] = shadow.UnitRange(unit);
-        const auto kept = authoritativeParts(shadow, unit, unitBegin, unitEnd);
+        const auto kept = authoritativeParts(shadow, unit, unitBegin, unitEnd, changed[static_cast<std::size_t>(unit - first)] == GuestMemory::BlockUnchanged);
         removeRange(range->written, unitBegin, unitEnd);
         for (const auto& [begin, end] : kept) addRange(range->written, begin, end);
     }
@@ -410,6 +419,14 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
                 Stats().mismatches.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<int> reports{0};
                 if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[shadow] verify: published bytes differ from the slab at 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(region.size));
+                static const bool abortOnDifference = [] {
+                    const char* text = std::getenv("APS5_VERIFY_BUFFER_SHADOW");
+                    return text != nullptr && std::strcmp(text, "abort") == 0;
+                }();
+                if (abortOnDifference) {
+                    std::fflush(stderr);
+                    std::abort();
+                }
             }
         }
     }
@@ -453,7 +470,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 // the written ranges.
                 const auto& slab = range->slab;
                 const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
-                const auto parts = slab != nullptr ? authoritativeParts(*shadow, unit, unitBegin, unitEnd) : GuestRanges{};
+                const auto parts = slab != nullptr ? authoritativeParts(*shadow, unit, unitBegin, unitEnd, changed[k] == GuestMemory::BlockUnchanged) : GuestRanges{};
                 removeRange(range->written, unitBegin, unitEnd);
                 for (const auto& [begin, end] : parts) addRange(range->written, begin, end);
                 if (parts.empty()) {
@@ -566,7 +583,10 @@ bool evictOne(Shadows& registry) {
             --victim->rangeOwned;
         }
     }
-    if (victimRange) victim->ranges[victimSlab].written.clear();
+    if (victimRange) {
+        victim->ranges[victimSlab].written.clear();
+        bumpBufferShadowSerial();
+    }
     victim->Recount();
     registry.liveBytes -= SlabBytes(*slab);
     --registry.liveSlabs;
@@ -635,12 +655,37 @@ bool UnitShadowEnabled() {
 }
 
 bool ShadowVerify() {
-    static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr;
+    static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr || std::getenv("APS5_VERIFY_BUFFER_SHADOW") != nullptr;
     return verify;
 }
 
+void NoteShadowVerification(bool matched, std::uint64_t address, std::uint64_t bytes) {
+    Stats().verified.fetch_add(1, std::memory_order_relaxed);
+    if (matched) return;
+    Stats().mismatches.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[bufshadow] verify: the seeded slab differs from the import at 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+    static const bool abortOnDifference = [] {
+        const char* text = std::getenv("APS5_VERIFY_BUFFER_SHADOW");
+        return text != nullptr && std::strcmp(text, "abort") == 0;
+    }();
+    if (abortOnDifference) {
+        std::fflush(stderr);
+        std::abort();
+    }
+}
+
+bool BufferShadowEnabled() {
+    static const bool enabled = std::getenv("APS5_BUFFER_SHADOW") != nullptr && UnitShadowEnabled();
+    return enabled;
+}
+
+std::uint64_t BufferShadowSerial() {
+    return bufferShadowSerial.load(std::memory_order_acquire);
+}
+
 bool RangeSlabsEnabled() {
-    static const bool enabled = std::getenv("APS5_RANGE_SLABS") != nullptr;
+    static const bool enabled = std::getenv("APS5_RANGE_SLABS") != nullptr || std::getenv("APS5_BUFFER_SHADOW") != nullptr;
     return enabled;
 }
 
@@ -747,6 +792,7 @@ std::optional<ShadowDestination> RangeShadowDestination(const Context& context, 
         // The absorbed slabs' bytes move first: every unit they owned is the new slab's now.
         recordSlabMoves(context, slab, moved);
         (absorbed.empty() ? Stats().rangeMade : Stats().rangeGrown).fetch_add(1, std::memory_order_relaxed);
+        bumpBufferShadowSerial();
         if (TraceEnabled()) std::fprintf(stderr, "[shadow] range slab of import 0x%llx: units %llu..%llu (%.1f MiB), %zu absorbed, %zu grid pieces rehomed\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(spanFirst), static_cast<unsigned long long>(spanLast), needed / 1048576.0, absorbed.size(), rehome.size());
     }
     return rangeDestination(shadow, import, first, last, begin, begin, end);
@@ -1026,7 +1072,7 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
                 ranged[k] = 1;
                 if (slab != nullptr) {
                     const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
-                    parts[k] = authoritativeParts(*shadow, unit, unitBegin, unitEnd);
+                    parts[k] = authoritativeParts(*shadow, unit, unitBegin, unitEnd, changed[k] == GuestMemory::BlockUnchanged);
                 }
                 fresh[k] = parts[k].empty() ? 0 : 1;
                 continue;
@@ -1134,15 +1180,20 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
     return result;
 }
 
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation) {
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, bool published) {
     if (!UnitShadowEnabled() || ranges.empty() || generation == 0) return;
     auto& registry = Registry();
     std::uint64_t bytes = 0;
     std::uint64_t lost = 0;
+    bool grid = false, ranged = false;
     {
         std::lock_guard lock(registry.mutex);
         const auto shadow = find(registry, import);
-        if (shadow == nullptr) return;
+        if (shadow == nullptr) {
+            for (const auto& range : ranges) lost += range.end > range.begin ? (range.end - range.begin + UnitBytes - 1) / UnitBytes : 0;
+            Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
+            return;
+        }
         const auto present = Recorder::Presents();
         for (const auto& [begin, end, slab] : ranges) {
             if (end <= begin) continue;
@@ -1159,9 +1210,13 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                     const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
                     if (shadow->generation[unit] == 0) removeRange(range->written, unitBegin, unitEnd);
                     addRange(range->written, std::max(begin, unitBegin), std::min(end, unitEnd));
+                    ranged = true;
+                } else {
+                    grid = true;
                 }
+                const bool clean = shadow->generation[unit] == 0 || shadow->published[unit] != 0;
                 shadow->generation[unit] = generation;
-                shadow->published[unit] = 0;
+                shadow->published[unit] = published && clean && shadow->RangeOf(unit) != nullptr ? 1 : 0;
                 current->lastUse = present;
             }
         }
@@ -1175,8 +1230,9 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     Stats().retiled.fetch_add(1, std::memory_order_relaxed);
     Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
-    // source, as they see a write-back.
-    StorageTexture::BumpPendingSerial();
+    // source, as they see a write-back; a buffer writer's range units move their own serial.
+    if (grid) StorageTexture::BumpPendingSerial();
+    if (ranged) bumpBufferShadowSerial();
 }
 
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {
@@ -1224,6 +1280,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
         registry.liveBytes -= SlabBytes(slab);
         --registry.liveSlabs;
     });
+    if (!shadow->ranges.empty()) bumpBufferShadowSerial();
     ++registry.retired;
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
@@ -1254,6 +1311,7 @@ void DestroyShadows(VkDevice device) {
             registry.liveBytes -= SlabBytes(slab);
             --registry.liveSlabs;
         });
+        if (!it->second->ranges.empty()) bumpBufferShadowSerial();
         it = registry.byBase.erase(it);
     }
 }

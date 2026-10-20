@@ -49,7 +49,7 @@ bool UnitShadowEnabled();
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
 // so the neighbours' results in the rest of the unit reach the import before the write stamps it).
 enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
-enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Rehome, Border, Count };
+enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Rehome, Border, Writer, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
@@ -140,6 +140,13 @@ std::optional<ShadowDestination> ShadowDestinationFor(const Context& context, co
 // [begin, end) outside the written ranges, which the caller seeds from the import before binding.
 // nullopt when APS5_RANGE_SLABS is unset or the budget refuses (the caller stages as before).
 bool RangeSlabsEnabled();
+// O16.T13 P2 (APS5_BUFFER_SHADOW=1, which turns range slabs on too): a large written buffer region
+// of a recorded use takes a range slab (GuestBufferMemory), and its written bytes are published
+// right after its work (PublishReason::Writer) in place of today's copy-back.
+bool BufferShadowEnabled();
+// Moves whenever range units are marked or a range slab is made, grown, evicted or retired (a
+// buffer writer's MarkShadowed does not move StorageTexture::PendingSerial).
+std::uint64_t BufferShadowSerial();
 std::optional<ShadowDestination> RangeShadowDestination(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
 // After a writer's MarkShadowed into range slabs: the first and last page of each range, when they
 // hold bytes outside it, publish their written bytes at once, so a store into those neighbours does
@@ -154,8 +161,13 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 // After a retile's copies were recorded: the units of `ranges` (guest) hold the newest bytes at
 // `generation`, unpublished. A unit whose slab is no longer the one the copies went into is not
 // marked (counted `slab lost`). In a range slab the ranges join its written ranges. Bumps
-// StorageTexture's pending serial.
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation);
+// StorageTexture's pending serial when grid units were marked, BufferShadowSerial when range
+// units were.
+// `published`: the bytes reached the import too (a range slab region's copy-back); a range unit
+// with no unpublished results of its own then stays published.
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, bool published = false);
+// A range slab region's seeded slab compared with its import before the work (verification).
+void NoteShadowVerification(bool matched, std::uint64_t address, std::uint64_t bytes);
 // retireImport: publishes the fresh units whose memory `registered` still names as a readable
 // registered range into the (old) import buffer, hands the slabs to the batch and drops the shadow.
 // The import retires because its registration vanished or changed size, so the rest of its memory

@@ -110,6 +110,8 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
+struct ShadowSlab;
+struct ShadowSlabPin;
 class Recorder;
 
 template<typename TRange>
@@ -403,6 +405,18 @@ private:
         std::uint64_t copyBackGeneration = 0;
         bool planned = false;
         std::vector<StagedPiece> plannedPieces {};
+        // O16.T13 (APS5_BUFFER_SHADOW, see shadowEligible): the region binds a range slab of its
+        // import's unit shadow at `shadowOffset` (gpuCopy and deviceLocal are set too, so the
+        // staging rules hold for it). `shadowSeeds` are copied in from the import before the work;
+        // RecordCopyBacks copies the written sub-ranges back from the slab into `copySource` as
+        // from a staging buffer, and MarkDirectWrites marks them fresh and published in the slab.
+        // `shadowImport` names the import (base, bytes, buffer, lead).
+        bool shadow = false;
+        std::shared_ptr<ShadowSlab> shadowSlab {};
+        std::shared_ptr<ShadowSlabPin> shadowPin {};
+        VkDeviceSize shadowOffset = 0;
+        HostImport shadowImport {};
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> shadowSeeds {};
     };
     void planStagingCopy(Region& region, bool copiedBack, std::span<const Buffer* const> own);
 
@@ -449,6 +463,9 @@ private:
     // and an atomic element or a size within the written-shadow window. Independent of the import,
     // so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    bool shadowEligible(const Region& region, bool addressable) const;
+    bool takeShadow(Region& region, const HostImport& import);
+    void verifyShadowSeeded(Recorder& recorder, VkCommandBuffer commands, std::span<Region* const> copies) const;
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.

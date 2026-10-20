@@ -75,7 +75,7 @@ def gate_script():
     return "\n".join(script)
 
 
-class RelinkerEligibilityTests(unittest.TestCase):
+class BuildEligibilityTests(unittest.TestCase):
     def setUp(self):
         self.node = shutil.which("node")
         if not self.node:
@@ -88,58 +88,43 @@ class RelinkerEligibilityTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_gate(self, commits, search, files=("core/relinker/main.cpp",), manual=False):
+    def run_gate(self, files=("core/relinker/main.cpp",), manual=False):
         scenario = self.root / "scenario.json"
-        scenario.write_text(json.dumps({"commits": commits, "search": search, "files": list(files), "manual": manual}),
+        scenario.write_text(json.dumps({"commits": [], "search": None, "files": list(files), "manual": manual}),
                             encoding="utf-8")
-        environment = dict(os.environ, PR_NUMBER="7", GITHUB_TRIGGERING_ACTOR="maintainer")
         result = subprocess.run([self.node, "harness.js", "scenario.json", "gate.js"], cwd=self.root,
-                                capture_output=True, text=True, env=environment, timeout=90)
+                                capture_output=True, text=True, env=dict(os.environ), timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return json.loads(result.stdout)
 
-    def test_author_with_a_commit_in_main_runs_the_relinker(self):
-        result = self.run_gate([{"sha": "a"}], None)
-        self.assertIs(result["outputs"]["relinker"], True)
-        self.assertEqual(result["calls"], [["listCommits", "main", "author"]])
-
-    def test_author_with_only_merged_pull_requests_runs_the_relinker(self):
-        result = self.run_gate([], {"total_count": 12, "incomplete_results": False, "items": []})
-        self.assertIs(result["outputs"]["relinker"], True)
-        self.assertEqual(result["calls"], [["listCommits", "main", "author"],
-                                           ["search", "repo:owner/project is:pr is:merged base:main author:author"]])
-        self.assertEqual(result["warnings"], [])
-
-    def test_author_without_merged_pull_requests_skips_the_relinker(self):
-        result = self.run_gate([], {"total_count": 0, "incomplete_results": False, "items": []})
-        self.assertIs(result["outputs"]["relinker"], False)
-        self.assertEqual(result["warnings"], [])
-        self.assertIn("no commit or merged pull request in main was found for the author", result["summary"])
-
-    def test_failed_search_skips_the_relinker_with_a_warning(self):
-        result = self.run_gate([], None)
-        self.assertIs(result["outputs"]["relinker"], False)
-        self.assertEqual(result["outputs"]["sha"], "main")
-        self.assertEqual(len(result["warnings"]), 1)
-        self.assertIn("API rate limit exceeded", result["warnings"][0])
-
-    def test_incomplete_search_skips_the_relinker_with_a_warning(self):
-        result = self.run_gate([], {"total_count": 3, "incomplete_results": True, "items": []})
-        self.assertIs(result["outputs"]["relinker"], False)
-        self.assertEqual(len(result["warnings"]), 1)
-        self.assertIn("incomplete", result["warnings"][0])
-
-    def test_pull_request_without_relinker_files_checks_no_author(self):
-        result = self.run_gate([], None, files=("core/libs/tests/write_watch/a.cpp",))
-        self.assertIs(result["outputs"]["relinker"], False)
-        self.assertIs(result["outputs"]["write-watch"], True)
+    def test_code_change_runs_every_build(self):
+        result = self.run_gate()
+        self.assertIs(result["outputs"]["code"], True)
+        self.assertIn("changes code", result["summary"])
         self.assertEqual(result["calls"], [])
 
-    def test_manual_run_checks_no_author(self):
-        result = self.run_gate([], None, manual=True)
-        self.assertIs(result["outputs"]["relinker"], True)
+    def test_documentation_only_skips_the_builds(self):
+        result = self.run_gate(files=("README.md", "docs/research/cpu-chain.md", "core/libs/notes.md", "NOTICE",
+                                      ".github/ISSUE_TEMPLATE/bug.yml", ".github/CODEOWNERS"))
+        self.assertIs(result["outputs"]["code"], False)
+        self.assertIn("documentation only", result["summary"])
+
+    def test_one_code_file_among_documentation_runs_every_build(self):
+        result = self.run_gate(files=("README.md", "docs/dev/BUILD.md", "tools/check_conventions.py"))
+        self.assertIs(result["outputs"]["code"], True)
+
+    def test_files_beside_documentation_count_as_code(self):
+        for path in (".github/workflows/build.yml", ".github/dependabot.yml", "docs.cmake", "LICENSE.txt"):
+            with self.subTest(path=path):
+                self.assertIs(self.run_gate(files=(path,))["outputs"]["code"], True)
+
+    def test_pull_request_without_files_runs_every_build(self):
+        self.assertIs(self.run_gate(files=())["outputs"]["code"], True)
+
+    def test_manual_run_builds_without_reading_the_pull_request(self):
+        result = self.run_gate(files=("README.md",), manual=True)
+        self.assertIs(result["outputs"]["code"], True)
         self.assertEqual(result["calls"], [])
-        self.assertIs(self.run_gate([], None, files=("README.md",), manual=True)["outputs"]["relinker"], False)
 
 
 if __name__ == "__main__":

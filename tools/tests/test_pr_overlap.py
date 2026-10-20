@@ -316,7 +316,10 @@ class CommentStateTests(unittest.TestCase):
     def setUp(self):
         if os.name == "nt" or not all(shutil.which(tool) for tool in ("bash", "jq", "sed", "sha256sum")):
             self.skipTest("the workflow step runs in bash with jq, sed and sha256sum on Linux")
-        lines = (Path(__file__).resolve().parents[2] / ".github/workflows/pr-overlap.yml").read_text(encoding="utf-8").splitlines()
+        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/pr-overlap.yml"
+        if not workflow.exists():
+            self.skipTest("this repository does not run the PR overlap workflow")
+        lines = workflow.read_text(encoding="utf-8").splitlines()
         start = next(index for index, line in enumerate(lines) if "tools/pr_overlap.py" in line)
         indent = len(lines[start]) - len(lines[start].lstrip())
         while start > 0 and len(lines[start - 1]) - len(lines[start - 1].lstrip()) == indent:

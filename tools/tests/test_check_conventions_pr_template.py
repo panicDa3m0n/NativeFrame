@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -124,6 +125,35 @@ class PullRequestTemplateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("[pr-title] Pull request title is not Conventional Commits", result.stdout)
 
+
+    def run_event(self, user, title="ci: bump actions/checkout", text="Bumps actions/checkout from 6 to 7."):
+        event = {"pull_request": {"title": title, "body": text, "user": user}}
+        (self.root / "event.json").write_text(json.dumps(event), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-I", str(CHECKER), "--base", "HEAD", "--head", "HEAD", "--event", "event.json"],
+            cwd=self.root, capture_output=True, text=True, encoding="utf-8",
+            env={key: value for key, value in os.environ.items()
+                 if key not in ("GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_ACTIONS")},
+        )
+        return result, [line[len(PREFIX):] for line in result.stdout.splitlines() if line.startswith(PREFIX)]
+
+    def test_dependabot_pull_request_skips_the_template(self):
+        result, findings = self.run_event({"login": "dependabot[bot]", "type": "Bot"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(findings, [])
+
+    def test_dependabot_title_is_still_checked(self):
+        result, _ = self.run_event({"login": "dependabot[bot]", "type": "Bot"}, title="Bump actions/checkout")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("[pr-title] Pull request title is not Conventional Commits", result.stdout)
+
+    def test_other_authors_of_the_same_description_fill_the_template(self):
+        for user in ({"login": "someone", "type": "User"}, {"login": "dependabot[bot]", "type": "User"},
+                     {"login": "renovate[bot]", "type": "Bot"}, None):
+            with self.subTest(user=user):
+                result, findings = self.run_event(user)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("section 'What' is missing or empty", findings)
 
 if __name__ == "__main__":
     unittest.main()

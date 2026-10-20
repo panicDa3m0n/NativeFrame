@@ -4942,6 +4942,489 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     return CachedTable{tableSerial, tableRanges.get()};
 }
 
+namespace {
+
+#ifdef _WIN32
+// The written ranges the read probe watches (groups, with their counts) and their protected pages
+// (an open-addressed table, one entry per 4 KiB page with the protection it had). The fault handler
+// allocates nothing and takes only this lock, which no holder keeps across an access to guest
+// memory or a call that can wait on the loader lock.
+struct ReadProbeGroup {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t notes = 0;
+    std::uint64_t protects = 0;
+    std::uint64_t titleCaller = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeModule::Count)> reads{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeModule::Count)> writes{};
+};
+
+struct ReadProbePage {
+    std::uint64_t page = 0;
+    std::uint32_t group = 0;
+    DWORD previous = 0;
+    bool armed = false;
+    bool given = false;
+};
+
+struct ReadProbeCaller {
+    std::uint64_t pc = 0;
+    std::uint64_t faults = 0;
+    ProbeModule module = ProbeModule::Other;
+};
+
+struct ReadProbe {
+    static constexpr std::size_t Groups = 1024;
+    static constexpr unsigned PageBits = 18;
+    static constexpr std::size_t Pages = std::size_t{1} << PageBits;
+    static constexpr std::size_t Pending = 8192;
+    static constexpr std::size_t Callers = 16;
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::array<ReadProbeGroup, Groups> groups{};
+    std::size_t groupCount = 0;
+    std::array<ReadProbePage, Pages> pages{};
+    std::size_t pageCount = 0;
+    std::array<std::uint64_t, Pending> pending{};
+    std::size_t pendingCount = 0;
+    std::array<ReadProbeCaller, Callers> callers{};
+    std::size_t callerCount = 0;
+    BufferReadProbeCounts totals;
+    std::uintptr_t titleBegin = 0;
+    std::uintptr_t titleEnd = 0;
+    std::uintptr_t driverBegin = 0;
+    std::uintptr_t driverEnd = 0;
+    std::uint64_t lastReport = 0;
+};
+
+constexpr std::uint64_t ProbePage = 4096;
+constexpr std::uint32_t AnyGroup = 0xffffffffu;
+
+ReadProbe& readProbe() {
+    static ReadProbe probe;
+    return probe;
+}
+
+std::pair<std::uintptr_t, std::uintptr_t> moduleRange(HMODULE module) {
+    if (module == nullptr) return {0, 0};
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<std::uintptr_t>(dos->e_lfanew));
+    return {base, base + nt->OptionalHeader.SizeOfImage};
+}
+
+ProbeModule moduleOf(const ReadProbe& probe, std::uintptr_t pc) {
+    if (pc >= probe.titleBegin && pc < probe.titleEnd) return ProbeModule::Title;
+    if (pc >= probe.driverBegin && pc < probe.driverEnd) return ProbeModule::Driver;
+    return ProbeModule::Other;
+}
+
+// The module an access belongs to: the faulting instruction's, or, inside another module (the C
+// runtime's memcpy or memcmp, a system library), the first caller within four frames that is the
+// title's image or this driver.
+std::pair<ProbeModule, std::uintptr_t> callerOf(const ReadProbe& probe, const CONTEXT& faulting) {
+    auto pc = static_cast<std::uintptr_t>(faulting.Rip);
+    const auto first = moduleOf(probe, pc);
+    if (first != ProbeModule::Other) return {first, pc};
+    CONTEXT context = faulting;
+    for (int frame = 0; frame < 4; ++frame) {
+        DWORD64 imageBase = 0;
+        auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (function == nullptr) {
+            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+            context.Rsp += 8;
+        } else {
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+        }
+        if (context.Rip == 0) break;
+        const auto module = moduleOf(probe, static_cast<std::uintptr_t>(context.Rip));
+        if (module != ProbeModule::Other) return {module, static_cast<std::uintptr_t>(context.Rip)};
+    }
+    return {ProbeModule::Other, pc};
+}
+
+// The page's entry, inserted when asked while the table stays at most half full.
+ReadProbePage* pageEntry(ReadProbe& probe, std::uint64_t page, bool insert) {
+    auto index = static_cast<std::size_t>(((page / ProbePage) * 0x9e3779b97f4a7c15ull) >> (64u - ReadProbe::PageBits));
+    for (std::size_t step = 0; step < ReadProbe::Pages; ++step) {
+        auto& entry = probe.pages[index];
+        if (entry.page == page) return &entry;
+        if (entry.page == 0) {
+            if (!insert || probe.pageCount * 2 >= ReadProbe::Pages) return nullptr;
+            entry.page = page;
+            ++probe.pageCount;
+            return &entry;
+        }
+        index = (index + 1) & (ReadProbe::Pages - 1);
+    }
+    return nullptr;
+}
+
+enum class ArmPages : std::uint8_t { All, Given, Disarmed };
+
+// Makes the readable pages of [from, to) PAGE_NOACCESS, one VirtualProtect per run of chosen pages
+// of uniform protection: every page for a protect (taken into the group), the pages a scope gave
+// back, or the pages already known and not armed (driver and other faults). An armed page found
+// readable again was made accessible by someone else: it counts as lost and is armed again.
+bool armPages(ReadProbe& probe, std::uint64_t from, std::uint64_t to, std::uint32_t group, ArmPages which) {
+    bool armedAny = false;
+    for (auto at = from; at < to;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region)) == 0) break;
+        const auto regionEnd = std::min<std::uint64_t>(to, reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize);
+        if (region.State == MEM_COMMIT && (region.Protect & (PAGE_READWRITE | PAGE_READONLY)) != 0) {
+            std::uint64_t spanBegin = 0;
+            const auto flush = [&](std::uint64_t spanEnd) {
+                if (spanBegin == 0) return;
+                DWORD old = 0;
+                const bool done = VirtualProtect(reinterpret_cast<void*>(spanBegin), static_cast<SIZE_T>(spanEnd - spanBegin), PAGE_NOACCESS, &old) != 0;
+                for (auto page = spanBegin; page < spanEnd; page += ProbePage) pageEntry(probe, page, false)->armed = done;
+                armedAny = armedAny || done;
+                spanBegin = 0;
+            };
+            for (auto page = at; page < regionEnd; page += ProbePage) {
+                auto* entry = pageEntry(probe, page, which == ArmPages::All);
+                const bool chosen = entry != nullptr && (which == ArmPages::All || (which == ArmPages::Given ? entry->given : !entry->armed && !entry->given));
+                if (!chosen) {
+                    flush(page);
+                    continue;
+                }
+                if (entry->armed) ++probe.totals.lost;
+                if (which == ArmPages::All) entry->group = group;
+                entry->given = false;
+                entry->previous = region.Protect;
+                if (spanBegin == 0) spanBegin = page;
+            }
+            flush(regionEnd);
+        }
+        at = regionEnd;
+    }
+    return armedAny;
+}
+
+// Gives the armed pages of [from, to) (of one group, or any) their protection back, one
+// VirtualProtect per run of equal previous protection; `given` marks them for the end of a scope.
+std::uint64_t restorePages(ReadProbe& probe, std::uint64_t from, std::uint64_t to, std::uint32_t group, bool given) {
+    std::uint64_t restored = 0;
+    for (auto at = from; at < to;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region)) == 0) break;
+        const auto regionEnd = std::min<std::uint64_t>(to, reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize);
+        if (region.State == MEM_COMMIT && region.Protect == PAGE_NOACCESS) {
+            std::uint64_t spanBegin = 0;
+            DWORD spanPrevious = 0;
+            const auto flush = [&](std::uint64_t spanEnd) {
+                if (spanBegin == 0) return;
+                DWORD old = 0;
+                VirtualProtect(reinterpret_cast<void*>(spanBegin), static_cast<SIZE_T>(spanEnd - spanBegin), spanPrevious, &old);
+                spanBegin = 0;
+            };
+            for (auto page = at; page < regionEnd; page += ProbePage) {
+                auto* entry = pageEntry(probe, page, false);
+                if (entry == nullptr || !entry->armed || (group != AnyGroup && entry->group != group)) {
+                    flush(page);
+                    continue;
+                }
+                if (spanBegin != 0 && entry->previous != spanPrevious) flush(page);
+                if (spanBegin == 0) {
+                    spanBegin = page;
+                    spanPrevious = entry->previous;
+                }
+                entry->armed = false;
+                entry->given = given;
+                ++restored;
+            }
+            flush(regionEnd);
+        }
+        at = regionEnd;
+    }
+    return restored;
+}
+
+void noteCaller(ReadProbe& probe, ProbeModule module, std::uintptr_t pc) {
+    for (std::size_t i = 0; i < probe.callerCount; ++i) {
+        if (probe.callers[i].pc == pc) {
+            ++probe.callers[i].faults;
+            return;
+        }
+    }
+    if (probe.callerCount < ReadProbe::Callers) probe.callers[probe.callerCount++] = ReadProbeCaller{pc, 1, module};
+}
+
+// Arms again, in address order and in runs, the pages a driver or other fault gave back.
+void armPending(ReadProbe& probe) {
+    if (probe.pendingCount == 0) return;
+    std::sort(probe.pending.begin(), probe.pending.begin() + static_cast<std::ptrdiff_t>(probe.pendingCount));
+    std::size_t i = 0;
+    while (i < probe.pendingCount) {
+        auto stop = probe.pending[i] + ProbePage;
+        std::size_t j = i + 1;
+        while (j < probe.pendingCount && probe.pending[j] <= stop) {
+            stop = std::max(stop, probe.pending[j] + ProbePage);
+            ++j;
+        }
+        armPages(probe, probe.pending[i], stop, 0, ArmPages::Disarmed);
+        i = j;
+    }
+    probe.pendingCount = 0;
+}
+
+LONG CALLBACK readProbeFault(EXCEPTION_POINTERS* info) {
+    const auto* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
+    const bool write = record->ExceptionInformation[0] == 1;
+    const auto page = address / ProbePage * ProbePage;
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    auto* entry = pageEntry(probe, page, false);
+    if (entry == nullptr) {
+        ReleaseSRWLockExclusive(&probe.lock);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    MEMORY_BASIC_INFORMATION region{};
+    const bool queried = VirtualQuery(reinterpret_cast<void*>(page), &region, sizeof(region)) != 0 && region.State == MEM_COMMIT;
+    if (!entry->armed || !queried || region.Protect != PAGE_NOACCESS) {
+        // Not (or no longer) the probe's: another thread gave the page back since the fault, or
+        // someone else changed its protection. An access the page now allows is retried; the rest
+        // goes to the handlers after this one (the C library's write tracking).
+        const DWORD allows = write ? (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) : (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE);
+        const bool retry = queried && (region.Protect & allows) != 0;
+        ReleaseSRWLockExclusive(&probe.lock);
+        return retry ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    }
+    const auto [module, caller] = callerOf(probe, *info->ContextRecord);
+    const auto index = static_cast<std::size_t>(module);
+    const auto groupIndex = entry->group;
+    auto& group = probe.groups[groupIndex];
+    ++(write ? group.writes : group.reads)[index];
+    ++(write ? probe.totals.writes : probe.totals.reads)[index];
+    if (module == ProbeModule::Title) {
+        // The title's first access is the one counted: the whole range gets its protection back.
+        group.titleCaller = caller;
+        restorePages(probe, group.begin, group.end, groupIndex, false);
+    } else {
+        // The driver's and other modules' accesses give back only their page, armed again at the
+        // next protect, so they do not hide the title's.
+        noteCaller(probe, module, caller);
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(page), ProbePage, entry->previous, &old);
+        entry->armed = false;
+        ++probe.totals.pageFaults;
+        if (probe.pendingCount < ReadProbe::Pending) probe.pending[probe.pendingCount++] = page;
+    }
+    ReleaseSRWLockExclusive(&probe.lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+std::size_t readProbeMinBytes() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_BUFFER_READ_PROBE_MIN_KIB");
+        return static_cast<std::size_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull) * 1024;
+    }();
+    return bytes;
+}
+
+void initReadProbe(ReadProbe& probe) {
+    static const bool installed = [&] {
+        const auto title = moduleRange(GetModuleHandleW(nullptr));
+        probe.titleBegin = title.first;
+        probe.titleEnd = title.second;
+        HMODULE driver = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&readProbeFault), &driver);
+        const auto own = moduleRange(driver);
+        probe.driverBegin = own.first;
+        probe.driverEnd = own.second;
+        AddVectoredExceptionHandler(1, readProbeFault);
+        return true;
+    }();
+    static_cast<void>(installed);
+}
+
+std::string moduleName(std::uintptr_t pc) {
+    HMODULE module = nullptr;
+    if (pc == 0 || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(pc), &module)) return "?";
+    char name[MAX_PATH]{};
+    const auto length = GetModuleFileNameA(module, name, MAX_PATH);
+    std::string path(name, length);
+    const auto slash = path.find_last_of("\\/");
+    char offset[32];
+    std::snprintf(offset, sizeof(offset), "+0x%llx", static_cast<unsigned long long>(pc - reinterpret_cast<std::uintptr_t>(module)));
+    return (slash == std::string::npos ? path : path.substr(slash + 1)) + offset;
+}
+
+// What a report prints, copied under the lock and printed after it (module names take the loader
+// lock, which a thread faulting on a protected page may hold).
+struct ReadProbeReport {
+    std::size_t groupCount = 0;
+    std::size_t pageCount = 0;
+    std::size_t pendingCount = 0;
+    BufferReadProbeCounts totals;
+    std::vector<ReadProbeGroup> groups;
+    std::vector<ReadProbeCaller> callers;
+};
+
+bool takeReadProbeReport(ReadProbe& probe, ReadProbeReport& report) {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (probe.lastReport == 0) probe.lastReport = nowMs;
+    if (nowMs - probe.lastReport < 10000) return false;
+    probe.lastReport = nowMs;
+    report.groupCount = probe.groupCount;
+    report.pageCount = probe.pageCount;
+    report.pendingCount = probe.pendingCount;
+    report.totals = probe.totals;
+    report.groups.assign(probe.groups.begin(), probe.groups.begin() + static_cast<std::ptrdiff_t>(probe.groupCount));
+    report.callers.assign(probe.callers.begin(), probe.callers.begin() + static_cast<std::ptrdiff_t>(probe.callerCount));
+    return true;
+}
+
+// Every range the title or another module touched, then the most protected others, up to twelve.
+void printReadProbeReport(ReadProbeReport& report) {
+    const auto& t = report.totals;
+    constexpr auto title = static_cast<std::size_t>(ProbeModule::Title);
+    constexpr auto other = static_cast<std::size_t>(ProbeModule::Other);
+    std::stable_sort(report.groups.begin(), report.groups.end(), [&](const ReadProbeGroup& a, const ReadProbeGroup& b) {
+        const bool aTouched = a.reads[title] + a.writes[title] + a.reads[other] + a.writes[other] != 0;
+        const bool bTouched = b.reads[title] + b.writes[title] + b.reads[other] + b.writes[other] != 0;
+        if (aTouched != bTouched) return aTouched;
+        return a.protects > b.protects;
+    });
+    std::string ranges;
+    for (std::size_t i = 0; i < report.groups.size() && i < 12; ++i) {
+        const auto& group = report.groups[i];
+        char where[256];
+        std::snprintf(where, sizeof(where), " [%llx %llu KiB: notes %llu, protects %llu, title r%llu w%llu, driver r%llu w%llu, other r%llu w%llu",
+            static_cast<unsigned long long>(group.begin), static_cast<unsigned long long>((group.end - group.begin) >> 10u), static_cast<unsigned long long>(group.notes), static_cast<unsigned long long>(group.protects),
+            static_cast<unsigned long long>(group.reads[0]), static_cast<unsigned long long>(group.writes[0]), static_cast<unsigned long long>(group.reads[1]), static_cast<unsigned long long>(group.writes[1]), static_cast<unsigned long long>(group.reads[2]), static_cast<unsigned long long>(group.writes[2]));
+        ranges += where;
+        if (group.titleCaller != 0) ranges += ", title last " + moduleName(static_cast<std::uintptr_t>(group.titleCaller));
+        ranges += "]";
+    }
+    std::string callers;
+    for (const auto& caller : report.callers) {
+        callers += " [" + moduleName(static_cast<std::uintptr_t>(caller.pc)) + (caller.module == ProbeModule::Driver ? " driver " : " other ") + std::to_string(caller.faults) + "]";
+    }
+    std::fprintf(stderr, "[bufread-probe] (cumulative): %zu ranges, %zu pages, %llu protects (%llu refused), %llu pages lost, %llu given to scopes, %llu given to driver or other faults (%zu pending); faults: title reads %llu writes %llu, driver reads %llu writes %llu, other reads %llu writes %llu; ranges:%s; callers:%s%c",
+        report.groupCount, report.pageCount, static_cast<unsigned long long>(t.protects), static_cast<unsigned long long>(t.refused), static_cast<unsigned long long>(t.lost), static_cast<unsigned long long>(t.scoped), static_cast<unsigned long long>(t.pageFaults), report.pendingCount,
+        static_cast<unsigned long long>(t.reads[0]), static_cast<unsigned long long>(t.writes[0]), static_cast<unsigned long long>(t.reads[1]), static_cast<unsigned long long>(t.writes[1]), static_cast<unsigned long long>(t.reads[2]), static_cast<unsigned long long>(t.writes[2]),
+        ranges.empty() ? " none" : ranges.c_str(), callers.empty() ? " none" : callers.c_str(), 10);
+}
+#endif
+
+}
+
+bool BufferReadProbe() {
+#ifdef _WIN32
+    static const bool enabled = std::getenv("APS5_BUFFER_READ_PROBE") != nullptr;
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+void ProbeProtectWrittenRange(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    const auto begin = (address + ProbePage - 1) / ProbePage * ProbePage;
+    const auto end = (address + bytes) / ProbePage * ProbePage;
+    if (end <= begin || end - begin < readProbeMinBytes()) return;
+    auto& probe = readProbe();
+    initReadProbe(probe);
+    ReadProbeReport report;
+    AcquireSRWLockExclusive(&probe.lock);
+    armPending(probe);
+    std::size_t group = probe.groupCount;
+    for (std::size_t i = 0; i < probe.groupCount; ++i) {
+        if (probe.groups[i].begin == begin && probe.groups[i].end == end) {
+            group = i;
+            break;
+        }
+    }
+    if (group == probe.groupCount && probe.groupCount < ReadProbe::Groups) {
+        probe.groups[group] = ReadProbeGroup{begin, end};
+        ++probe.groupCount;
+    }
+    if (group == probe.groupCount) {
+        ++probe.totals.refused;
+    } else {
+        ++probe.groups[group].notes;
+        if (armPages(probe, begin, end, static_cast<std::uint32_t>(group), ArmPages::All)) {
+            ++probe.groups[group].protects;
+            ++probe.totals.protects;
+        }
+    }
+    const bool reporting = takeReadProbeReport(probe, report);
+    ReleaseSRWLockExclusive(&probe.lock);
+    if (reporting) printReadProbeReport(report);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+ProbeHostRead::ProbeHostRead(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    if (!BufferReadProbe() || bytes == 0) return;
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    const auto from = address / ProbePage * ProbePage;
+    const auto to = (address + bytes + ProbePage - 1) / ProbePage * ProbePage;
+    const auto given = restorePages(probe, from, to, AnyGroup, true);
+    probe.totals.scoped += given;
+    ReleaseSRWLockExclusive(&probe.lock);
+    if (given != 0) {
+        scopeBegin = from;
+        scopeBytes = static_cast<std::size_t>(to - from);
+    }
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+ProbeHostRead::~ProbeHostRead() {
+#ifdef _WIN32
+    if (scopeBytes == 0) return;
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    armPages(probe, scopeBegin, scopeBegin + scopeBytes, 0, ArmPages::Given);
+    ReleaseSRWLockExclusive(&probe.lock);
+#endif
+}
+
+BufferReadProbeCounts BufferReadProbeTotals() {
+#ifdef _WIN32
+    auto& probe = readProbe();
+    AcquireSRWLockShared(&probe.lock);
+    const auto totals = probe.totals;
+    ReleaseSRWLockShared(&probe.lock);
+    return totals;
+#else
+    return {};
+#endif
+}
+
+void ResetBufferReadProbe() {
+#ifdef _WIN32
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    for (auto& entry : probe.pages) {
+        if (entry.page != 0 && entry.armed) {
+            DWORD old = 0;
+            VirtualProtect(reinterpret_cast<void*>(entry.page), ProbePage, entry.previous, &old);
+        }
+        entry = ReadProbePage{};
+    }
+    for (std::size_t i = 0; i < probe.groupCount; ++i) probe.groups[i] = ReadProbeGroup{};
+    probe.groupCount = 0;
+    probe.pageCount = 0;
+    probe.pendingCount = 0;
+    probe.callerCount = 0;
+    probe.totals = {};
+    ReleaseSRWLockExclusive(&probe.lock);
+#endif
+}
+
 void GuestBufferMemory::ProbeWrites() const {
     for (const auto& [begin, end] : writes) {
         std::uint64_t staged = 0;
@@ -4952,7 +5435,8 @@ void GuestBufferMemory::ProbeWrites() const {
             if (from < to) staged += to - from;
         }
         const auto bytes = end - begin;
-        ProbeGpuBufferWrite(begin, static_cast<std::size_t>(bytes), staged * 2 >= bytes);
+        if (BufferShadowProbe()) ProbeGpuBufferWrite(begin, static_cast<std::size_t>(bytes), staged * 2 >= bytes);
+        if (BufferReadProbe()) ProbeProtectWrittenRange(begin, static_cast<std::size_t>(bytes));
     }
 }
 

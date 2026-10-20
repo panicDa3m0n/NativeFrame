@@ -2715,6 +2715,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         spanned += to - from;
     }
     equal.assign(spans.size(), 0);
+    const ProbeHostRead probeRead(address, bytes);
     if (compared) CompareSpans(spans, equal);
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;

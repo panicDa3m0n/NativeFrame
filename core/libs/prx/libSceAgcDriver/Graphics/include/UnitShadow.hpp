@@ -174,6 +174,47 @@ struct BufferShadowProbeCounts {
 BufferShadowProbeCounts BufferShadowProbeTotals();
 void ResetBufferShadowProbe();
 
+// O16.T15 (APS5_BUFFER_READ_PROBE=1, diagnostics, Windows only): the interior pages of every buffer
+// range of at least APS5_BUFFER_READ_PROBE_MIN_KIB (1024) the GPU writes become PAGE_NOACCESS once
+// noted (ProbeProtectWrittenRange, from MarkGpuWrites), page by page with the protection each had.
+// A vectored handler (first in line) counts each access that faults by kind (read or write) and by
+// module: the faulting instruction's, or its first caller within four frames in the title's image
+// or this driver. An access of the title's image gives the whole range its protection back, so it
+// counts once per protect; one of the driver or of another module gives back only its page, armed
+// again at the next protect, so the driver's own reads do not hide the title's. A driver reader
+// that knows it reads such ranges opens a ProbeHostRead scope: the range's pages are given back for
+// its lifetime and armed again after it. Pages someone else made accessible again (the C library's
+// write tracking, a title's mprotect) count as lost and are armed again at the next protect. The
+// bytes stay where they are today, so only the faults change; a system call that reads or writes a
+// protected range fails as on any protected memory. The [bufread-probe] line every 10 s gives the
+// ranges with their notes, protects and accesses, and the callers of the driver's and other faults.
+bool BufferReadProbe();
+void ProbeProtectWrittenRange(std::uint64_t address, std::size_t bytes);
+class ProbeHostRead {
+public:
+    ProbeHostRead(std::uint64_t address, std::size_t bytes);
+    ~ProbeHostRead();
+    ProbeHostRead(const ProbeHostRead&) = delete;
+    ProbeHostRead& operator=(const ProbeHostRead&) = delete;
+
+private:
+    std::uint64_t scopeBegin = 0;
+    std::size_t scopeBytes = 0;
+};
+enum class ProbeModule : std::uint8_t { Title, Driver, Other, Count };
+struct BufferReadProbeCounts {
+    std::uint64_t protects = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t lost = 0;
+    std::uint64_t scoped = 0;
+    std::uint64_t pageFaults = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeModule::Count)> reads{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeModule::Count)> writes{};
+};
+BufferReadProbeCounts BufferReadProbeTotals();
+// Gives every protected range its protection back and clears the counts (tests).
+void ResetBufferReadProbe();
+
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();

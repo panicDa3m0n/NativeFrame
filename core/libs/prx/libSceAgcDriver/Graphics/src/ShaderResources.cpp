@@ -5106,6 +5106,16 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+namespace {
+// Moved data-word buffers (PrepareDrawBindings): 32 cached per template, and a cached buffer no
+// recorded work holds any more is rewritten for the next words instead of a new buffer.
+// APS5_NO_WORD_BUFFER_REUSE=1 keeps eight by content only, as before.
+bool WordBufferReuse() {
+    static const bool enabled = std::getenv("APS5_NO_WORD_BUFFER_REUSE") == nullptr;
+    return enabled;
+}
+}
+
 std::size_t ShaderResources::DrawUploadLimit() {
     static const std::size_t limit = [] {
         const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
@@ -5134,20 +5144,31 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            constexpr std::size_t MovedWordBufferSlots = 8;
+            const auto slots = WordBufferReuse() ? std::size_t{32} : std::size_t{8};
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
             std::shared_ptr<Buffer> buffer;
-            if (held != movedWordBuffers.end()) {
-                buffer = held->buffer;
-            } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const auto fill = [&] {
                 std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
+            };
+            // A slot of this allocation whose buffer nothing else holds (no recorded work, no draw's
+            // bindings: only this cache) takes the new words in place, so most draws whose words
+            // change make no buffer (a new one is a pool take that recreates the exact-sized VkBuffer).
+            const auto spare = held != movedWordBuffers.end() || !WordBufferReuse() ? movedWordBuffers.end() : std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.buffer.use_count() == 1; });
+            if (held != movedWordBuffers.end()) {
+                buffer = held->buffer;
+            } else if (spare != movedWordBuffers.end()) {
+                buffer = spare->buffer;
+                fill();
+                spare->words = override->words;
+            } else {
+                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                fill();
                 MovedWordBuffer entry{index, override->words, override->size, buffer};
-                if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
-                else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+                if (movedWordBuffers.size() < slots) movedWordBuffers.push_back(std::move(entry));
+                else movedWordBuffers[movedWordBufferNext++ % slots] = std::move(entry);
             }
             selected.push_back(index);
             result->snapshots.push_back({0, std::move(buffer), 0, override->size});

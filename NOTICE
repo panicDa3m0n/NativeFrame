@@ -1,0 +1,105 @@
+NativeFrame
+Copyright (C) 2026 panicDa3m0n and the NativeFrame contributors
+
+NativeFrame is a fork of AnyPS5 and is distributed under the GNU General
+Public License, version 2 only (GPL-2.0-only). The full license text is in
+the LICENSE file. There is NO WARRANTY, to the extent permitted by law.
+
+NativeFrame is not affiliated with, endorsed by or sponsored by Sony
+Interactive Entertainment. "PlayStation" and "PS5" are trademarks of their
+respective owners and are used here only to describe compatibility.
+
+
+Upstream project
+----------------
+
+AnyPS5
+  https://github.com/boykopovar/AnyPS5
+  Created by boykopovar (first commit: 3 August 2026), with code from more
+  than 500 contributors. The complete authorship of every upstream line is
+  preserved in this repository's git history (git log, git blame).
+
+NativeFrame keeps the AnyPS5 history unchanged and builds on it: the
+relinker, the reimplemented system libraries, the AGC/PM4 to Vulkan driver
+and the RDNA to SPIR-V shader recompiler are AnyPS5 work. NativeFrame adds
+performance work on top of it (see docs/research/).
+
+Fixes that are generic and not specific to NativeFrame are meant to be
+offered back to AnyPS5 under its own contribution rules.
+
+
+Upstream pull requests integrated before upstream merged them
+---------------------------------------------------------------
+
+The following AnyPS5 pull requests were merged into NativeFrame from their
+authors' branches, most of them before upstream merged them (some never
+were). Each merge commit names the pull request and the commit it took, and
+authorship is kept on every original commit. "Upstream" marks the ones that
+AnyPS5 merged later.
+
+  #1896  Joey Fisher       perf(agc): pipeline indirect draws behind the packet worker
+  #6292  Mehran            perf(agc): replace winpthreads locks and TLS on the draw path
+  #6501  Nesyth            perf(agc): queue occlusion counter dumps behind pipelined draws instead of draining
+  #6522  Mehran            fix(agc): record a multisampled target's commands on its own device
+  #6566  Scott Schuster    perf(agc): fewer heap allocations per recorded draw (upstream)
+  #6609  Mehran            perf(agc): rule out pending write overlaps from the published union (upstream)
+  #6615  Mehran            perf(agc): move per-draw thread-locals to TEB slots
+  #6617  Scott Schuster    perf(agc): the draw pipeline retires finished commits on a reaper thread
+  #6650  WallisSkill       perf(agc): cache freed small blocks per thread on Windows (upstream)
+  #6658  Nicolas Abosch    perf(libkernel): end short sleeps when the GPU or a flip completes
+  #6661  al3w0f205         perf(libSceAgcDriver): elide descriptor count heap maps, optimize vertex copy planning
+  #6763  SP4C3B4R-8        perf(agc): copy draw inputs on NVIDIA's Windows driver instead of binding host imports in place (upstream)
+  #6917  milescoviello     perf(libc): keep the guest allocation lease snapshot until the registry changes (upstream)
+  #6951  alfalfa-star      perf(agc): memoize host import run bounds per lease snapshot
+  #6955  alfalfa-star      perf(agc): reuse a cached address space's committed pages on a hit
+  #7153  MarcZX100         perf(agc): keep draw pipeline for satisfied waits
+  #7340  teepean           perf(agc): draws that only store to a buffer continue one render pass
+  #7464  Evgeniy Kazarin   perf(agc): keep unimported label stores on the CPU
+  #7465  Evgeniy Kazarin   perf(agc): defer small host imports until first GPU use
+  #7466  Evgeniy Kazarin   perf(agc): validate host imports through their registered owner
+  #7467  Evgeniy Kazarin   perf(libc): avoid repeated Windows path component scans
+  #7470  Evgeniy Kazarin   perf(libc): release exact resident mappings without repeated queries
+  #7471  Evgeniy Kazarin   perf(libc): collect resident writes directly into the output buffer
+  #7472  Evgeniy Kazarin   perf(libc): reuse saved direct-memory buffers when unreferenced
+  #7473  Evgeniy Kazarin   perf(libc): skip write-watch queries for proven clean resident ranges
+
+  Pull request pages: https://github.com/boykopovar/AnyPS5/pull/<number>
+
+
+Code derived from other projects inside this repository
+--------------------------------------------------------
+
+shadPS4 Emulator Project (https://github.com/shadps4-emu/shadPS4)
+  Parts of core/libs/prx/libSceAvPlayer, core/libs/prx/libSceFont and
+  core/libs/prx/libSceFontFt carry "Copyright 2024 shadPS4 Emulator Project"
+  and are licensed GPL-2.0-or-later, which is compatible with GPL-2.0-only.
+
+AMD Machine-Readable GPU ISA Specification
+  tools/rdna_isa.txt is an instruction list derived from it.
+  Copyright (c) Advanced Micro Devices, Inc., or its affiliates. MIT License.
+
+
+Third-party libraries (git submodules under 3rdparty/)
+------------------------------------------------------
+
+They are not copied into this repository: each is fetched from its own
+upstream at a pinned commit and keeps its own license.
+
+  SDL2                    zlib license
+  Vulkan-Headers          Apache-2.0 or MIT
+  SPIRV-Headers           MIT-style Khronos license
+  SPIRV-Tools             Apache-2.0
+  glslang                 BSD-3-Clause and other permissive licenses (see its LICENSE.txt)
+  VulkanMemoryAllocator   MIT
+  LibAtrac9               MIT
+  ffmpeg-core             FFmpeg (LGPL-2.1-or-later for the default configuration)
+  freetype                FreeType License or GPL-2.0
+  stb                     MIT or public domain
+  tracy                   BSD-3-Clause
+  libjpeg-turbo           IJG, BSD-3-Clause and zlib licenses
+  libusb-cmake            LGPL-2.1
+  mbedtls                 Apache-2.0 or GPL-2.0-or-later
+  zstd                    BSD-3-Clause or GPL-2.0
+  ZArchive                MIT No Attribution
+
+The license of each submodule is authoritative; this list is a summary.

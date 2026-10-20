@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_UNITSHADOW_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -147,6 +148,32 @@ void PublishAllShadows(const Context& context, PublishReason reason);
 void DestroyShadows(VkDevice device);
 // The [storage] line's shadow segment (10 s deltas, live slab totals).
 std::string ShadowReport();
+// O16.T10 P0 (APS5_BUFFER_SHADOW_PROBE=1, study scritture-gpu-vram.md): what publishing the buffer
+// bytes the GPU writes at the boundaries a title can observe (a label written on the GPU, the end
+// of a submission, a flip) would copy, and which readers would meet bytes written since the last
+// boundary. Counts only (the [bufshadow-probe] line every 10 s); nothing changes. A boundary
+// publishes the distinct 4 KiB pages of the writes since the previous one.
+bool BufferShadowProbe();
+enum class ProbeBoundary : std::uint8_t { Label, Submission, Flip, Count };
+enum class ProbeReader : std::uint8_t { Hook, DrawSnapshot, InPlace, Count };
+void ProbeGpuBufferWrite(std::uint64_t address, std::size_t bytes, bool staged);
+void ProbeBufferBoundary(ProbeBoundary boundary);
+void ProbeBufferRead(ProbeReader reader, std::uint64_t address, std::size_t bytes);
+struct BufferShadowProbeCounts {
+    std::uint64_t writes = 0;
+    std::uint64_t stagedBytes = 0;
+    std::uint64_t inPlaceBytes = 0;
+    std::uint64_t publishedPages = 0;
+    std::uint64_t publishedBytes = 0;
+    std::uint64_t busyBoundaries = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeBoundary::Count)> boundaries{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeReader::Count)> reads{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeReader::Count)> readBytes{};
+};
+// Totals since the start or the last ResetBufferShadowProbe (tests).
+BufferShadowProbeCounts BufferShadowProbeTotals();
+void ResetBufferShadowProbe();
+
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();

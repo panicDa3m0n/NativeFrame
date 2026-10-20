@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -375,6 +376,7 @@ void Driver::execute(const Submission& submission) {
             const auto now = FrameTiming::Clock::now();
             if (!APS5_ENABLE_TIMING_LOG) frame->IncludeSubmission(submission.serial, now, now, now, true);
             frame->SetFlip(submission.serial, cursor, APS5_ENABLE_TIMING_LOG ? submission.receivedAt : now, now);
+            if (Graphics::BufferShadowProbe()) Graphics::ProbeBufferBoundary(Graphics::ProbeBoundary::Flip);
             if (APS5_ENABLE_TIMING_LOG) frame->CollectBackground();
             frame->NoteFlipBatches(batchesAtFlip, unsignaledAtFlip);
             CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
@@ -492,6 +494,7 @@ void Driver::execute(const Submission& submission) {
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
+    if (Graphics::BufferShadowProbe()) Graphics::ProbeBufferBoundary(Graphics::ProbeBoundary::Submission);
     if (pipelined) DrawPrepare::Queue0().Flush(0x201);
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {

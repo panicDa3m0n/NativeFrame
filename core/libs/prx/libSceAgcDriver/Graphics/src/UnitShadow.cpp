@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -819,6 +820,131 @@ void DestroyShadows(VkDevice device) {
         }
         it = registry.byBase.erase(it);
     }
+}
+
+namespace {
+
+struct BufferProbe {
+    std::mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> live;
+    BufferShadowProbeCounts totals;
+    BufferShadowProbeCounts window;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+BufferProbe& bufferProbe() {
+    static BufferProbe probe;
+    return probe;
+}
+
+void addCounts(BufferShadowProbeCounts& into, const BufferShadowProbeCounts& delta) {
+    into.writes += delta.writes;
+    into.stagedBytes += delta.stagedBytes;
+    into.inPlaceBytes += delta.inPlaceBytes;
+    into.publishedPages += delta.publishedPages;
+    into.publishedBytes += delta.publishedBytes;
+    into.busyBoundaries += delta.busyBoundaries;
+    for (std::size_t i = 0; i < into.boundaries.size(); ++i) into.boundaries[i] += delta.boundaries[i];
+    for (std::size_t i = 0; i < into.reads.size(); ++i) {
+        into.reads[i] += delta.reads[i];
+        into.readBytes[i] += delta.readBytes[i];
+    }
+}
+
+void reportBufferProbe(BufferProbe& probe) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - probe.lastReport < std::chrono::seconds(10)) return;
+    probe.lastReport = now;
+    const auto& w = probe.window;
+    constexpr double MiB = 1048576.0;
+    std::fprintf(stderr, "[bufshadow-probe] (10 s): %llu GPU buffer writes (staged %.1f MiB, in place %.1f MiB); boundaries label %llu submission %llu flip %llu (%llu with pages to publish); published at boundaries %llu pages %.1f MiB; readers meeting bytes written since the last boundary: hook %llu (%.1f MiB) draw snapshot %llu (%.1f MiB) in place %llu (%.1f MiB)%c",
+        static_cast<unsigned long long>(w.writes), w.stagedBytes / MiB, w.inPlaceBytes / MiB,
+        static_cast<unsigned long long>(w.boundaries[0]), static_cast<unsigned long long>(w.boundaries[1]), static_cast<unsigned long long>(w.boundaries[2]), static_cast<unsigned long long>(w.busyBoundaries),
+        static_cast<unsigned long long>(w.publishedPages), w.publishedBytes / MiB,
+        static_cast<unsigned long long>(w.reads[0]), w.readBytes[0] / MiB, static_cast<unsigned long long>(w.reads[1]), w.readBytes[1] / MiB, static_cast<unsigned long long>(w.reads[2]), w.readBytes[2] / MiB, 10);
+    probe.window = {};
+}
+
+}
+
+bool BufferShadowProbe() {
+    static const bool enabled = std::getenv("APS5_BUFFER_SHADOW_PROBE") != nullptr;
+    return enabled;
+}
+
+void ProbeGpuBufferWrite(std::uint64_t address, std::size_t bytes, bool staged) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    auto& probe = bufferProbe();
+    std::lock_guard lock(probe.mutex);
+    probe.live.emplace_back(address, address + bytes);
+    BufferShadowProbeCounts delta;
+    delta.writes = 1;
+    (staged ? delta.stagedBytes : delta.inPlaceBytes) = bytes;
+    addCounts(probe.totals, delta);
+    addCounts(probe.window, delta);
+}
+
+void ProbeBufferBoundary(ProbeBoundary boundary) {
+    auto& probe = bufferProbe();
+    std::lock_guard lock(probe.mutex);
+    BufferShadowProbeCounts delta;
+    delta.boundaries[static_cast<std::size_t>(boundary)] = 1;
+    if (!probe.live.empty()) {
+        // The distinct pages and bytes of the writes since the previous boundary.
+        auto& live = probe.live;
+        std::sort(live.begin(), live.end());
+        std::uint64_t lastPage = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t covered = 0;
+        for (std::size_t i = 0; i < live.size();) {
+            auto begin = live[i].first;
+            auto end = live[i].second;
+            for (++i; i < live.size() && live[i].first <= end; ++i) end = std::max(end, live[i].second);
+            delta.publishedBytes += end - std::max(begin, covered);
+            covered = end;
+            auto first = begin / 4096;
+            const auto last = (end - 1) / 4096;
+            if (lastPage != std::numeric_limits<std::uint64_t>::max() && first <= lastPage) first = lastPage + 1;
+            if (first <= last) delta.publishedPages += last - first + 1;
+            lastPage = std::max(lastPage == std::numeric_limits<std::uint64_t>::max() ? 0 : lastPage, last);
+        }
+        delta.busyBoundaries = 1;
+        live.clear();
+    }
+    addCounts(probe.totals, delta);
+    addCounts(probe.window, delta);
+    reportBufferProbe(probe);
+}
+
+void ProbeBufferRead(ProbeReader reader, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return;
+    auto& probe = bufferProbe();
+    std::lock_guard lock(probe.mutex);
+    if (probe.live.empty()) return;
+    const auto end = address + bytes;
+    std::uint64_t met = 0;
+    for (const auto& [begin, stop] : probe.live) {
+        if (begin < end && address < stop) met = std::max(met, std::min(end, stop) - std::max(address, begin));
+    }
+    if (met == 0) return;
+    BufferShadowProbeCounts delta;
+    delta.reads[static_cast<std::size_t>(reader)] = 1;
+    delta.readBytes[static_cast<std::size_t>(reader)] = met;
+    addCounts(probe.totals, delta);
+    addCounts(probe.window, delta);
+}
+
+BufferShadowProbeCounts BufferShadowProbeTotals() {
+    auto& probe = bufferProbe();
+    std::lock_guard lock(probe.mutex);
+    return probe.totals;
+}
+
+void ResetBufferShadowProbe() {
+    auto& probe = bufferProbe();
+    std::lock_guard lock(probe.mutex);
+    probe.live.clear();
+    probe.totals = {};
+    probe.window = {};
 }
 
 std::string ShadowReport() {

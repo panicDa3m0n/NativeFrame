@@ -86,6 +86,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_BLOCK_WRITEBACK_WIDEN` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | enables the widening that stores a whole image when it keeps being asked for in pieces |
 | `APS5_BUFFER_POOL_SHARED` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/BufferPool.cpp` |  | uses one buffer tier for every allocation size, as before the tier split |
 | `APS5_BUFFER_POOL_SLOTS` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/BufferPool.cpp` | 4096 | bounds the buffers each pool tier retains (0 keeps the default of 4096) |
+| `APS5_BUFFER_SHADOW_PROBE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` |  | counts what publishing GPU-written buffer bytes at labels, submission ends and flips would copy and which readers meet bytes written since the last boundary (the `[bufshadow-probe]` line); no decision changes |
 | `APS5_CAPTURE_GPU_COPIES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | records GPU buffer copies in the capture trace (requires APS5_CAPTURE_TRACE) |
 | `APS5_CAPTURE_INPUTS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | records each draw's inputs in the capture trace (requires APS5_CAPTURE_TRACE) |
 | `APS5_CAPTURE_TRACE` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp` |  | writes capture events to capture-trace.log |

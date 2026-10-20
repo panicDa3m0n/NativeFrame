@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -1017,6 +1018,7 @@ private:
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
+    if (BufferShadowProbe()) ProbeBufferRead(ProbeReader::Hook, address, bytes);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from

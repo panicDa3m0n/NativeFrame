@@ -4942,6 +4942,20 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     return CachedTable{tableSerial, tableRanges.get()};
 }
 
+void GuestBufferMemory::ProbeWrites() const {
+    for (const auto& [begin, end] : writes) {
+        std::uint64_t staged = 0;
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal) continue;
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) staged += to - from;
+        }
+        const auto bytes = end - begin;
+        ProbeGpuBufferWrite(begin, static_cast<std::size_t>(bytes), staged * 2 >= bytes);
+    }
+}
+
 bool GuestBufferMemory::HasCopiedWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);

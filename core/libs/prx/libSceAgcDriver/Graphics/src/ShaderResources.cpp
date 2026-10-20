@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -5246,6 +5247,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
+        if (BufferShadowProbe()) ProbeBufferRead(ProbeReader::DrawSnapshot, begin, bytes);
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
@@ -5452,6 +5454,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    if (BufferShadowProbe()) {
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) ProbeBufferRead(ProbeReader::InPlace, begin, static_cast<std::size_t>(end - begin));
+    }
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
@@ -5473,6 +5478,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
     guestMemory.NoteStagedCopies();
+    if (BufferShadowProbe()) guestMemory.ProbeWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

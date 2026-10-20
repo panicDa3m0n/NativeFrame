@@ -23,7 +23,7 @@ namespace {
 
 constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
-constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "rehome", "border", "writer"};
+constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown", "rehome", "border", "writer", "address"};
 
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
@@ -803,6 +803,23 @@ std::optional<ShadowDestination> RangeShadowDestination(const Context& context, 
     return rangeDestination(shadow, import, first, last, begin, begin, end);
 }
 
+bool BufferShadowLazy() {
+    static const bool enabled = BufferShadowEnabled() && std::getenv("APS5_BUFFER_SHADOW_LAZY") != nullptr;
+    return enabled;
+}
+
+namespace {
+std::atomic<std::uint64_t> lazySkippedBytes{0};
+}
+
+void NoteLazyCopyBackSkipped(std::uint64_t bytes) {
+    lazySkippedBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+std::uint64_t LazyCopyBackSkippedBytes() {
+    return lazySkippedBytes.load(std::memory_order_relaxed);
+}
+
 bool BufferShadowReaders() {
     static const bool enabled = BufferShadowEnabled() && std::getenv("APS5_NO_BUFFER_SHADOW_READERS") == nullptr;
     return enabled;
@@ -1329,6 +1346,24 @@ void PublishAllShadows(const Context& context, PublishReason reason) {
         }
     }
     for (const auto& shadow : shadows) publishRange(shadow, shadow->importBase, shadow->ImportEnd(), PublishScope::Whole, reason);
+}
+
+std::size_t PublishRangeSlabs(const Context& context, PublishReason reason) {
+    if (!UnitShadowEnabled()) return 0;
+    std::vector<std::pair<std::shared_ptr<UnitShadow>, std::pair<std::uint64_t, std::uint64_t>>> spans;
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [base, shadow] : registry.byBase) {
+            if (shadow->context.device != context.device || shadow->rangeOwned == 0 || shadow->liveUnits == 0) continue;
+            for (const auto& range : shadow->ranges) {
+                if (range.slab != nullptr) spans.push_back({shadow, {shadow->UnitBegin(range.slab->firstUnit), shadow->UnitBegin(range.slab->firstUnit + range.slab->units)}});
+            }
+        }
+    }
+    std::size_t units = 0;
+    for (const auto& [shadow, span] : spans) units += publishRange(shadow, span.first, span.second, PublishScope::Whole, reason);
+    return units;
 }
 
 void DestroyShadows(VkDevice device) {

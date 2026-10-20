@@ -49,7 +49,7 @@ bool UnitShadowEnabled();
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
 // so the neighbours' results in the rest of the unit reach the import before the write stamps it).
 enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
-enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Rehome, Border, Writer, Count };
+enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Rehome, Border, Writer, Address, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
@@ -149,6 +149,15 @@ bool BufferShadowEnabled();
 // range (no seed needed: the reader then reads what the import holds); none is made or grown.
 // nullopt otherwise, and with APS5_NO_BUFFER_SHADOW_READERS (the reader binds the import).
 bool BufferShadowReaders();
+// O16.T17 (APS5_BUFFER_SHADOW_LAZY=1 with APS5_BUFFER_SHADOW, variant C of the study): a range slab
+// region's written bytes are not copied back after its work; they stay live in the slab and reach
+// the import when a host-side or in-place consumer publishes them (the flush hook, a direct or
+// copied region's flush, a reused build's proof, a label, a fill, a copy, indirect arguments,
+// scanout, an eviction, a retire). A title's own CPU reads of them are not seen (see the debt).
+bool BufferShadowLazy();
+// A copy-back the lazy mode left out (counted on the [bufshadow] line).
+void NoteLazyCopyBackSkipped(std::uint64_t bytes);
+std::uint64_t LazyCopyBackSkippedBytes();
 std::optional<ShadowDestination> RangeShadowSource(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
 // Moves whenever range units are marked or a range slab is made, grown, evicted or retired (a
 // buffer writer's MarkShadowed does not move StorageTexture::PendingSerial).
@@ -182,6 +191,10 @@ void NoteShadowVerification(bool matched, std::uint64_t address, std::uint64_t b
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered);
 // Teardown: every shadow of the context's device is published; DestroyShadows then drops them.
 void PublishAllShadows(const Context& context, PublishReason reason);
+// O16.T17 (APS5_BUFFER_SHADOW_LAZY): publishes every live range slab unit of the context's device.
+// A build that reads guest memory through BDA tables maps the imports, never the slabs, so its use
+// publishes them first (PublishReason::Address).
+std::size_t PublishRangeSlabs(const Context& context, PublishReason reason);
 void DestroyShadows(VkDevice device);
 // The [storage] line's shadow segment (10 s deltas, live slab totals).
 std::string ShadowReport();

@@ -419,6 +419,9 @@ private:
         std::uint64_t serial;
         std::uint64_t regionEnd = 0;
         std::uint64_t committedEnd = 0;
+        // Bound to a range slab (GuestBufferMemory::ShadowBound): read and written there, so the
+        // proof publishes nothing for it.
+        bool shadow = false;
     };
 
     // The build is two stages. A (buildPrepare, no device lock): the binding plan with its layout
@@ -634,6 +637,9 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    // BufferShadowSerial at the last proof (O16.T17): when it moved, the in-place ranges publish
+    // the range slabs' live bytes over them.
+    std::uint64_t bufferShadowSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

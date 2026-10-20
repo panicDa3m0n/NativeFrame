@@ -298,6 +298,9 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    // Whether a region bound to a range slab (writer or reader, see Region::shadow) covers
+    // [begin, end): such a range is read and written in the slab, never in the import.
+    bool ShadowBound(std::uint64_t begin, std::uint64_t end) const;
     // ProbeGpuBufferWrite for every written range (APS5_BUFFER_SHADOW_PROBE): staged where a
     // device-local copy region holds it, in place otherwise.
     void ProbeWrites() const;

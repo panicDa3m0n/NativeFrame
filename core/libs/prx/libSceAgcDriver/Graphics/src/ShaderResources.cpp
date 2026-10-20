@@ -2202,6 +2202,8 @@ void ShaderResources::buildComplete() {
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
+        // Lazy range slabs: the BDA tables map the imports, so their live bytes land there first.
+        if (usesBda && BufferShadowLazy()) PublishRangeSlabs(context, PublishReason::Address);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
@@ -2386,6 +2388,7 @@ void ShaderResources::noteReusable() {
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
         if (serial == 0) return;
         directRegions.push_back({begin, end, serial});
+        directRegions.back().shadow = guestMemory.ShadowBound(begin, end);
     }
     for (const auto& cut : guestMemory.CutRegions()) {
         for (auto& region : directRegions) {
@@ -3158,6 +3161,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    const auto shadowSerialBefore = BufferShadowSerial();
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -3320,6 +3324,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    // Lazy range slabs: a build reading through BDA tables reads the imports (see the build).
+    if (usesBda && BufferShadowLazy()) PublishRangeSlabs(context, PublishReason::Address);
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             struct RegionsTag {};
@@ -3332,6 +3338,24 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
                 if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            }
+        }
+        // Variant C (APS5_BUFFER_SHADOW_LAZY): a range slab writer leaves its bytes live, and the
+        // in-place ranges of this set publish them first, as for a unit shadow's results above,
+        // whenever a range slab changed since the last proof. Ranges bound to a slab read it.
+        if (BufferShadowLazy() && bufferShadowSerialSeen != shadowSerialBefore) {
+            for (const auto& region : directRegions) {
+                const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+                if (!region.shadow && AnyShadowedOverlaps(region.begin, bytes)) StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region");
+            }
+            for (const auto& [begin, end] : guestMemory.Writes()) {
+                const auto bytes = static_cast<std::size_t>(end - begin);
+                if (!guestMemory.ShadowBound(begin, end) && AnyShadowedOverlaps(begin, bytes)) StorageTexture::FlushPending(begin, bytes, nullptr, "written buffer range");
+            }
+        }
+        if (ShadowVerify() && BufferShadowLazy()) {
+            for (const auto& region : directRegions) {
+                if (!region.shadow) NoteShadowVerification(!AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin)), region.begin, region.end - region.begin);
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -3357,6 +3381,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    bufferShadowSerialSeen = shadowSerialBefore;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }
@@ -5231,6 +5256,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 continue;
             }
             const bool direct = readInPlace();
+            if (direct && AnyShadowedOverlaps(item.address, item.size)) {
+                // Live slab or unit shadow bytes under the range: they reach the import before the
+                // draw reads it in place (a CPU snapshot would read the import's older bytes).
+                StorageTexture::PublishShadowsOnly(item.address, item.size, PublishScope::Whole, "imported buffer region");
+                if (profiled) noteInPlaceSkip(InPlaceSkip::PendingWriter, item.size);
+                continue;
+            }
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
                 if (profiled && direct) noteInPlaceSkip(InPlaceSkip::PendingWriter, item.size);
                 continue;
@@ -5401,7 +5433,7 @@ ShaderResources::SpeculativeBindings ShaderResources::SpeculateDrawBindings(std:
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct) continue;
-            if (Recorder::SnapshotOverlaps(pending, item.address, item.size)) {
+            if (Recorder::SnapshotOverlaps(pending, item.address, item.size) || AnyShadowedOverlaps(item.address, item.size)) {
                 out.refusal = SpecRefusal::PendingWriter;
                 return out;
             }

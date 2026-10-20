@@ -3874,8 +3874,8 @@ void reportBufferShadow() {
     if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
     static std::uint64_t lastTaken = 0, lastReused = 0, lastSeed = 0, lastPublished = 0;
     const auto taken = stats.taken.load(), reused = stats.reused.load(), seed = stats.seedBytes.load(), published = stats.publishedBytes.load();
-    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published, %llu read-only regions bound to slabs by builds (%.1f MiB not read in place); last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
-        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0, static_cast<unsigned long long>(stats.readers.load()), stats.readerBytes.load() / 1048576.0,
+    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published, %llu read-only regions bound to slabs by builds (%.1f MiB not read in place), %.1f MiB of copy-backs left live (lazy); last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
+        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0, static_cast<unsigned long long>(stats.readers.load()), stats.readerBytes.load() / 1048576.0, LazyCopyBackSkippedBytes() / 1048576.0,
         static_cast<unsigned long long>(taken - lastTaken), static_cast<unsigned long long>(reused - lastReused), (seed - lastSeed) / 1048576.0, (published - lastPublished) / 1048576.0);
     lastTaken = taken;
     lastReused = reused;
@@ -4139,6 +4139,11 @@ bool GuestBufferMemory::shadowEligible(const Region& region, bool addressable) c
     if (!BufferShadowEnabled() || !stagingAllowed || addressable || region.unstaged || region.shadow || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     return bytes >= bufferShadowMin() && bytes <= bufferShadowMax() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+}
+
+bool GuestBufferMemory::ShadowBound(std::uint64_t begin, std::uint64_t end) const {
+    if (!uploaded || committed) return false;
+    return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.shadow && region.begin <= begin && end <= region.end; });
 }
 
 bool GuestBufferMemory::takeShadowSource(Region& region, const HostImport& import) {
@@ -4883,7 +4888,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     if (stagedAny) reportStaging();
-    if (ShadowVerify()) verifyShadowSeeded(*recorder, commands, copies);
+    if (ShadowVerify() && !BufferShadowLazy()) verifyShadowSeeded(*recorder, commands, copies);
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide).
@@ -4911,6 +4916,19 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (!merged.empty() && range.first < merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
                 else merged.push_back(range);
             }
+        }
+        if (region.shadow && BufferShadowLazy()) {
+            // Variant C: the written bytes stay live in the slab until a consumer publishes them;
+            // nothing is recorded (no barrier, no end of an open render pass).
+            for (const auto& [begin, end] : merged) {
+                const auto from = std::max(begin, region.begin);
+                const auto to = std::min(end, region.end);
+                if (from < to) NoteLazyCopyBackSkipped(to - from);
+            }
+            region.copiedBack = true;
+            region.shadowPin.reset();
+            reportBufferShadow();
+            continue;
         }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
@@ -5714,7 +5732,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
             const auto to = std::min(end, region.end);
             if (from < to) marked.push_back({from, to, region.shadowSlab});
         }
-        if (!marked.empty()) MarkShadowed(region.shadowImport, marked, GuestMemory::TrackerGeneration(), true);
+        if (!marked.empty()) MarkShadowed(region.shadowImport, marked, GuestMemory::TrackerGeneration(), !BufferShadowLazy());
     }
 }
 

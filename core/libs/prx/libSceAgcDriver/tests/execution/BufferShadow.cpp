@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -52,6 +53,13 @@
 //   RitiroImport: an import retired after the uses gives its slabs back.
 // --evict (APS5_UNIT_SHADOW_MIB=16, Sfratto): three 12 MiB writers each land in the import and the
 // live slab bytes stay within the budget. Without the switch (_off) the regions take today's paths.
+// With APS5_BUFFER_SHADOW_LAZY (O16.T17, variant C) a writer's bytes stay live in the slab:
+//   ScrittorePigro: the import keeps its older bytes until GuestMemory::Read publishes them;
+//   LettoreRiusatoPubblica: a reused build reading the range in place publishes it in its proof;
+//   SpeculazioneRifiutata: neither a draw's bindings nor a speculation copy a range with live bytes
+//     (the bindings publish it and read it in place);
+//   RitiroPubblica: an import retired while its range stays registered publishes the live bytes;
+//   --evict: an evicted slab publishes its live bytes.
 
 namespace AgcDriver {
 struct VulkanDeviceTestAccess {
@@ -291,7 +299,8 @@ int RunCases(const Context& context, Recorder& recorder, WatchedBlock& watched, 
         Require(std::memcmp(seen.data(), bytes + (4u << 20u), RegionBytes) == 0, "the reader of region B does not see its bytes");
     }
 
-    // IstantaneaEvitata and SpecBindingsOmbra through a build: a read-only element over region A.
+    // IstantaneaEvitata and SpecBindingsOmbra through a build: a read-only 4 KiB element inside
+    // region A (a speculation refuses more than APS5_DRAW_UPLOAD_MAX, 4096 bytes, as Large).
     {
         ShaderRecompiler::RecompileResult program;
         ShaderRecompiler::DescriptorBinding binding;
@@ -300,7 +309,8 @@ int RunCases(const Context& context, Recorder& recorder, WatchedBlock& watched, 
         binding.descriptorSet = 0;
         binding.binding = 0;
         binding.count = 1;
-        binding.guestDescriptor = {static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(a >> 32u) & 0xffffu, static_cast<std::uint32_t>(RegionBytes), 0x31000000u};
+        const auto element = a + 16 * Page;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(Page), 0x31000000u};
         binding.bufferWritten = {false};
         program.bindings.push_back(binding);
         const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -309,7 +319,8 @@ int RunCases(const Context& context, Recorder& recorder, WatchedBlock& watched, 
         if (shadowing) Require(bindings == nullptr, "a draw's bindings copied a buffer the slab holds");
         else Require(bindings != nullptr && bindings->snapshots.size() == 1, "a draw's bindings did not copy the in-place buffer without APS5_BUFFER_SHADOW");
         const auto speculated = resources->SpeculateDrawBindings({}, resources->InPlaceReads(), nullptr);
-        if (shadowing) Require(speculated.bindings == nullptr && speculated.ranges.empty(), "a speculation copied a buffer the slab holds");
+        if (shadowing) Require(speculated.bindings == nullptr && speculated.ranges.empty() && speculated.refusal == ShaderResources::SpecRefusal::None, "a speculation copied a buffer the slab holds, or refused it");
+        else Require(speculated.bindings != nullptr && speculated.ranges.size() == 1, "a speculation did not copy the in-place 4 KiB buffer without APS5_BUFFER_SHADOW");
         resources->MarkGpuWrites(recorder);
         uses.Settle();
     }
@@ -372,6 +383,109 @@ int RunCases(const Context& context, Recorder& recorder, WatchedBlock& watched, 
     return 0;
 }
 
+// A compute build reading [element, element + bytes) through one read-only element.
+std::shared_ptr<ShaderResources> ReaderBuild(const Context& context, std::uint64_t element, std::size_t bytes, ShaderRecompiler::RecompileResult& program) {
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(bytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    return std::make_shared<ShaderResources>(context, compute);
+}
+
+int RunLazy(const Context& context, Recorder& recorder, WatchedBlock& watched, const HostImport& import) {
+    const Uses uses(context, recorder, import);
+    const auto address = watched.Address();
+    auto* bytes = watched.Bytes();
+    const auto a = address + Unit;
+    const auto write = [&](std::uint64_t element, std::uint8_t value) {
+        auto use = uses.Upload(element, RegionBytes);
+        Require(uses.InSlab(use), "a written 3 MiB region was not bound to a range slab");
+        uses.Shade(use, 0, RegionBytes, value);
+        uses.Finish(use);
+        uses.Settle();
+    };
+
+    // ScrittorePigro.
+    write(a, 0x5a);
+    Require(Holds(bytes + Unit, RegionBytes, 0x11), "a lazy writer copied its bytes back into the import");
+    Require(AnyShadowedOverlaps(a, RegionBytes), "a lazy writer's bytes are not live in the slab");
+    {
+        std::vector<std::byte> read(RegionBytes);
+        AgcDriver::GuestMemory::Read(a, read);
+        Require(Holds(read.data(), RegionBytes, 0x5a), "GuestMemory::Read did not publish the live bytes");
+        Require(Holds(bytes + Unit, RegionBytes, 0x5a) && !AnyShadowedOverlaps(a, RegionBytes), "the published bytes did not reach the import");
+    }
+
+    // LettoreRiusatoPubblica: a 4 KiB build across the end of A's slab, read in place, then a lazy
+    // writer of A, then the build's reuse. The storage images' serial is moved off 0 first (a
+    // title's always is; 0 never memoizes, so their scan would publish anyway) and the proof
+    // before the writer memoizes it: the proof after the writer rests on the range slab serial.
+    StorageTexture::BumpPendingSerial();
+    const auto across = a + RegionBytes - Page / 2;
+    ShaderRecompiler::RecompileResult program;
+    auto reader = ReaderBuild(context, across, Page, program);
+    Require(reader->InPlaceReads().size() == 1, "the build across the slab's end does not read in place");
+    reader->MarkGpuWrites(recorder);
+    uses.Settle();
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    Require(reader->Revalidate(std::span(&compute, 1), nullptr), "the reader build was not reusable");
+    reader->MarkGpuWrites(recorder);
+    uses.Settle();
+    write(a, 0x6b);
+    {
+        Require(reader->Revalidate(std::span(&compute, 1), nullptr), "the reader build was not reusable after the writer");
+        reader->MarkGpuWrites(recorder);
+        uses.Settle();
+        Require(Holds(bytes + Unit + RegionBytes - Page / 2, Page / 2, 0x6b), "a reused build reading in place did not publish the live bytes under it");
+    }
+
+    // SpeculazioneRifiutata.
+    write(a, 0x7c);
+    {
+        const auto speculated = reader->SpeculateDrawBindings({}, reader->InPlaceReads(), nullptr);
+        Require(speculated.bindings == nullptr && speculated.refusal == ShaderResources::SpecRefusal::PendingWriter, "a speculation copied a range with live slab bytes, or refused it for another reason");
+        const auto bindings = reader->PrepareDrawBindings(recorder);
+        Require(bindings == nullptr, "a draw's bindings copied a range with live slab bytes");
+        reader->MarkGpuWrites(recorder);
+        uses.Settle();
+        Require(Holds(bytes + Unit + RegionBytes - Page / 2, Page / 2, 0x7c), "the draw's bindings did not publish the live bytes they read in place");
+    }
+    reader.reset();
+
+    // LettorePerIndirizzo: a build reading through BDA tables maps the imports, never the slabs, so
+    // its use publishes every live range slab first (PublishRangeSlabs, the Address reason).
+    write(a, 0x4d);
+    Require(!Holds(bytes + Unit, RegionBytes, 0x4d) && AnyShadowedOverlaps(a, RegionBytes), "the lazy writer before the address-based read copied its bytes back");
+    Require(PublishRangeSlabs(context, PublishReason::Address) > 0, "an address-based read published no live range slab unit");
+    uses.Settle();
+    Require(Holds(bytes + Unit, RegionBytes, 0x4d) && !AnyShadowedOverlaps(a, RegionBytes), "an address-based read did not publish the live bytes into the import");
+
+    // RitiroPubblica: region C written lazily, then its registration replaced in one mutation (the
+    // range stays registered, the import retires).
+    const auto c = address + (8u << 20u);
+    write(c, 0x3c);
+    Require(Holds(bytes + (8u << 20u), RegionBytes, 0x11), "the lazy writer of region C copied its bytes back");
+    static_cast<void>(ShadowReport());
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(watched.Bytes());
+        mutation.Add(watched.Bytes(), 16u << 20u, true, true, true);
+    }
+    Require(HostImportFor(context, address, 16u << 20u) != nullptr, "the block registered again was not imported");
+    uses.Settle();
+    const auto retired = ShadowReport();
+    Require(ReportValue(retired, "lost on retire ") == 0, "the retire lost live units: " + retired);
+    Require(Holds(bytes + (8u << 20u), RegionBytes, 0x3c), "an import retired with its range still registered did not publish the live bytes");
+    std::cout << "lazy range slab buffers: the import gets the bytes when a consumer asks\n";
+    return 0;
+}
+
 int RunEvict(const Context& context, Recorder& recorder, WatchedBlock& watched, const HostImport& import) {
     const Uses uses(context, recorder, import);
     constexpr std::size_t TwelveMiB = std::size_t{12} << 20u;
@@ -385,8 +499,13 @@ int RunEvict(const Context& context, Recorder& recorder, WatchedBlock& watched, 
         const auto live = ReportValue(ShadowReport(), "live ");
         Require(live <= 16.0, "the live slab bytes exceed the 16 MiB budget: " + std::to_string(live) + " MiB");
     }
+    // Lazy: the last writer's slab still holds its bytes; the two evicted ones published theirs.
     for (std::uint8_t index = 0; index < 3; ++index) {
         const auto offset = Unit + index * (TwelveMiB + Unit);
+        if (BufferShadowLazy() && index == 2) {
+            std::vector<std::byte> read(TwelveMiB);
+            AgcDriver::GuestMemory::Read(watched.Address() + offset, read);
+        }
         Require(Holds(watched.Bytes() + offset, TwelveMiB, static_cast<std::uint8_t>(0x81 + index)), "an evicted writer's bytes did not stay in the import");
     }
     std::cout << "range slab buffers within the budget: evictions keep every writer's bytes\n";
@@ -441,7 +560,8 @@ int Run(const Context& deviceContext, bool evict) {
     Recorder recorder(context);
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
     recorder.Activate();
-    return evict ? RunEvict(context, recorder, watched, importKey) : RunCases(context, recorder, watched, importKey, shadowing);
+    if (evict) return RunEvict(context, recorder, watched, importKey);
+    return BufferShadowLazy() ? RunLazy(context, recorder, watched, importKey) : RunCases(context, recorder, watched, importKey, shadowing);
 }
 
 }

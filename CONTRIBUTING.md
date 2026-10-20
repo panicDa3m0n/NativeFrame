@@ -65,7 +65,7 @@ On Windows with an NVIDIA GPU some tests are skipped by design (VideoOut tests w
 ### Review and checks
 
 - `main` only changes through pull requests. Force pushes and deletion of `main` are blocked for everyone.
-- Every pull request needs an approving review from the code owner ([.github/CODEOWNERS](.github/CODEOWNERS)) and these checks to pass: **Conventions** (`tools/check_conventions.py`, run from the base branch without executing your code), **Relinker on Linux** and **Windows build and tests**. A pull request that only changes documentation skips the two builds.
+- Every pull request needs an approving review from the code owner ([.github/CODEOWNERS](.github/CODEOWNERS)) and these checks to pass: **Conventions** (`tools/check_conventions.py`, run from the base branch without executing your code), **Relinker on Linux** and **Windows build and tests**. A pull request that only changes documentation skips the two builds. Dependabot's pull requests skip the description template, but their title is still checked.
 - Workflows of a pull request from a fork run only after the maintainer has read the changes and approved the run. Changes to `.github/workflows/` get extra scrutiny.
 - All review conversations must be resolved before merging.
 

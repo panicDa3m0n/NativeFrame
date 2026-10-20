@@ -25,9 +25,13 @@ This code applies in every project space: the repository, issues, pull requests,
 
 ## Reporting and enforcement
 
-Report a problem privately to the maintainer, [@panicDa3m0n](https://github.com/panicDa3m0n), through the contact on the maintainer's GitHub profile. Reports are handled confidentially.
+Reports go to the maintainer, [@panicDa3m0n](https://github.com/panicDa3m0n), through GitHub only:
 
-The maintainer may edit or delete content, lock threads, and warn, temporarily block or permanently ban anyone whose behaviour breaks this code, in proportion to what happened and whether it is repeated. Decisions can be appealed by writing to the maintainer.
+- **Private:** open the repository's **Security** tab, choose **Report a vulnerability**, and start the title with `Code of conduct:`. Only the maintainer sees these reports. Use this for anything personal or sensitive.
+- **Public:** for something that does not need privacy, open an issue or a discussion.
+- To report content or an account to GitHub itself, use **Report content** in the menu of the comment or on the profile.
+
+Reports are handled confidentially. The maintainer may edit or delete content, lock threads, and warn, temporarily block or permanently ban anyone whose behaviour breaks this code, in proportion to what happened and whether it is repeated. Decisions can be appealed through the same private channel.
 
 ## Attribution
 

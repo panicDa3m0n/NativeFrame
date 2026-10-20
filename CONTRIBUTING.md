@@ -62,6 +62,13 @@ On Windows with an NVIDIA GPU some tests are skipped by design (VideoOut tests w
 - Say whether the change was written with AI assistance (`AI-assisted: yes` or `no`). It is a declaration, not a judgement: the author of the pull request is responsible for every line either way.
 - By submitting a contribution you agree that it is licensed under the GNU General Public License, version 2 only, like the rest of the project, and you confirm that you have the right to submit it.
 
+### Review and checks
+
+- `main` only changes through pull requests. Force pushes and deletion of `main` are blocked for everyone.
+- Every pull request needs an approving review from the code owner ([.github/CODEOWNERS](.github/CODEOWNERS)) and these checks to pass: **Conventions** (`tools/check_conventions.py`, run from the base branch without executing your code), **Relinker on Linux** and **Windows build and tests**. A pull request that only changes documentation skips the two builds.
+- Workflows of a pull request from a fork run only after the maintainer has read the changes and approved the run. Changes to `.github/workflows/` get extra scrutiny.
+- All review conversations must be resolved before merging.
+
 ## Issues
 
 Use the issue forms: **Bug report**, **Title compatibility report**, **Performance report** (with a measured frame) and **Technical proposal**. Search the existing issues first.

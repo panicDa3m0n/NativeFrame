@@ -1450,24 +1450,63 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+namespace {
+
+// The [gputime] line's pass starts (O17.T2): why a draw began a render pass instead of continuing
+// the open one, and the PM4 opcode being committed when other work ended an open pass.
+enum class PassStart : std::size_t { Continued, Closed, Forced, Samples, Key, Hazard, Count };
+constexpr const char* PassStartNames[] = {"continued", "closed", "forced", "samples", "key", "hazard"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PassStart::Count)> passStarts{};
+std::array<std::atomic<std::uint64_t>, 256> passClosesByOpcode{};
+// The timed work (its class key) that ended an open pass (BeginGpuTiming on an open pass).
+std::array<std::atomic<std::uint64_t>, 64> passClosesByClass{};
+std::atomic<std::uint64_t> passClosesByProgram{0};
+thread_local bool startingDrawPass = false;
+// An open pass other work ended: charged to the next timed range begun before the next draw's pass
+// (the work that needed the pass ended), else counted as untimed.
+thread_local bool pendingPassClose = false;
+std::atomic<std::uint64_t> passClosesUntimed{0};
+void notePassStart(PassStart reason) {
+    if (Recorder::GpuTimingEnabled()) passStarts[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        notePassStart(!pass.open ? PassStart::Closed : forced ? PassStart::Forced : PassStart::Samples);
+        if (pendingPassClose) {
+            pendingPassClose = false;
+            passClosesUntimed.fetch_add(1, std::memory_order_relaxed);
+        }
+        startingDrawPass = true;
         const auto commands = Commands();
+        startingDrawPass = false;
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        notePassStart(PassStart::Continued);
+        return {open->commands, true, false};
+    }
+    notePassStart(pass.key != key ? PassStart::Key : PassStart::Hazard);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    startingDrawPass = true;
     endOpenRenderPass(!merge);
+    startingDrawPass = false;
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide};
+}
+
+bool Recorder::RenderPassOpen() const {
+    return open != nullptr && open->renderPass.open;
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -1489,6 +1528,10 @@ void Recorder::SealPassWriteOnly() {
 
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    if (!startingDrawPass && GpuTimingEnabled()) {
+        passClosesByOpcode[GuestMemory::CurrentPacket().opcode & 0xffu].fetch_add(1, std::memory_order_relaxed);
+        pendingPassClose = true;
+    }
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
@@ -1998,6 +2041,11 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
+    if (pendingPassClose || (open != nullptr && open->renderPass.open && !startingDrawPass)) {
+        pendingPassClose = false;
+        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) passClosesByClass[static_cast<std::size_t>(key - ClassKey(CommandClass::DispatchLeading)) & 63u].fetch_add(1, std::memory_order_relaxed);
+        else passClosesByProgram.fetch_add(1, std::memory_order_relaxed);
+    }
     Commands();
     return beginTiming(key);
 }
@@ -2631,6 +2679,34 @@ void Recorder::readGpuTiming(Batch& batch) {
         AgcDriver::ProfilePrint_nid_no_patch("; draw programs: %zu variants, %.0f ms inside the passes:", drawPrograms.size(), drawProgramMs);
         for (std::size_t i = 0; i < drawPrograms.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(drawPrograms[i].first), static_cast<unsigned long long>(drawPrograms[i].second.count), drawPrograms[i].second.ms);
         timingByDrawProgram.clear();
+    }
+    {
+        std::string starts;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(PassStart::Count); ++i) {
+            char text[48];
+            std::snprintf(text, sizeof(text), " %s %llu", PassStartNames[i], static_cast<unsigned long long>(passStarts[i].exchange(0, std::memory_order_relaxed)));
+            starts += text;
+        }
+        std::vector<std::pair<std::uint64_t, unsigned>> closers;
+        for (unsigned opcode = 0; opcode < 256; ++opcode) {
+            if (const auto count = passClosesByOpcode[opcode].exchange(0, std::memory_order_relaxed); count != 0) closers.emplace_back(count, opcode);
+        }
+        std::sort(closers.rbegin(), closers.rend());
+        std::string by;
+        for (std::size_t i = 0; i < closers.size() && i < 8; ++i) {
+            char text[32];
+            std::snprintf(text, sizeof(text), " 0x%02x:%llu", closers[i].second, static_cast<unsigned long long>(closers[i].first));
+            by += text;
+        }
+        std::string classes;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(CommandClass::Count) - static_cast<std::size_t>(CommandClass::DispatchLeading) && i < 64; ++i) {
+            if (const auto count = passClosesByClass[i].exchange(0, std::memory_order_relaxed); count != 0) {
+                char text[64];
+                std::snprintf(text, sizeof(text), " %s:%llu", CommandClassNames[i], static_cast<unsigned long long>(count));
+                classes += text;
+            }
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("; pass starts:%s; passes ended by other work, by opcode:%s; by the timed work after them:%s program:%llu untimed:%llu", starts.c_str(), by.c_str(), classes.c_str(), static_cast<unsigned long long>(passClosesByProgram.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(passClosesUntimed.exchange(0, std::memory_order_relaxed)));
     }
     AgcDriver::ProfilePrint_nid_no_patch("\n");
     timingByKey.clear();

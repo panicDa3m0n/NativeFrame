@@ -130,12 +130,61 @@ BdaResources::BdaResources(const Context& context) {
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+std::vector<ShaderRecompiler::BdaAbi::Range> OverlayLiveSpans(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, const std::vector<LiveSlabSpan>& live, std::vector<std::shared_ptr<ShadowSlab>>& kept, std::uint64_t& mapped) {
+    std::vector<ShaderRecompiler::BdaAbi::Range> result;
+    result.reserve(ranges.size() + live.size() * 2u);
+    auto first = live.begin();
+    for (const auto& range : ranges) {
+        while (first != live.end() && first->end <= range.begin) ++first;
+        auto cursor = range.begin;
+        const auto append = [&](std::uint64_t end, const LiveSlabSpan* span) {
+            if (cursor >= end) return;
+            auto part = range;
+            part.begin = cursor;
+            part.end = end;
+            if (span != nullptr) {
+                // The memory's permissions stay: the lookup of an atomic access asks for both,
+                // whether or not the build stores (a read-only range made such builds fail).
+                part.deviceAddress = span->deviceAddress + (cursor - span->begin);
+                mapped += end - cursor;
+                if (std::find(kept.begin(), kept.end(), span->slab) == kept.end()) kept.push_back(span->slab);
+            } else {
+                part.deviceAddress += cursor - range.begin;
+            }
+            result.push_back(part);
+            cursor = end;
+        };
+        for (auto span = first; span != live.end() && span->begin < range.end; ++span) {
+            append(std::max(cursor, span->begin), nullptr);
+            append(std::min(range.end, span->end), &*span);
+        }
+        append(range.end, nullptr);
+    }
+    return result;
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool liveSlabs) : BdaResources(context) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
-    const auto& ranges = cached.has_value() ? *cached->ranges : built;
-    const auto serial = cached.has_value() ? cached->serial : 0;
+    const std::vector<ShaderRecompiler::BdaAbi::Range>* source = cached.has_value() ? cached->ranges : &built;
+    auto serial = cached.has_value() ? cached->serial : 0;
+    std::vector<ShaderRecompiler::BdaAbi::Range> overlaid;
+    if (liveSlabs) {
+        if (const auto live = LiveRangeSlabSpans(context); !live.empty()) {
+            std::uint64_t mapped = 0;
+            overlaid = OverlayLiveSpans(*source, live, keptSlabs, mapped);
+            if (mapped != 0) {
+                // Not the space's table any more: found by its words alone.
+                source = &overlaid;
+                serial = 0;
+                NoteAddressOverlay(mapped);
+            } else {
+                keptSlabs.clear();
+            }
+        }
+    }
+    const auto& ranges = *source;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
@@ -208,7 +257,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, ranges, table, serial});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }

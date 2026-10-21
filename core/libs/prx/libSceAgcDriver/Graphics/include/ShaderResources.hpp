@@ -559,6 +559,8 @@ private:
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // O17.T4 (diagnostic): whether APS5_BDA_OVERLAY_MASK lets this build map live slab bytes.
+    bool bdaOverlayAllowed = true;
     bool bdaReadOnly = true;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;

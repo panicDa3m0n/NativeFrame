@@ -129,6 +129,8 @@ struct UnitShadow {
     // whether a slab -> import copy was recorded at that generation.
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
+    // Per unit: the address writer serial (AddressWriterSerial) when its slab bytes became current.
+    std::vector<std::uint64_t> authority;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -237,6 +239,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    shadow->authority.assign(static_cast<std::size_t>(units), 0);
     shadow->owner.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
@@ -309,6 +312,9 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = static_cast<VkDeviceSize>(units) * UnitBytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    // Lazy range slabs are mapped by BDA tables (LiveRangeSlabSpans), so a slab gets an address.
+    const bool addressable = context.bufferDeviceAddress;
+    if (addressable) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkBuffer buffer = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer) != VK_SUCCESS) return nullptr;
@@ -316,6 +322,8 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
     context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocation.allocationSize = requirements.size;
+    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    if (addressable) allocation.pNext = &flags;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     try {
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -331,7 +339,12 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
         context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
         return nullptr;
     }
-    return std::make_shared<ShadowSlab>(context, buffer, memory, firstUnit, units);
+    auto slab = std::make_shared<ShadowSlab>(context, buffer, memory, firstUnit, units);
+    if (addressable) {
+        const VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+        slab->deviceAddress = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &address);
+    }
+    return slab;
 }
 
 struct SlabCopies {
@@ -1265,6 +1278,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 }
                 const bool clean = shadow->generation[unit] == 0 || shadow->published[unit] != 0;
                 shadow->generation[unit] = generation;
+                shadow->authority[unit] = AddressWriterSerial();
                 shadow->published[unit] = published && clean && shadow->RangeOf(unit) != nullptr ? 1 : 0;
                 current->lastUse = present;
             }
@@ -1364,6 +1378,128 @@ std::size_t PublishRangeSlabs(const Context& context, PublishReason reason) {
     std::size_t units = 0;
     for (const auto& [shadow, span] : spans) units += publishRange(shadow, span.first, span.second, PublishScope::Whole, reason);
     return units;
+}
+
+std::vector<LiveSlabSpan> LiveRangeSlabSpans(const Context& context, std::vector<std::pair<std::uint64_t, std::uint64_t>>* partial) {
+    std::vector<LiveSlabSpan> spans;
+    if (!UnitShadowEnabled()) return spans;
+    auto& registry = Registry();
+    // As a publish does (publishUnits): the CPU's stores over the live range slabs are collected
+    // first, so a page it stored over since is not taken as the slab's (StoredPagesSince).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> collect;
+    {
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [base, shadow] : registry.byBase) {
+            if (shadow->context.device != context.device || shadow->rangeOwned == 0 || shadow->liveUnits == 0) continue;
+            for (const auto& range : shadow->ranges) {
+                if (range.slab == nullptr || range.slab->deviceAddress == 0) continue;
+                const auto begin = std::max(shadow->UnitBegin(range.slab->firstUnit), shadow->importBase);
+                const auto end = std::min(shadow->UnitBegin(range.slab->firstUnit + range.slab->units), shadow->ImportEnd());
+                if (end > begin) collect.emplace_back(begin, end);
+            }
+        }
+    }
+    for (const auto& [begin, end] : collect) GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin));
+    std::lock_guard lock(registry.mutex);
+    for (const auto& [base, shadow] : registry.byBase) {
+        if (shadow->context.device != context.device || shadow->rangeOwned == 0 || shadow->liveUnits == 0) continue;
+        for (const auto& range : shadow->ranges) {
+            const auto& slab = range.slab;
+            if (slab == nullptr || slab->deviceAddress == 0) continue;
+            const auto slabBegin = shadow->UnitBegin(slab->firstUnit);
+            for (auto unit = slab->firstUnit; unit < slab->firstUnit + slab->units && unit < shadow->Units(); ++unit) {
+                if (!shadow->Live(unit) || shadow->SlabOf(unit) != slab) continue;
+                const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+                const auto parts = authoritativeParts(*shadow, unit, unitBegin, unitEnd);
+                if (parts.size() != 1 || parts.front().first != unitBegin || parts.front().second != unitEnd) {
+                    if (partial != nullptr && !parts.empty()) partial->emplace_back(unitBegin, unitEnd);
+                    continue;
+                }
+                if (VerifySlabAuthority()) NoteAuthorityCheck(shadow->authority[unit], unitBegin);
+                const auto address = slab->deviceAddress + (unitBegin - slabBegin);
+                if (!spans.empty() && spans.back().slab == slab && spans.back().end == unitBegin) spans.back().end = unitEnd;
+                else spans.push_back({unitBegin, unitEnd, address, slab});
+            }
+        }
+    }
+    std::sort(spans.begin(), spans.end(), [](const LiveSlabSpan& a, const LiveSlabSpan& b) { return a.begin < b.begin; });
+    return spans;
+}
+
+namespace {
+std::atomic<std::uint64_t> addressOverlays{0}, addressOverlayBytes{0}, addressPublishes{0};
+// Moves at every use of a build that stores through addresses: its stores reach the imports with no
+// stamp, so a slab byte current before it may be older than its import after it.
+std::atomic<std::uint64_t> addressWriterSerial{1};
+std::atomic<std::uint64_t> authorityChecked{0}, authorityStale{0}, unitsForgotten{0};
+}
+
+std::uint64_t AddressWriterSerial() {
+    return addressWriterSerial.load(std::memory_order_acquire);
+}
+
+bool VerifySlabAuthority() {
+    static const bool enabled = std::getenv("APS5_VERIFY_SLAB_AUTHORITY") != nullptr;
+    return enabled;
+}
+
+void NoteAuthorityCheck(std::uint64_t authority, std::uint64_t address) {
+    authorityChecked.fetch_add(1, std::memory_order_relaxed);
+    if (authority >= AddressWriterSerial()) return;
+    if (authorityStale.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[slab-authority] a live unit at 0x%llx is mapped with bytes from before a store through addresses\n", static_cast<unsigned long long>(address));
+}
+
+std::size_t PublishRangeSlabsForAddressWriter(const Context& context) {
+    const auto units = PublishRangeSlabs(context, PublishReason::Address);
+    addressWriterSerial.fetch_add(1, std::memory_order_acq_rel);
+    static const bool keep = std::getenv("APS5_NO_ADDRESS_WRITER_FORGET") != nullptr;
+    if (keep || !UnitShadowEnabled()) return units;
+    // The published range slab units hand their authority to the imports for good: the stores that
+    // follow are not stamped, so a later writer of part of a unit must seed the rest from the import
+    // instead of taking the slab's bytes as current.
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    for (const auto& [base, shadow] : registry.byBase) {
+        if (shadow->context.device != context.device || shadow->rangeOwned == 0) continue;
+        for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
+            auto* range = shadow->RangeOf(unit);
+            if (range == nullptr || shadow->generation[unit] == 0 || shadow->published[unit] == 0) continue;
+            const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+            removeRange(range->written, unitBegin, unitEnd);
+            shadow->generation[unit] = 0;
+            shadow->published[unit] = 0;
+            unitsForgotten.fetch_add(1, std::memory_order_relaxed);
+        }
+        shadow->Recount();
+    }
+    return units;
+}
+
+std::string SlabAuthorityReport() {
+    char text[160];
+    std::snprintf(text, sizeof(text), "address writers %llu, units forgotten %llu, authority checked %llu, stale %llu", static_cast<unsigned long long>(AddressWriterSerial() - 1), static_cast<unsigned long long>(unitsForgotten.load()), static_cast<unsigned long long>(authorityChecked.load()), static_cast<unsigned long long>(authorityStale.load()));
+    return text;
+}
+
+void NoteAddressOverlay(std::uint64_t bytes) {
+    addressOverlays.fetch_add(1, std::memory_order_relaxed);
+    addressOverlayBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void NoteAddressPublish() {
+    addressPublishes.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t AddressOverlays() {
+    return addressOverlays.load(std::memory_order_relaxed);
+}
+
+std::uint64_t AddressOverlayBytes() {
+    return addressOverlayBytes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t AddressPublishes() {
+    return addressPublishes.load(std::memory_order_relaxed);
 }
 
 void DestroyShadows(VkDevice device) {

@@ -3874,9 +3874,10 @@ void reportBufferShadow() {
     if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
     static std::uint64_t lastTaken = 0, lastReused = 0, lastSeed = 0, lastPublished = 0;
     const auto taken = stats.taken.load(), reused = stats.reused.load(), seed = stats.seedBytes.load(), published = stats.publishedBytes.load();
-    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published, %llu read-only regions bound to slabs by builds (%.1f MiB not read in place), %.1f MiB of copy-backs left live (lazy); last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
-        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0, static_cast<unsigned long long>(stats.readers.load()), stats.readerBytes.load() / 1048576.0, LazyCopyBackSkippedBytes() / 1048576.0,
+    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published, %llu read-only regions bound to slabs by builds (%.1f MiB not read in place), %.1f MiB of copy-backs left live (lazy), %llu address-based builds mapping live slab bytes (%.1f MiB), %llu address-based uses that published them; last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
+        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0, static_cast<unsigned long long>(stats.readers.load()), stats.readerBytes.load() / 1048576.0, LazyCopyBackSkippedBytes() / 1048576.0, static_cast<unsigned long long>(AddressOverlays()), AddressOverlayBytes() / 1048576.0, static_cast<unsigned long long>(AddressPublishes()),
         static_cast<unsigned long long>(taken - lastTaken), static_cast<unsigned long long>(reused - lastReused), (seed - lastSeed) / 1048576.0, (published - lastPublished) / 1048576.0);
+    std::fprintf(stderr, "[bufshadow] %s\n", SlabAuthorityReport().c_str());
     lastTaken = taken;
     lastReused = reused;
     lastSeed = seed;

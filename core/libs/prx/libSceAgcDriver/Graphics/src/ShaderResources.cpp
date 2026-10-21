@@ -2202,10 +2202,21 @@ void ShaderResources::buildComplete() {
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
-        // Lazy range slabs: the BDA tables map the imports, so their live bytes land there first.
-        if (usesBda && BufferShadowLazy()) PublishRangeSlabs(context, PublishReason::Address);
+        // Lazy range slabs: a read-only build's BDA table maps their live bytes (BdaResources); one
+        // that stores through addresses reads and writes the imports, which get the live bytes first.
+        const bool mapsLiveSlabs = usesBda && BufferShadowLazy() && bdaReadOnly && bdaOverlayAllowed && context.bufferDeviceAddress;
+        if (usesBda && BufferShadowLazy() && !mapsLiveSlabs) {
+            if (bdaReadOnly) PublishRangeSlabs(context, PublishReason::Address);
+            else PublishRangeSlabsForAddressWriter(context);
+            NoteAddressPublish();
+        } else if (mapsLiveSlabs) {
+            // The units its table cannot map whole (LiveRangeSlabSpans) reach the import first.
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> partial;
+            static_cast<void>(LiveRangeSlabSpans(context, &partial));
+            for (const auto& [begin, end] : partial) PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, PublishReason::Address);
+        }
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, mapsLiveSlabs);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         finishImageTables();
         phase(BuildPhase::Bda);
@@ -3324,8 +3335,18 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
-    // Lazy range slabs: a build reading through BDA tables reads the imports (see the build).
-    if (usesBda && BufferShadowLazy()) PublishRangeSlabs(context, PublishReason::Address);
+    // Lazy range slabs (see the build): a read-only build whose table maps live slab bytes, or that
+    // would need to, is made again with a table of the live bytes of now; one that stores through
+    // addresses publishes them.
+    if (usesBda && BufferShadowLazy()) {
+        if (!(bdaReadOnly && bdaOverlayAllowed && context.bufferDeviceAddress)) {
+            if (bdaReadOnly) PublishRangeSlabs(context, PublishReason::Address);
+            else PublishRangeSlabsForAddressWriter(context);
+            NoteAddressPublish();
+        } else if ((bda != nullptr && bda->Overlaid()) || !LiveRangeSlabSpans(context).empty()) {
+            return finish(false, false, ProofFailure::Changed);
+        }
+    }
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             struct RegionsTag {};

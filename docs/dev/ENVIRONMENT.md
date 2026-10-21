@@ -9,7 +9,9 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `ANYPS5_LOADEXEC_PARENT` | string | `core/libs/tests/GuestLoadExecHost.cpp` |  | variable the Windows entry stub reads; its wide name is built in `core/relinker/elfpatcher/src/windows/WindowsEntryStubBuilder.cpp` |
 | `ANYPS5_LOADEXEC_TEST_ROOT` | string | `core/libs/tests/GuestLoadExecHost.cpp` |  | directory the load-exec host test reads its guest executable from |
 | `ANYPS5_TEST_QUOTED_ARGV0` | presence | `core/libs/tests/GuestLoadExecHost.cpp` |  | makes the load-exec test's first argument one with quotes, a backslash and non-ASCII text |
+| `APS5_BDA_SLAB_OVERLAY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderAddressResources.cpp` |  | with `APS5_BUFFER_SHADOW_LAZY`, lets a read-only address-based build map live range slab bytes in its BDA table instead of publishing them first |
 | `APS5_EBOOT` | string | `core/libs/tests/GuestSystemExit.cpp` |  | host path of the executable launched for /app0/eboot.bin, defaulting to the running executable |
+| `APS5_NO_ADDRESS_WRITER_FORGET` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` |  | keeps the authority of range slab units a build that stores through addresses published, so a later writer of part of a unit takes the slab bytes as current |
 | `APS5_SKIP_TIMING_TESTS` | presence | `core/libs/tests/PreciseWait.cpp` |  | treats the timing tests' runner as preempted, so they skip without probing the clock |
 | `APS5_USBD_DEVICE` | string | `core/libs/tests/GuestUsbd.cpp` |  | selects the USB device a test drives, as vendor:product in hex |
 
@@ -51,6 +53,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_TRACE_BUFFER_WRITTEN` | presence | `core/shader/recompiler/Optimization/src/DescriptorBindingBuilder.cpp` |  | prints how many guest buffer elements a program may store to and how many it only loads |
 | `APS5_TRACE_IMAGE_TABLE` | presence | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | traces image-table resolution |
 | `APS5_VERIFY_BUFFER_SHADOW` | presence or `abort` | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` |  | reads back every range slab copy-back of `APS5_BUFFER_SHADOW` and compares it with guest memory when its batch completes (counted as the shadow verification, `abort` stops at the first difference); also verifies unit shadow publishes as `APS5_SHADOW_VERIFY` |
+| `APS5_VERIFY_SLAB_AUTHORITY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` |  | counts the live range slab units a BDA table maps whose bytes predate a store through addresses (the `[bufshadow]` line) |
 | `APS5_VERIFY_SPEC_BINDINGS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | makes the commit's own bindings beside a taken speculation (APS5_SPEC_BINDINGS), records those, aborts when the choices differ and counts differing bytes |
 | `APS5_VERIFY_SRT_COMPACT` | presence | `core/shader/recompiler/Optimization/src/SrtWalker/SrtDescriptorEvaluation.cpp` |  | walks every SRT descriptor a second time through the IR evaluator and throws when the two walks differ |
 | `APS5_VERIFY_SRT_TAPE` | presence | `core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp` |  | walks a plan's runtime sources a second time through the evaluator, adopts its answers where the two differ and prints the first twenty differences |

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -465,6 +466,66 @@ int RunLazy(const Context& context, Recorder& recorder, WatchedBlock& watched, c
     Require(PublishRangeSlabs(context, PublishReason::Address) > 0, "an address-based read published no live range slab unit");
     uses.Settle();
     Require(Holds(bytes + Unit, RegionBytes, 0x4d) && !AnyShadowedOverlaps(a, RegionBytes), "an address-based read did not publish the live bytes into the import");
+
+    // LettorePerIndirizzoSlab (O17.T1): a read-only build's BDA table maps the live bytes to the slab
+    // instead: the range over A points at the slab's address, the rest of the import's range stays.
+    if (context.bufferDeviceAddress) {
+        write(a, 0x5e);
+        const auto live = LiveRangeSlabSpans(context);
+        Require(live.size() == 1 && live.front().begin == a && live.front().end == a + RegionBytes && live.front().deviceAddress != 0, "the live slab bytes of the lazy writer are not one span over its region");
+        const std::uint64_t importAddress = 0x100000000ull;
+        const std::vector<ShaderRecompiler::BdaAbi::Range> table{{address, address + (16u << 20u), importAddress, ShaderRecompiler::BdaAbi::Read | ShaderRecompiler::BdaAbi::Write, 0}};
+        std::vector<std::shared_ptr<ShadowSlab>> kept;
+        std::uint64_t mapped = 0;
+        const auto overlaid = OverlayLiveSpans(table, live, kept, mapped);
+        Require(overlaid.size() == 3 && mapped == RegionBytes && kept.size() == 1 && kept.front() == live.front().slab, "the table over the live span is not split into import, slab and import parts");
+        Require(overlaid[0].begin == address && overlaid[0].end == a && overlaid[0].deviceAddress == importAddress, "the part before the live span does not point at the import");
+        Require(overlaid[1].begin == a && overlaid[1].end == a + RegionBytes && overlaid[1].deviceAddress == live.front().deviceAddress && overlaid[1].permissions == table.front().permissions, "the live span does not point at the slab with the memory's permissions");
+        Require(overlaid[2].begin == a + RegionBytes && overlaid[2].deviceAddress == importAddress + (a + RegionBytes - address), "the part after the live span does not point at the import");
+        PublishRangeSlabs(context, PublishReason::Address);
+        uses.Settle();
+        Require(LiveRangeSlabSpans(context).empty() && Holds(bytes + Unit, RegionBytes, 0x5e), "the published live span stayed live or did not reach the import");
+        // A region off the units: the unit it ends inside is live only in part, so it is reported
+        // for publishing and no mapped span covers it or splits a unit.
+        write(a + Page, 0x6e);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> partial;
+        const auto units = LiveRangeSlabSpans(context, &partial);
+        const auto tail = a + RegionBytes;
+        Require(std::find(partial.begin(), partial.end(), std::pair<std::uint64_t, std::uint64_t>{tail, tail + Unit}) != partial.end(), "the unit a region ends inside is not reported live in part");
+        Require(!units.empty() && std::all_of(units.begin(), units.end(), [&](const LiveSlabSpan& span) { return span.begin % Unit == 0 && span.end % Unit == 0 && (span.end <= tail || span.begin >= tail + Unit); }), "a mapped span splits a unit or covers one the slab holds in part");
+        PublishRangeSlabs(context, PublishReason::Address);
+        uses.Settle();
+    } else {
+        std::cout << "LettorePerIndirizzoSlab skipped: the device has no buffer device address\n";
+    }
+
+    // ScrittorePerIndirizzo (O20.T1): a build that stores through addresses publishes every live range
+    // slab, then its stores reach the import with no stamp (here a fill of A's import bytes). A later
+    // lazy writer of one page of A must seed the rest from the import: the next publish keeps the
+    // stores there instead of bringing the slab's bytes from before them back.
+    write(a, 0x2a);
+    Require(PublishRangeSlabsForAddressWriter(context) > 0, "a storing address-based build published no live range slab unit");
+    uses.Settle();
+    Require(Holds(bytes + Unit, RegionBytes, 0x2a), "a storing address-based build did not get the live bytes into the import");
+    {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import.buffer, HostImportOffset(import, a), RegionBytes, 0x3b3b3b3bu);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        uses.Settle();
+    }
+    Require(Holds(bytes + Unit, RegionBytes, 0x3b), "the unstamped GPU stores did not reach the import");
+    {
+        auto later = uses.Upload(a, RegionBytes);
+        Require(uses.InSlab(later), "the later writer of A was not bound to the range slab");
+        uses.Shade(later, 0, Page, 0x4c);
+        uses.Finish(later);
+        uses.Settle();
+    }
+    PublishRangeSlabs(context, PublishReason::Address);
+    uses.Settle();
+    Require(Holds(bytes + Unit, Page, 0x4c), "the later writer's page did not reach the import");
+    Require(Holds(bytes + Unit + Page, RegionBytes - Page, 0x3b), "the slab's bytes from before the stores through addresses came back over them");
 
     // RitiroPubblica: region C written lazily, then its registration replaced in one mutation (the
     // range stays registered, the import retires).

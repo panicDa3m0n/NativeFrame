@@ -64,6 +64,8 @@ struct ShadowSlab {
     VkDeviceMemory memory;
     std::uint64_t firstUnit;
     std::uint32_t units;
+    // Its device address when the device has buffer device addresses (BDA tables map it), else 0.
+    VkDeviceAddress deviceAddress = 0;
     std::uint64_t lastUse = 0;
     // Destinations handed out for a write-back in progress: such a slab is never evicted.
     std::atomic<std::uint32_t> pins{0};
@@ -195,6 +197,36 @@ void PublishAllShadows(const Context& context, PublishReason reason);
 // A build that reads guest memory through BDA tables maps the imports, never the slabs, so its use
 // publishes them first (PublishReason::Address).
 std::size_t PublishRangeSlabs(const Context& context, PublishReason reason);
+// O17.T1 (APS5_BUFFER_SHADOW_LAZY): the whole units a range slab of the context's device holds
+// newer than its import in every byte (written, not published, not stored over by the CPU since),
+// ascending and disjoint, with the slab's device address for each; only slabs with a device
+// address. A read-only build that reads through BDA tables maps them instead of the import
+// (BdaResources). The shader looks a range up for every access and an access across two ranges
+// fails, so a table never splits a unit: a live unit the slab holds only in part goes to `partial`
+// (its range), and the build publishes it first.
+struct LiveSlabSpan {
+    std::uint64_t begin;
+    std::uint64_t end;
+    VkDeviceAddress deviceAddress;
+    std::shared_ptr<ShadowSlab> slab;
+};
+std::vector<LiveSlabSpan> LiveRangeSlabSpans(const Context& context, std::vector<std::pair<std::uint64_t, std::uint64_t>>* partial = nullptr);
+// A build that stores through addresses: every live range slab is published, then the published units
+// hand their authority to the imports (APS5_NO_ADDRESS_WRITER_FORGET keeps it, for comparison).
+std::size_t PublishRangeSlabsForAddressWriter(const Context& context);
+std::uint64_t AddressWriterSerial();
+// APS5_VERIFY_SLAB_AUTHORITY: counts the live units a BDA table maps whose bytes predate a store
+// through addresses (SlabAuthorityReport).
+bool VerifySlabAuthority();
+void NoteAuthorityCheck(std::uint64_t authority, std::uint64_t address);
+std::string SlabAuthorityReport();
+// The [bufshadow] line: address-based builds whose table maps live slab bytes, and uses of builds
+// that store through addresses (they publish every live range slab first).
+void NoteAddressOverlay(std::uint64_t bytes);
+void NoteAddressPublish();
+std::uint64_t AddressOverlays();
+std::uint64_t AddressOverlayBytes();
+std::uint64_t AddressPublishes();
 void DestroyShadows(VkDevice device);
 // The [storage] line's shadow segment (10 s deltas, live slab totals).
 std::string ShadowReport();

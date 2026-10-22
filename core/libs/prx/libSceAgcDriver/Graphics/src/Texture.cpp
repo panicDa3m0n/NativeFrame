@@ -3983,7 +3983,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
 bool StorageTexture::WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
     auto& pending = Pending();
     if (pending.flushingCount.load(std::memory_order_acquire) == 0 || GuestMemory::GpuMutex().HeldByThisThread()) return false;
-    const auto* exempt = refreshing;
+    const auto* exempt = Refreshing::Get();
     for (bool waited = false;; waited = true) {
         {
             std::lock_guard lock(pending.mutex);

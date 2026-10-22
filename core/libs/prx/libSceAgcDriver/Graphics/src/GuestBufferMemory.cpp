@@ -4056,7 +4056,6 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
             static const bool fatal = std::getenv("APS5_SNAPSHOT_CHECK_FATAL") != nullptr;
             if (!live || fatal) throw std::runtime_error(text);
             static AgcDriver::Mutex reportMutex;
-            static std::uint64_t mismatches = 0;
             static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
             std::lock_guard lock(reportMutex);
             const auto mismatches = Snapshots().mismatched.fetch_add(1, std::memory_order_relaxed) + 1;

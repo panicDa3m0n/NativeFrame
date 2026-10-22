@@ -1826,7 +1826,8 @@ bool takeSpeculativeBindings(const DrawSpeculation* speculation, const ShaderRes
         return outcome == TakenBindings || outcome == TakenEmpty;
     };
     if (speculation->resources.get() != &resources) return finish(RejectedTemplate);
-    if (!std::equal(moved.begin(), moved.end(), speculation->moved.begin(), speculation->moved.end())) return finish(RejectedMoved);
+    const auto sameMoved = [](const ShaderResources::MovedBuffer& a, const ShaderResources::MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && std::ranges::equal(a.words, b.words); };
+    if (!std::equal(moved.begin(), moved.end(), speculation->moved.begin(), speculation->moved.end(), sameMoved)) return finish(RejectedMoved);
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     resources.InPlaceReads(reads);
@@ -2715,7 +2716,7 @@ std::shared_ptr<const DrawInputSpeculation> SpeculateDrawInputs(const Context& c
     }
 }
 
-const std::set<std::uint32_t>* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+const std::uint32_t* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders) {
     if (speculation == nullptr) return nullptr;
     if (speculation->device != context.device) {
         noteSpecInput(SpecRefusedDevice);
@@ -3222,7 +3223,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.recorder = recorder;
         record.resources = resources;
         record.moved = resolved.moved;
-        record.speculation = prepared != nullptr ? prepared->speculation.get() : nullptr;
+        record.speculation = nullptr;
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;

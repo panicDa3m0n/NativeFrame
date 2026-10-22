@@ -752,44 +752,6 @@ private:
         return true;
     }
 
-    void resumeResidentWrites(std::uintptr_t address) {
-        const auto run = std::prev(residentRuns.upper_bound(address));
-        run->second.writeObserved = true;
-        forgetClean(run->first, run->second.end);
-        auto first = views.lower_bound(run->first);
-        while (first != views.end() && first->first < run->second.end) {
-            const auto begin = first->first;
-            auto end = begin;
-            const auto protection = first->second.protection;
-            auto next = first;
-            bool armed = false;
-            do {
-                armed = armed || next->second.armed != 0;
-                end = next->first + pageBytes;
-                ++next;
-            } while (next != views.end() && next->first == end && end < run->second.end && next->second.protection == protection);
-            if (armed) {
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(begin), end - begin, protection, &previous)) fail("resume resident guest writes");
-            }
-            for (; first != next; ++first) first->second.armed = 0;
-        }
-    }
-
-    bool armResident(std::uintptr_t from, std::uintptr_t stop) {
-        const auto first = views.lower_bound(from & ~(pageBytes - 1));
-        if (first == views.end() || !writable(first->second.protection)) return false;
-        const auto protection = first->second.protection;
-        for (auto it = first; it != views.end() && it->first < stop; ++it) {
-            if (!it->second.resident || it->second.protection != protection || it->second.hostWrites != 0 || it->second.hostImports != 0 || it->second.page->pins != 0) return false;
-        }
-        DWORD previous;
-        const auto readOnly = protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-        if (!VirtualProtect(reinterpret_cast<void*>(from), stop - from, readOnly, &previous)) fail("arm resident memory write tracking");
-        for (auto it = first; it != views.end() && it->first < stop; ++it) it->second.armed |= subpagesOf(it->first, from, stop);
-        return true;
-    }
-
     Window open(HANDLE section, std::uint64_t offset, std::size_t bytes) {
         const auto lead = offset % granularity;
         Window window;

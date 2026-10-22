@@ -20,7 +20,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Float32FlushControl.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DrawInputsInPlace.hpp"
-#include "prx/libSceAgcDriver/Execution/include/RobustBufferAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupBarrier.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"

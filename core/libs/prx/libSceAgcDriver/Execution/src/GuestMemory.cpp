@@ -1247,19 +1247,20 @@ WriteTracker& Tracker() {
 // The tracker's mutex held; its release publishes the generation (WriteTracker::published).
 class TrackerLock {
 public:
-    TrackerLock(WriteTracker& tracker, std::unique_lock<AgcDriver::Mutex> lock) : tracker(&tracker), lock(std::move(lock)) {}
+    TrackerLock(WriteTracker& tracker, std::unique_lock<AgcDriver::Mutex> lock) : tracker(&tracker), held(std::move(lock)) {}
     TrackerLock(TrackerLock&&) = default;
     TrackerLock& operator=(TrackerLock&&) = delete;
     ~TrackerLock() { unlock(); }
+    void lock() { held.lock(); }
     void unlock() {
-        if (!lock.owns_lock()) return;
+        if (!held.owns_lock()) return;
         tracker->published.store(tracker->generation.load(std::memory_order_relaxed), std::memory_order_release);
-        lock.unlock();
+        held.unlock();
     }
 
 private:
     WriteTracker* tracker;
-    std::unique_lock<AgcDriver::Mutex> lock;
+    std::unique_lock<AgcDriver::Mutex> held;
 };
 
 TrackerLock lockTracker(WriteTracker& tracker) {

@@ -78,7 +78,7 @@ struct DrawInputSpeculation {
     const State* state = nullptr;
     const CompiledShader* shaders = nullptr;
     std::size_t shaderCount = 0;
-    std::set<std::uint32_t> fragmentOutputs;
+    std::uint32_t fragmentOutputs = 0;
     VertexInputLayout vertexInput;
     std::vector<std::uint32_t> mainKey;
     std::vector<std::uint32_t> fragmentKey;
@@ -96,7 +96,7 @@ bool SpecProbe();
 bool SpecBindings();
 bool SpecInputs();
 std::shared_ptr<const DrawInputSpeculation> SpeculateDrawInputs(const Context& context, const State& state, std::span<const CompiledShader> shaders);
-const std::set<std::uint32_t>* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders);
+const std::uint32_t* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders);
 std::shared_ptr<Pipeline> TakeSpeculatedPipeline(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, bool lean, bool proxiedTargets);
 // The two halves of a DrawSpeculation outside a parallel-prepared draw (tests): what a prepare
 // thread makes for a key whose template SharedResourceCache holds, and the commit's check, which

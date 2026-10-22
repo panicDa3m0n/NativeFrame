@@ -77,7 +77,7 @@ int main() {
         const auto layouts = described.View();
         const auto vertexInput = BuildVertexInputLayout(context, compiled.vertex.vertexAttributes);
         const auto* outputs = TakeSpeculatedOutputs(speculation.get(), context, state, shaders);
-        Require(outputs != nullptr && outputs->contains(0u), "the commit did not take the speculated fragment outputs of the same draw");
+        Require(outputs != nullptr && (*outputs & 1u) != 0, "the commit did not take the speculated fragment outputs of the same draw");
         const auto taken = TakeSpeculatedPipeline(speculation.get(), context, state, shaders, vertexInput, layouts, true, false);
         Require(taken != nullptr && taken == speculation->pipeline, "the commit did not take the speculated pipeline of the same draw");
         Require(CachedPipeline(context, state, vertexInput, layouts, shaders, VK_IMAGE_LAYOUT_GENERAL) == taken, "the speculated pipeline is not the one the commit looks up");

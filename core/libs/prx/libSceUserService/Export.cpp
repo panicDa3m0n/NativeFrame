@@ -26,7 +26,7 @@ int APS5_VABI sceUserServiceGetAccessibilityChatTranscription(int user_id, int32
  return ReportAccessibilitySetting(user_id, chat_transcription, 0);
 }
 
-int APS5_VABI sceUserServiceGetAccessibilityKeyremapEnable() {
+int APS5_VABI sceUserServiceGetAccessibilityKeyremapEnable(std::int32_t userId, std::int32_t* enabled) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
@@ -43,7 +43,7 @@ int APS5_VABI sceUserServiceGetAccessibilityVibration(int user_id, int32_t* vibr
  return ReportAccessibilitySetting(user_id, vibration, 1);
 }
 
-int APS5_VABI sceUserServiceGetAccessibilityZoom() {
+int APS5_VABI sceUserServiceGetAccessibilityZoom(std::int32_t userId, std::int32_t* zoom) {
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
@@ -148,8 +148,11 @@ int APS5_VABI sceUserServiceGetUserNumber(int user_id, int32_t* number) {
  return USER_SERVICE_OK;
 }
 
-int APS5_VABI sceUserServiceInitialize(const void* params) {
- (void)params;
+static bool ValidThreadPriority(int priority) {
+ return priority >= USER_SERVICE_THREAD_PRIORITY_MIN && priority <= USER_SERVICE_THREAD_PRIORITY_MAX;
+}
+
+static int MarkInitialized() {
  if (initialized.exchange(true)) {
   return USER_SERVICE_ERROR_ALREADY_INITIALIZED;
  }
@@ -157,11 +160,20 @@ int APS5_VABI sceUserServiceInitialize(const void* params) {
  return USER_SERVICE_OK;
 }
 
-int APS5_VABI sceUserServiceInitialize2(void) {
- if (!initialized.exchange(true)) {
-  loginReported.store(false);
+int APS5_VABI sceUserServiceInitialize(const UserServiceInitParam* params) {
+ if (params != nullptr) {
+  if (!ValidThreadPriority(params->priority)) {
+   return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+  }
  }
- return USER_SERVICE_OK;
+ return MarkInitialized();
+}
+
+int APS5_VABI sceUserServiceInitialize2(std::int32_t priority, KernelCpumask affinityMask) {
+ if (!ValidThreadPriority(priority)) {
+  return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+ }
+ return MarkInitialized();
 }
 
 int APS5_VABI sceUserServiceTerminate(void) {

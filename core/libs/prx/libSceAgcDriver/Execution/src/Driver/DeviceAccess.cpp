@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -22,37 +21,27 @@ DevicePointer::operator bool() const { return Load() != nullptr; }
 bool DevicePointer::operator==(std::nullptr_t) const { return Load() == nullptr; }
 
 void DeviceUseGate::lock_shared() {
-    auto value = state.load(std::memory_order_relaxed);
-    for (;;) {
-        if ((value & Replacing) != 0) {
-            WaitWhile(state, value);
-            value = state.load(std::memory_order_relaxed);
-        } else if (state.compare_exchange_weak(value, value + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-            return;
-        }
-    }
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return !replacing; });
+    ++users;
 }
 
 void DeviceUseGate::unlock_shared() {
-    if (state.fetch_sub(1, std::memory_order_release) == (Replacing | 1)) WakeAll(state);
+    std::lock_guard lock(mutex);
+    if (--users == 0) changed.notify_all();
 }
 
 void DeviceUseGate::lock() {
-    auto value = state.load(std::memory_order_relaxed);
-    for (;;) {
-        if ((value & Replacing) != 0) {
-            WaitWhile(state, value);
-            value = state.load(std::memory_order_relaxed);
-        } else if (state.compare_exchange_weak(value, value | Replacing, std::memory_order_acquire, std::memory_order_relaxed)) {
-            break;
-        }
-    }
-    for (value = state.load(std::memory_order_acquire); value != Replacing; value = state.load(std::memory_order_acquire)) WaitWhile(state, value);
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return !replacing; });
+    replacing = true;
+    changed.wait(lock, [&] { return users == 0; });
 }
 
 void DeviceUseGate::unlock() {
-    state.fetch_and(~Replacing, std::memory_order_release);
-    WakeAll(state);
+    std::lock_guard lock(mutex);
+    replacing = false;
+    changed.notify_all();
 }
 
 }

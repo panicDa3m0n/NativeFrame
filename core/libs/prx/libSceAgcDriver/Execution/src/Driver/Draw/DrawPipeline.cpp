@@ -1,10 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepare.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
-#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +23,10 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+std::atomic<std::uint64_t> heldReadRanges{0};
+std::atomic<std::uint64_t> heldReadQueries{0};
+std::atomic<std::uint64_t> heldReadHits{0};
+
 }
 
 DrawPipeline& DrawPipeline::Queue0() {
@@ -35,41 +38,17 @@ std::size_t DrawPipeline::Depth() {
     static const std::size_t depth = [] {
         const char* text = std::getenv("APS5_PIPELINED_DRAWS");
         if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr || std::getenv("APS5_DRAW_DRAIN") != nullptr || std::getenv("APS5_DRAIN_ALL") != nullptr || std::getenv("APS5_NO_WORDWISE_CAPTURE") != nullptr) return std::size_t{0};
-        const std::size_t standard = PipelineIndirect() ? 64 : 8;
-        if (text == nullptr) return standard;
+        if (text == nullptr) return std::size_t{8};
         const auto value = std::strtoull(text, nullptr, 10);
-        return value == 0 ? std::size_t{0} : value == 1 ? standard : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
+        return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{8} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
     return depth;
-}
-
-std::size_t DrawPipeline::RefillMark() {
-    static const std::size_t mark = Depth() == 0 ? 0 : std::getenv("APS5_COMMIT_HYSTERESIS") != nullptr ? Depth() / 2 : Depth() - 1;
-    return mark;
-}
-
-std::uint64_t DrawPipeline::ProducerWakes() {
-    std::lock_guard lock(mutex);
-    return producerWakes;
 }
 
 std::size_t DrawPipeline::QueuedItems() {
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
     return pipeline.items.size();
-}
-
-bool DrawPipeline::PipelineIndirect() {
-    static const bool enabled = [] { const char* text = std::getenv("APS5_PIPELINE_INDIRECT"); return text != nullptr && std::strcmp(text, "0") != 0; }();
-    return enabled;
-}
-
-bool DrawPipeline::DrainBeforeRead(std::uint64_t address, std::size_t bytes) {
-    if (!Active()) return false;
-    auto& pipeline = Queue0();
-    if (!pipeline.Busy() || !pipeline.Overlaps(address, bytes)) return false;
-    pipeline.Drain(DrainReason::Capture);
-    return true;
 }
 
 bool& DrawPipeline::Active() {
@@ -99,7 +78,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -111,23 +90,16 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        static const bool spin = std::getenv("APS5_NO_PRODUCER_SPIN") == nullptr;
-        if (spin) {
-            lock.unlock();
-            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) <= RefillMark(); });
-            lock.lock();
-        }
-        if (items.size() > RefillMark()) {
-            ++idleWaiters;
-            idle.wait(lock, [&] { return items.size() <= RefillMark(); });
-            --idleWaiters;
-        }
+        ++idleWaiters;
+        idle.wait(lock, [&] { return items.size() < Depth(); });
+        --idleWaiters;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
+    heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -140,7 +112,6 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
-    const auto windowNs = std::max<double>(1.0, static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastReport).count()));
     lastReport = now;
     std::string drainText;
     for (std::size_t i = 0; i < drains.size(); ++i) {
@@ -161,21 +132,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> counted{};
-    for (std::size_t i = 0; i < counted.size(); ++i) {
-        const auto total = events[i].load(std::memory_order_relaxed);
-        counted[i] = total - reportedEvents[i];
-        reportedEvents[i] = total;
-    }
-    const auto busy = static_cast<double>(commitNs) * 100.0 / windowNs;
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
+    char reads[64];
+    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
+    drainText += reads;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};
 }
 
 void DrawPipeline::run() {
-    if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("draw committer");
+    PerformanceTrace::BindThread("draw committer");
+    StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
@@ -192,7 +160,6 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
-            const PerformanceTimer timing("DrawPipeline.Commit");
             if (commit != nullptr) (*commit)();
         } catch (const std::exception&) {
             failed = true;
@@ -208,52 +175,16 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        Item done;
-        {
-            std::lock_guard lock(mutex);
-            done = std::move(items.front());
-            items.pop_front();
-            ++commits;
-            commitNs += spent;
-            if (failed) ++commitErrors;
-            if (fatal != nullptr && failure == nullptr) failure = fatal;
-            outstanding.fetch_sub(1, std::memory_order_release);
-            if (idleWaiters != 0 && items.size() <= RefillMark()) {
-                ++producerWakes;
-                idle.notify_all();
-            }
-        }
-        retire(std::move(done));
+        std::lock_guard lock(mutex);
+        items.pop_front();
+        ++commits;
+        commitNs += spent;
+        if (failed) ++commitErrors;
+        if (fatal != nullptr && failure == nullptr) failure = fatal;
+        outstanding.fetch_sub(1, std::memory_order_release);
+        if (idleWaiters != 0) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
-}
-
-void DrawPipeline::retire(Item&& item) {
-    static const bool reaperEnabled = std::getenv("APS5_NO_COMMIT_REAPER") == nullptr;
-    if (!reaperEnabled) {
-        const Item dropped = std::move(item);
-        return;
-    }
-    constexpr std::size_t ReapBatch = 64;
-    std::lock_guard lock(retireMutex);
-    retired.push_back(std::move(item));
-    if (!reaper.joinable()) reaper = std::thread([this] { reap(); });
-    if (retired.size() >= ReapBatch && reaperWaiting) reapWake.notify_one();
-}
-
-void DrawPipeline::reap() {
-    for (;;) {
-        std::deque<Item> batch;
-        {
-            std::unique_lock lock(retireMutex);
-            reaperWaiting = true;
-            reapWake.wait_for(lock, std::chrono::milliseconds(2), [&] { return retired.size() >= 64; });
-            reaperWaiting = false;
-            if (retired.empty()) continue;
-            batch.swap(retired);
-        }
-        batch.clear();
-    }
 }
 
 void DrawPipeline::Stop() {
@@ -271,7 +202,6 @@ void DrawPipeline::Stop() {
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
-    if (Active() && !GuestMemory::GpuMutex().HeldByThisThread()) DrawPrepare::Queue0().Flush();
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
@@ -289,6 +219,27 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
+}
+
+bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
+    const auto end = address + bytes;
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    heldReadQueries.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& item : pipeline.items) {
+        for (const auto& [begin, limit] : item.reads) {
+            if (address >= limit || begin >= end) continue;
+            heldReadHits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+void DrawPipeline::ReleaseRunningReads() {
+    std::lock_guard lock(mutex);
+    if (!items.empty()) items.front().reads.clear();
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

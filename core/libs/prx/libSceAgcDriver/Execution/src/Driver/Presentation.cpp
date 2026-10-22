@@ -148,7 +148,6 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);
-        else reportPresentRate();
         CheckFailure();
     } catch (const ProcessShutdown&) {
         throw;
@@ -156,20 +155,6 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         ReportFailure(std::current_exception());
         throw;
     }
-}
-
-void Driver::reportPresentRate() {
-    static const bool enabled = std::getenv("APS5_PRESENT_RATE") != nullptr;
-    if (!enabled) return;
-    static std::uint64_t presents = 0;
-    static auto windowStart = std::chrono::steady_clock::now();
-    ++presents;
-    const auto now = std::chrono::steady_clock::now();
-    const auto elapsed = std::chrono::duration<double, std::milli>(now - windowStart).count();
-    if (elapsed < 10000.0) return;
-    std::fprintf(stderr, "[present-rate] %llu presents over %.0f ms, %.1f ms per frame\n", static_cast<unsigned long long>(presents), elapsed, elapsed / static_cast<double>(presents));
-    presents = 0;
-    windowStart = now;
 }
 
 void Driver::reportPresents(double waitedMs, std::size_t inFlight) {

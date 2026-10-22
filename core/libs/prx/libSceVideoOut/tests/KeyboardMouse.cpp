@@ -438,6 +438,21 @@ void testFocusLossReleasesMouse() {
     check(!keyboardMouse.HandleEvent(PadSimulation::FocusLostEvent(), Pad::KeyboardMouse::Clock::now()).releaseMouse, "nothing to release without capture");
 }
 
+void testShake() {
+    const auto samples = Simulate(defaults(), {At(0.0, KeyEvent(SDL_SCANCODE_X, true)), At(200.0, KeyEvent(SDL_SCANCODE_X, false))}, 10.0, 300.0);
+    const auto& first = samples[1].state;
+    const auto& second = samples[6].state;
+    check(first.hasMotion && second.hasMotion, "a held shake key reports motion");
+    check(std::fabs(first.accel[0]) == Pad::ShakeAcceleration && second.accel[0] == -first.accel[0], "the shake acceleration flips every half period");
+    check(second.gyro[2] == -first.gyro[2] && std::fabs(first.gyro[2]) == Pad::ShakeAngularVelocity, "the shake angular velocity flips with it");
+    check(!samples[25].state.hasMotion && samples[25].state.accel == PadInputState{}.accel, "releasing the shake key stops the motion");
+    Pad::KeyboardMouse keyboardMouse(defaults());
+    const auto now = Pad::KeyboardMouse::Clock::now();
+    keyboardMouse.Advance(now);
+    keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_X, true), now);
+    check(keyboardMouse.Advance(now + Pad::ShakeHalfPeriod), "a held shake key keeps the state changing");
+}
+
 void testToggleRequests() {
     Pad::KeyboardMouse keyboardMouse(defaults());
     const auto now = Pad::KeyboardMouse::Clock::now();
@@ -449,6 +464,12 @@ void testToggleRequests() {
     const auto overlay = keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F10, true), now);
     check(overlay.togglePerformanceOverlay && !overlay.toggleFullscreen, "F10 asks to toggle the performance overlay");
     check(!keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F10, false), now).togglePerformanceOverlay, "releasing F10 asks for nothing");
+    const auto screenshot = keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, true), now);
+    check(screenshot.screenshot && !screenshot.toggleFullscreen && !screenshot.togglePerformanceOverlay, "F12 asks for a screenshot");
+    auto repeated = KeyEvent(SDL_SCANCODE_F12, true);
+    repeated.key.repeat = 1;
+    check(!keyboardMouse.HandleEvent(repeated, now).screenshot, "a repeated F12 asks for nothing");
+    check(!keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F12, false), now).screenshot, "releasing F12 asks for nothing");
 }
 
 void testDefaultL2() {
@@ -536,6 +557,7 @@ int main() {
             {"wheel press", testWheelPress},
             {"wheel and keys on focus loss", testWheelFocusLoss},
             {"focus loss releases the mouse", testFocusLossReleasesMouse},
+            {"shake", testShake},
             {"toggle requests", testToggleRequests},
             {"default L2", testDefaultL2},
             {"title reads the mouse", testTitleReadsMouse},

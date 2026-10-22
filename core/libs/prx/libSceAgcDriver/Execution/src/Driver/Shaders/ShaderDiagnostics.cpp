@@ -1,5 +1,4 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include <cstdlib>
 #include <functional>
@@ -8,7 +7,7 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::reportSkip(const char* kind, const std::string& what) {
-    static AgcDriver::Mutex reportedMutex;
+    static std::mutex reportedMutex;
     static std::set<std::size_t> reported;
     static std::map<std::string, int> requestDumps;
 
@@ -51,7 +50,7 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
 }
 
 std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix) {
-    static AgcDriver::Mutex dumpMutex;
+    static std::mutex dumpMutex;
     static std::set<std::string> dumped;
     char hex[32];
     std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(address));

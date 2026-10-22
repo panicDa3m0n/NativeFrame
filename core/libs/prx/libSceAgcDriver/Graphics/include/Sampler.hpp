@@ -3,7 +3,6 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <cstdint>
 #include <map>
@@ -60,7 +59,7 @@ private:
         std::shared_ptr<Sampler> sampler;
         std::uint64_t lastUse;
     };
-    AgcDriver::Mutex mutex;
+    std::mutex mutex;
     std::map<std::array<std::uint32_t, 5>, Entry> entries;
     std::uint64_t clock = 0;
     std::size_t capacity;

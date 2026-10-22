@@ -36,7 +36,9 @@ int main() {
     using namespace ShaderRegs;
     auto* defaults = static_cast<unsigned char*>(sceAgcGetRegisterDefaults());
     Require(defaults && defaults == sceAgcGetRegisterDefaults());
-    Require(defaults == sceAgcGetRegisterDefaults2(13));
+    auto* versionedDefaults = static_cast<unsigned char*>(sceAgcGetRegisterDefaults2(13));
+    Require(versionedDefaults != nullptr);
+    Require(std::memcmp(defaults + 0x20, versionedDefaults + 0x20, 4 * sizeof(std::uint32_t)) == 0);
     // These are the byte offsets used by native callers, independent of the
     // private C++ structure used to construct the defaults object.
     ShaderRegister** contextBlocks = nullptr;

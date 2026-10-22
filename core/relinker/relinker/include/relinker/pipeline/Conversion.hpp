@@ -23,6 +23,7 @@ struct ConversionOptions {
     std::optional<std::uint64_t> WindowsFixedBase;
     bool WindowsDiagnostics = false;
     std::optional<std::uint64_t> LinuxFixedBase;
+    std::optional<std::uint64_t> MacosFixedBase;
     std::string RunPath = "$ORIGIN/libs";
     std::set<std::string> ExcludedModules;
     std::vector<GamePatch::PatchEntry> Patches;
@@ -45,6 +46,7 @@ struct ConversionOutput {
     RelinkResult Analysis;
     std::string WindowsDiagnostics;
     std::vector<GamePatch::AppliedPatch> AppliedPatches;
+    std::optional<std::uint64_t> LinuxBase;
 };
 
 class Conversion {

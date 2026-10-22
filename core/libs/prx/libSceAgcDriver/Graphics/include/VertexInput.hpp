@@ -161,27 +161,6 @@ public:
         return entries.size();
     }
 
-    std::shared_ptr<const VertexInputLayout> TryGetByShape(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
-        if (attributes.empty()) return nullptr;
-        const auto key = shapeHash(attributes);
-        std::lock_guard lock(mutex);
-        const auto range = shapes.equal_range(key);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (!sameShape(attributes, it->second.shape)) continue;
-            ValidateVertexAddresses(attributes);
-            return it->second.layout;
-        }
-        if (shapes.size() >= capacity) return nullptr;
-        auto layout = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
-        shapes.emplace(key, ShapeEntry{layout, std::vector<ShaderRecompiler::VertexAttribute>(attributes.begin(), attributes.end())});
-        return layout;
-    }
-
-    std::size_t ShapeCount() const {
-        std::lock_guard lock(mutex);
-        return shapes.size();
-    }
-
 private:
     std::shared_ptr<const VertexInputLayout> get(std::uint64_t variant, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
         std::lock_guard lock(mutex);
@@ -221,24 +200,6 @@ private:
                 (x.resource.fields[1] & 0xffff0000u) == (y.resource.fields[1] & 0xffff0000u) && x.resource.fields[3] == y.resource.fields[3] && NullVertexDescriptor(x) == NullVertexDescriptor(y);
         });
     }
-    static std::uint64_t shapeHash(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
-        std::uint64_t hash = 0xcbf29ce484222325ull;
-        const auto mix = [&hash](std::uint64_t value) {
-            hash ^= value;
-            hash *= 0x100000001b3ull;
-        };
-        for (const auto& attribute : attributes) {
-            mix(attribute.location);
-            mix(attribute.components);
-            mix(attribute.formatComponents);
-            mix(attribute.fetchIndex);
-            mix(attribute.resource.fields[1] & 0xffff0000u);
-            mix(attribute.resource.fields[3]);
-            mix(NullVertexDescriptor(attribute) ? 1u : 0u);
-        }
-        mix(attributes.size());
-        return hash;
-    }
     static std::size_t bypassIndex(std::uint64_t variant) {
         return static_cast<std::size_t>((variant ^ (variant >> 32u)) & 65535u);
     }
@@ -261,11 +222,6 @@ private:
     mutable std::mutex mutex;
     std::list<std::uint64_t> order;
     std::unordered_map<std::uint64_t, Entry> entries;
-    struct ShapeEntry {
-        std::shared_ptr<const VertexInputLayout> layout;
-        std::vector<ShaderRecompiler::VertexAttribute> shape;
-    };
-    std::unordered_multimap<std::uint64_t, ShapeEntry> shapes;
 };
 
 inline std::uint32_t VertexBufferOutOfBoundsSelect(const ShaderRecompiler::VertexAttribute& attribute) {
@@ -274,14 +230,16 @@ inline std::uint32_t VertexBufferOutOfBoundsSelect(const ShaderRecompiler::Verte
 
 inline bool VertexFetchOutOfRange(const ShaderRecompiler::VertexAttribute& attribute) {
     const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
+    if (stride != 0 || NullVertexDescriptor(attribute)) return false;
     const auto select = VertexBufferOutOfBoundsSelect(attribute);
-    return stride == 0 && (select == 2u || select == 3u) && attribute.resource.fields[2] == 0;
+    const auto records = attribute.resource.fields[2];
+    if (select == 0u) return true;
+    if (select == 3u) return records < DecodeVertexFormat(attribute).bytes;
+    return records == 0;
 }
 
 inline std::uint64_t ZeroStrideAvailableBytes(const ShaderRecompiler::VertexAttribute& attribute) {
-    const auto records = attribute.resource.fields[2];
-    if (VertexBufferOutOfBoundsSelect(attribute) == 2u && records != 0) return std::max<std::uint64_t>(records, DecodeVertexFormat(attribute).bytes);
-    return records;
+    return VertexFetchOutOfRange(attribute) ? 0u : DecodeVertexFormat(attribute).bytes;
 }
 
 inline std::size_t VertexBufferExtent(const ShaderRecompiler::VertexAttribute& attribute) {
@@ -305,7 +263,9 @@ inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute&
     Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
     const auto index = attribute.fetchIndex == 0 ? maxIndex : firstInstance + instances - 1u;
     const auto bytes = DecodeVertexFormat(attribute).bytes;
-    Require(stride == 0 || VertexBufferOutOfBoundsSelect(attribute) <= 1u || index < records, "vertex fetch exceeds descriptor record count");
+    const auto select = VertexBufferOutOfBoundsSelect(attribute);
+    const auto recordsUnchecked = stride == 0 ? select != 1u : select <= 1u;
+    Require(recordsUnchecked || index < records, "vertex fetch exceeds descriptor record count");
     const auto required = static_cast<std::uint64_t>(stride) * index + bytes;
     Require(stride != 0 || required <= ZeroStrideAvailableBytes(attribute), "vertex fetch exceeds descriptor byte range");
     Require(required <= std::numeric_limits<std::size_t>::max(), "vertex fetch exceeds addressable byte range");
@@ -338,16 +298,6 @@ struct VertexCopyPlan {
 
 inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     VertexCopyPlan plan;
-    if (fetches.empty()) return plan;
-    if (fetches.size() == 1) {
-        const auto& fetch = fetches[0];
-        Require(fetch.begin < fetch.end && fetch.alignment != 0, "empty vertex fetch range");
-        plan.copyOf = {0};
-        plan.offsets = {0};
-        plan.copies.emplace_back(fetch.begin, fetch.end);
-        plan.alignments.push_back(fetch.alignment);
-        return plan;
-    }
     plan.copyOf.assign(fetches.size(), 0);
     plan.offsets.assign(fetches.size(), 0);
     std::vector<std::size_t> order(fetches.size());
@@ -417,23 +367,36 @@ inline std::optional<std::uint32_t> ClampDrawIndices(std::span<std::byte> indice
     return highest;
 }
 
+template <typename TIndex>
+std::optional<std::uint32_t> HighestDrawIndexOf(std::span<const std::byte> indices, bool skipRestart) {
+    constexpr auto restartIndex = std::numeric_limits<TIndex>::max();
+    const auto count = indices.size() / sizeof(TIndex);
+    const auto* data = indices.data();
+    TIndex highest = 0;
+    if (!skipRestart) {
+        for (std::size_t i = 0; i < count; ++i) {
+            TIndex index;
+            std::memcpy(&index, data + i * sizeof(TIndex), sizeof(TIndex));
+            highest = std::max(highest, index);
+        }
+        if (count == 0) return std::nullopt;
+        return highest;
+    }
+    TIndex kept = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        TIndex index;
+        std::memcpy(&index, data + i * sizeof(TIndex), sizeof(TIndex));
+        const TIndex valid = index == restartIndex ? TIndex{0} : TIndex(~TIndex{0});
+        highest = std::max(highest, static_cast<TIndex>(index & valid));
+        kept |= valid;
+    }
+    if (kept == 0) return std::nullopt;
+    return highest;
+}
+
 inline std::optional<std::uint32_t> HighestDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
     Require(indexSize == 2 || indexSize == 4, "unsupported index size");
-    const auto restartIndex = indexSize == 2 ? 0xffffu : 0xffffffffu;
-    std::optional<std::uint32_t> highest;
-    for (std::size_t offset = 0; offset + indexSize <= indices.size(); offset += indexSize) {
-        std::uint32_t index = 0;
-        if (indexSize == 2) {
-            std::uint16_t value = 0;
-            std::memcpy(&value, indices.data() + offset, sizeof(value));
-            index = value;
-        } else {
-            std::memcpy(&index, indices.data() + offset, sizeof(index));
-        }
-        if (skipRestart && index == restartIndex) continue;
-        highest = std::max(highest.value_or(0u), index);
-    }
-    return highest;
+    return indexSize == 2 ? HighestDrawIndexOf<std::uint16_t>(indices, skipRestart) : HighestDrawIndexOf<std::uint32_t>(indices, skipRestart);
 }
 
 inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> indices, std::uint32_t indexSize) {

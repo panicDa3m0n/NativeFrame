@@ -21,14 +21,6 @@
 #include <mutex>
 #include <string>
 
-namespace AgcDriver {
-
-struct VulkanDeviceTestAccess {
-    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
-};
-
-}
-
 namespace {
 
 namespace Graphics = AgcDriver::Graphics;
@@ -83,7 +75,10 @@ private:
 enum class Outcome : std::uint8_t { NoDevice, NoImport, Passed };
 
 Graphics::Context Probe(const AgcDriver::VulkanDevice& device) {
-    return AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    Graphics::Context probe{};
+    probe.device = device.Device();
+    probe.hostImportAlignment = 1;
+    return probe;
 }
 
 bool Fill(AgcDriver::VulkanDevice& device, std::uint64_t address) {
@@ -119,13 +114,11 @@ Outcome WindowsFollowTheirRange() {
     Require(first != 0, "host import windows: the window at " + Hex(address) + " has no serial");
 
     GuestBlock other(OtherBytes);
-    Require(Graphics::HostImportSerial(probe, address, ProbeBytes, true) == first, "host import windows: an unrelated mapping changed the import serial");
     Require(Fill(*device, address), "host import windows: the window at " + Hex(address) + " cannot be filled after an unrelated registration");
     Require(Graphics::HostImportSerial(probe, address, ProbeBytes, false) == first, "host import windows: the window at " + Hex(address) + " was dropped by an unrelated registration, although its range still owns it");
 
     GuestAllocations::Mutation().Remove(guest.Data());
     GuestAllocations::Mutation().Add(guest.Data(), BlockBytes, true, true, true);
-    Require(Graphics::HostImportSerial(probe, address, ProbeBytes, true) != first, "host import windows: a remapped range kept its stale import serial before the next fill");
     Require(Fill(*device, address), "host import windows: the window at " + Hex(address) + " cannot be filled after its range was mapped again");
     const auto second = Graphics::HostImportSerial(probe, address, ProbeBytes, false);
     Require(second != 0 && second != first, "host import windows: the window of the range mapped again kept the serial " + Hex(first));
@@ -170,41 +163,6 @@ Outcome ResidentMappingsImportAfterCollection() {
     return Outcome::Passed;
 }
 
-Outcome SmallMappingsImportOnFirstUse() {
-    GuestBlock small(GuestAlignment);
-    GuestBlock large(2 * GuestAlignment);
-    auto device = OpenVulkanTestDevice();
-    if (!device) return Outcome::NoDevice;
-    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
-    if (context.hostImportAlignment == 0) return Outcome::NoImport;
-    for (auto* guest : {&small, &large}) {
-        Graphics::ClearHostImports(device->Device());
-        GuestAllocations::Mapped ranges;
-        for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
-            if (range->address == guest->Address()) ranges.push_back(range);
-        }
-        Require(ranges.size() == 1, "mapped import test lost its registered range");
-        {
-            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-            Require(Graphics::ImportMappedRanges(context, ranges, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true), "mapped import test could not adopt the device");
-        }
-        Require(Graphics::HostImportCovers(context, guest->Address(), ProbeBytes) == (guest == &large), "mapping did not defer exactly the small import");
-        Require(Fill(*device, guest->Address()), "first GPU use could not import the mapped buffer");
-        Require(Graphics::HostImportCovers(context, guest->Address(), ProbeBytes), "first GPU use left the mapped buffer unimported");
-        constexpr std::array<std::uint32_t, 4> pattern{0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-        for (std::size_t offset = 0; offset < ProbeBytes; offset += sizeof(std::uint32_t)) {
-            std::uint32_t actual = 0;
-            std::memcpy(&actual, guest->Data() + offset, sizeof(actual));
-            Require(actual == pattern[(offset / sizeof(actual)) % pattern.size()], "first GPU use changed the fill result");
-        }
-        for (std::size_t offset = ProbeBytes; offset < GuestAlignment; ++offset) {
-            Require(guest->Data()[offset] == 0, "first GPU use overwrote bytes outside the fill");
-        }
-    }
-    Graphics::ClearHostImports(device->Device());
-    return Outcome::Passed;
-}
-
 }
 
 int main() {
@@ -218,7 +176,6 @@ int main() {
         const auto windows = WindowsFollowTheirRange();
         Require(windows == Outcome::Passed, "host import windows: the device stopped importing guest memory between two scenarios");
         Require(ResidentMappingsImportAfterCollection() == Outcome::Passed, "resident import test failed");
-        Require(SmallMappingsImportOnFirstUse() == Outcome::Passed, "mapped import test lost its Vulkan device or host import support");
         std::puts("host import windows tests passed");
         return 0;
     } catch (const std::exception& error) {

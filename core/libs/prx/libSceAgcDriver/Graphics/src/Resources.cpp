@@ -4,7 +4,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
-#include <cstdlib>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -217,28 +216,6 @@ void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer sourc
     context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, source, destination, 1, &region);
 }
 
-VkDeviceSize HostCopyPieceBytes() {
-    static const VkDeviceSize bytes = [] {
-        const char* text = std::getenv("APS5_HOST_COPY_PIECE_KIB");
-        if (text == nullptr) return VkDeviceSize{64} << 10u;
-        return static_cast<VkDeviceSize>(std::strtoull(text, nullptr, 10)) << 10u;
-    }();
-    return bytes;
-}
-
-void CopyHostBuffer(const Context& context, VkCommandBuffer commands, VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes) {
-    const auto piece = HostCopyPieceBytes();
-    if (piece == 0 || bytes <= piece) {
-        CopyBuffer(context, commands, source, sourceOffset, destination, destinationOffset, bytes);
-        return;
-    }
-    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
-    for (VkDeviceSize done = 0; done < bytes; done += piece) {
-        const VkBufferCopy region{sourceOffset + done, destinationOffset + done, std::min(piece, bytes - done)};
-        copy(commands, source, destination, 1, &region);
-    }
-}
-
 void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
     const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, sourceAccess, destinationAccess};
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
@@ -359,7 +336,9 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         allocation.commandBufferCount = 1;
         Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &commands), "vkAllocateCommandBuffers");
         VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &fence), "vkCreateFence");
+        VkFence created = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &created), "vkCreateFence");
+        fence = created;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");

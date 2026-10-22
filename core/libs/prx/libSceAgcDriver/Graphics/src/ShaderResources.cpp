@@ -5242,16 +5242,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const bool profiled = BuildProfiled();
     if (profiled) preparedSnapshotBytes = 0;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    struct DrawReadsTag {};
+    auto& reads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, DrawReadsTag>();
     guestMemory.InPlaceReads(reads);
     if (SpecBindingsOn()) publishInPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct DrawSelectedTag {};
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, DrawSelectedTag>();
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
@@ -5382,8 +5382,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 void ShaderResources::writeDrawDescriptors(DrawBindings& result, std::span<const std::size_t> selected) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    struct DrawCountsTag {};
+    auto& counts = HostThreadLocal<std::array<std::vector<VkDescriptorPoolSize>, 2>, DrawCountsTag>();
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);
@@ -5409,14 +5409,14 @@ void ShaderResources::writeDrawDescriptors(DrawBindings& result, std::span<const
         result.fragmentLayout = fragment.layout;
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
-    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
+    struct DrawBuffersTag {};
+    auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, DrawBuffersTag>();
     buffers = descriptorBuffers;
-    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
-    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    struct DrawWritesTag {};
+    auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, DrawWritesTag>();
     writes = descriptorWrites;
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct DrawIndicesTag {};
+    auto& snapshotIndices = HostThreadLocal<std::vector<std::size_t>, DrawIndicesTag>();
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     auto nextWrite = writes.begin();
@@ -5453,8 +5453,8 @@ ShaderResources::SpeculativeBindings ShaderResources::SpeculateDrawBindings(std:
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct SpeculatedSelectedTag {};
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, SpeculatedSelectedTag>();
     selected.clear();
     // The same choices as PrepareDrawBindings, with the published reads and pending writes.
     for (std::size_t index = 0; index < allocations.size(); ++index) {

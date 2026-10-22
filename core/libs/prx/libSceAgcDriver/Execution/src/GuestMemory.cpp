@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -666,6 +667,14 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
 }
 
 bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    // The thread's stack bounds from its TEB: no thread-local (MinGW emulates those with a lock).
+    const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const auto low = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
+    const auto high = reinterpret_cast<std::uintptr_t>(tib->StackBase);
+    const auto here = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+    return high != 0 && here >= low && here < high && address >= here && address < high && bytes <= high - address;
+#else
     struct Bounds {
         std::uintptr_t low = 0;
         std::uintptr_t high = 0;
@@ -692,6 +701,7 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
     thread_local const Bounds bounds;
     const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
+#endif
 }
 
 #ifdef __linux__
@@ -1256,8 +1266,9 @@ struct EpochCollectMap {
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
-    thread_local EpochCollectMap* slot = nullptr;
-    auto& map = ShaderRecompiler::ThreadOwned(slot);
+    // A host thread-local: every collect asks it, and MinGW's thread_local costs a lock per access.
+    struct EpochCollectMapTag {};
+    auto& map = HostThreadLocal<EpochCollectMap, EpochCollectMapTag>();
     if (map.epoch != epoch) {
         map.ranges.clear();
         map.epoch = epoch;

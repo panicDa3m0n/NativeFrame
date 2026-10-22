@@ -2210,10 +2210,12 @@ void ShaderResources::buildComplete() {
             else PublishRangeSlabsForAddressWriter(context);
             NoteAddressPublish();
         } else if (mapsLiveSlabs) {
-            // The units its table cannot map whole (LiveRangeSlabSpans) reach the import first.
+            // The units its table cannot map whole (LiveRangeSlabSpans) reach the import first, and
+            // so do those its descriptors read in place.
             std::vector<std::pair<std::uint64_t, std::uint64_t>> partial;
             static_cast<void>(LiveRangeSlabSpans(context, &partial));
             for (const auto& [begin, end] : partial) PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, PublishReason::Address);
+            static_cast<void>(guestMemory.PublishLiveUnderOwnRanges());
         }
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, mapsLiveSlabs);

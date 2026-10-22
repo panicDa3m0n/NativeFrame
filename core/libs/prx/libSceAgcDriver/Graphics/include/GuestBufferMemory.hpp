@@ -347,6 +347,11 @@ public:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
     };
     std::optional<SplitReads> SplitInPlaceReads() const;
+    // An address-based build whose BDA table maps live range slab bytes publishes nothing else, and
+    // its descriptors' ranges are served by the registered heaps it maps (inside its address
+    // space's base, or merged into them), which UploadFinish leaves unflushed: the live units under
+    // those ranges reach the import here, before the descriptors read it. The units published.
+    std::size_t PublishLiveUnderOwnRanges() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
@@ -507,6 +512,8 @@ private:
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
+    // The descriptors' ranges as added, before the registered heaps serve or absorb them.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ownRanges;
     bool committed = false;
 };
 

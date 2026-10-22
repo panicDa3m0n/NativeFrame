@@ -59,6 +59,8 @@
 //   LettoreRiusatoPubblica: a reused build reading the range in place publishes it in its proof;
 //   SpeculazioneRifiutata: neither a draw's bindings nor a speculation copy a range with live bytes
 //     (the bindings publish it and read it in place);
+//   DescrittoreSulPosto: an address-based build's own region bound in place gets the live bytes
+//     under it into the import before its descriptors read it; the rest stays live for its table;
 //   ScrittoreAssorbito: a writer whose slab a later upload grows over before the writer's work is
 //     marked keeps its bytes (they reach the slab that holds the units now);
 //   RitiroPubblica: an import retired while its range stays registered publishes the live bytes;
@@ -495,6 +497,23 @@ int RunLazy(const Context& context, Recorder& recorder, WatchedBlock& watched, c
         const auto tail = a + RegionBytes;
         Require(std::find(partial.begin(), partial.end(), std::pair<std::uint64_t, std::uint64_t>{tail, tail + Unit}) != partial.end(), "the unit a region ends inside is not reported live in part");
         Require(!units.empty() && std::all_of(units.begin(), units.end(), [&](const LiveSlabSpan& span) { return span.begin % Unit == 0 && span.end % Unit == 0 && (span.end <= tail || span.begin >= tail + Unit); }), "a mapped span splits a unit or covers one the slab holds in part");
+        PublishRangeSlabs(context, PublishReason::Address);
+        uses.Settle();
+        // DescrittoreSulPosto (O20.T1): an address-based upload maps the registered heaps and reads one
+        // page of A through a descriptor, as a build whose table maps A's live bytes does; the page's
+        // range merges into the heap, which the upload leaves unflushed.
+        write(a, 0x7d);
+        {
+            GuestBufferMemory memory(context);
+            memory.AcquireRegistered();
+            memory.AddReadable(a + 4 * Page, Page);
+            memory.Upload(true);
+            Require(AnyShadowedOverlaps(a + 4 * Page, Page), "the address-based upload published the page itself: the merged range is not reproduced");
+            static_cast<void>(memory.PublishLiveUnderOwnRanges());
+            uses.Settle();
+            Require(Holds(bytes + Unit + 4 * Page, Page, 0x7d), "the live bytes under an address-based build's own range did not reach the import");
+            Require(AnyShadowedOverlaps(a + 2 * Unit, Unit), "the publish under the build's own range took the rest of A's live units with it");
+        }
         PublishRangeSlabs(context, PublishReason::Address);
         uses.Settle();
     } else {

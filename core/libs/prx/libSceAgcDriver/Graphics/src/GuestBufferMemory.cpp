@@ -3573,6 +3573,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     validate(address, bytes);
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
+    ownRanges.emplace_back(begin, end);
     const Region* inside = nullptr;
     switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
@@ -5968,6 +5969,16 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     InPlaceReads(result);
     return result;
+}
+
+std::size_t GuestBufferMemory::PublishLiveUnderOwnRanges() const {
+    if (!uploaded || committed) return 0;
+    std::size_t units = 0;
+    for (const auto& [begin, end] : ownRanges) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (bytes != 0 && AnyShadowedOverlaps(begin, bytes)) units += PublishShadow(begin, bytes, PublishScope::Whole, PublishReason::Address);
+    }
+    return units;
 }
 
 std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceReads() const {

@@ -842,6 +842,10 @@ struct WriteTracker {
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
+    // The generation as of the mutex's last release (TrackerLock), read without the mutex by
+    // TrackerGeneration: a reader then sees the state before a holder still walking, as if it had
+    // asked first, never a bump whose stamps are not all made.
+    std::atomic<std::uint32_t> published{1};
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1131,16 +1135,34 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
-std::unique_lock<AgcDriver::Mutex> lockTracker(WriteTracker& tracker) {
+// The tracker's mutex held; its release publishes the generation (WriteTracker::published).
+class TrackerLock {
+public:
+    TrackerLock(WriteTracker& tracker, std::unique_lock<AgcDriver::Mutex> lock) : tracker(&tracker), lock(std::move(lock)) {}
+    TrackerLock(TrackerLock&&) = default;
+    TrackerLock& operator=(TrackerLock&&) = delete;
+    ~TrackerLock() { unlock(); }
+    void unlock() {
+        if (!lock.owns_lock()) return;
+        tracker->published.store(tracker->generation.load(std::memory_order_relaxed), std::memory_order_release);
+        lock.unlock();
+    }
+
+private:
+    WriteTracker* tracker;
+    std::unique_lock<AgcDriver::Mutex> lock;
+};
+
+TrackerLock lockTracker(WriteTracker& tracker) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return std::unique_lock(tracker.mutex);
+    if (!profile) return TrackerLock(tracker, std::unique_lock(tracker.mutex));
     std::unique_lock lock(tracker.mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         trackerWaits.fetch_add(1, std::memory_order_relaxed);
         lock.lock();
     }
     trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
-    return lock;
+    return TrackerLock(tracker, std::move(lock));
 }
 
 #ifdef _WIN32
@@ -1870,8 +1892,11 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
-    // Under the mutex: a collect bumps the generation before its walk, and a walk still running
-    // when the value is read absorbs stores made after it with a stamp not newer than the value.
+    // A collect bumps the generation before its walk, and a walk still running when the value is
+    // read absorbs stores made after it with a stamp not newer than the value: the value is the
+    // one published at the mutex's last release (APS5_LOCKED_TRACKER_GENERATION waits for it).
+    static const bool locked = std::getenv("APS5_LOCKED_TRACKER_GENERATION") != nullptr;
+    if (!locked) return tracker.published.load(std::memory_order_acquire);
     const auto lock = lockTracker(tracker);
     return tracker.generation;
 }

@@ -103,6 +103,24 @@ void CheckSharedBlock() {
     if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
 }
 
+// TrackerGeneration reads the generation published when the tracker's mutex is released: a driver
+// store and a collect that finds a CPU store each move it past what it was before them.
+void CheckPublishedGeneration() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x22, 2 * Block);
+    const auto collected = CollectWritesUncached(base, 2 * Block);
+    Require(collected != 0, "the published-generation block is not collected");
+    Require(TrackerGeneration() >= collected, "the generation read after a finished collect is older than the collect's");
+    const auto before = TrackerGeneration();
+    Require(MarkWritten(base, Block) != 0, "a driver store into the published-generation block is not stamped");
+    const auto stored = TrackerGeneration();
+    Require(stored > before, "a driver store did not move the generation TrackerGeneration reads");
+    static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x33;
+    const auto seen = CollectWritesUncached(base + Block, Block);
+    Require(seen > stored && TrackerGeneration() >= seen, "a collect that found a CPU store did not move the generation TrackerGeneration reads");
+}
+
 void CheckStoredAllSince() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -1197,6 +1215,7 @@ int main() {
         }
 #endif
         CheckSharedBlock();
+        CheckPublishedGeneration();
         CheckStoredAllSince();
         CheckOwnStore();
         CheckUnwatch();

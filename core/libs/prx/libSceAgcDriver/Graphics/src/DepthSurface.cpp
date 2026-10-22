@@ -914,6 +914,7 @@ public:
     DepthSamplingState sampling;
     bool clearPending = false;
     std::uint64_t clearGeneration = 0u;
+    bool clearCompletionQueued = false;
     std::shared_ptr<OwnedImage> owned;
     std::shared_ptr<OwnedImage> sampleShadow;
     bool useSampleShadow = false;
@@ -1530,6 +1531,21 @@ DepthSurface* planeSurface(VkDevice device, std::uint64_t address) {
     return found == list.rend() ? nullptr : found->get();
 }
 
+void settlePendingHtileClear(const Context& context, std::uint64_t address) {
+    if (Recorder::InCompletion()) return;
+    auto* recorder = RecorderFor(context);
+    if (recorder == nullptr) return;
+    std::pair<std::uint64_t, std::size_t> metadata;
+    {
+        std::lock_guard lock(surfacesMutex());
+        const auto* surface = planeSurface(context.device, address);
+        if (surface == nullptr || !surface->samplingActive || surface->clearGeneration == 0u || !surface->clearCompletionQueued || !surface->sampling.refusal.empty()) return;
+        const auto& range = surface->sampling.initial[1];
+        metadata = {range.address, range.bytes};
+    }
+    if (recorder->PendingWriteOverlaps(metadata.first, metadata.second)) recorder->SyncThrough(metadata.first, metadata.second);
+}
+
 std::map<std::uint64_t, std::size_t>& clearedHtiles() {
     static auto* cleared = new std::map<std::uint64_t, std::size_t>();
     return *cleared;
@@ -1903,6 +1919,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    settlePendingHtileClear(context, target.address);
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
@@ -2200,6 +2217,7 @@ bool NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::siz
             else if (surface->clearPending || surface->clearGeneration != 0u) surface->sampling.Refuse("overlapping native multisample depth clear transitions are not implemented");
             else {
                 surface->clearPending = true;
+                surface->clearCompletionQueued = false;
                 completionCandidate = true;
             }
             existing = true;
@@ -2226,6 +2244,14 @@ void ArmHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes) {
     }
 }
 
+void QueueHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || !surface->samplingActive || surface->target.htileAddress != htileAddress || surface->clearGeneration == 0u || !surface->sampling.refusal.empty()) continue;
+        if (bytes >= surface->sampling.initial[1].bytes) surface->clearCompletionQueued = true;
+    }
+}
+
 void CompleteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
@@ -2234,6 +2260,7 @@ void CompleteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes) {
         if (bytes < metadata.bytes) continue;
         Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, surface->clearGeneration), "CPU writes raced native multisample depth clear");
         GuestMemory::MarkWritten(metadata.address, metadata.bytes);
+        surface->clearCompletionQueued = false;
     }
 }
 
@@ -2262,6 +2289,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         if (std::none_of(surfaces().begin(), surfaces().end(), held)) return nullptr;
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    settlePendingHtileClear(context, resource.baseAddress);
     std::lock_guard lock(surfacesMutex());
     auto* found = planeSurface(context.device, resource.baseAddress);
     if (found == nullptr) return nullptr;
@@ -2324,6 +2352,7 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
     if ((resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DMsaa) || resource.baseArray != 0) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto address = resource.baseAddress;
+    settlePendingHtileClear(context, address);
     std::lock_guard lock(surfacesMutex());
     auto* found = planeSurface(context.device, address);
     if (found == nullptr || !found->Holds(texture)) return false;

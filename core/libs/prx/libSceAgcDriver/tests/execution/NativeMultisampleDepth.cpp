@@ -872,7 +872,15 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                     });
                     if (fault == ClearFault::CpuWrite) metadata.Data()[metadataBytes - 1u] ^= std::byte{0x01};
                     if (fault == ClearFault::DepthWrite) memory.Data()[bytes - 1u] ^= std::byte{0x01};
-                    if (fault == ClearFault::PendingWrite) QueueTargetByteWrite(context, recorder, target.htileAddress, std::byte{0});
+                    if (fault == ClearFault::PendingWrite) {
+                        QueueTargetByteWrite(context, recorder, target.htileAddress, std::byte{0});
+                        std::string pendingRefusal;
+                        try { CachedSampledTexture(context, words); }
+                        catch (const std::exception& error) { pendingRefusal = error.what(); }
+                        const bool refused = pendingRefusal.find("external GPU writes") != std::string::npos;
+                        if (!refused) std::fprintf(stderr, "Pending HTILE texture refusal: %s\n", pendingRefusal.c_str());
+                        Require(refused, "an unrecognized pending HTILE write was accepted or refused for another reason");
+                    }
                 }
                 Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "completed native depth clear lost its sampled view");
                 recorder.Sync();

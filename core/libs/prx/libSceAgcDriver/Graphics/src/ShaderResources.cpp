@@ -2721,6 +2721,15 @@ bool ProofRefusesReleased() {
     return !keeps;
 }
 
+// A sampled view of a storage image over memory a depth surface now covers: the lookup no longer
+// views that image (cachedStorageTexture serves the depth surface), so the view may read texels
+// the depth surface has replaced; the proof refuses it, as it does the storage image itself
+// (APS5_PROOF_IGNORES_DEPTH_VIEWS keeps the view as before).
+bool ProofGuardsDepthViews() {
+    static const bool ignores = std::getenv("APS5_PROOF_IGNORES_DEPTH_VIEWS") != nullptr;
+    return !ignores;
+}
+
 bool OwnImageRefreshEnabled() {
     static const bool disabled = std::getenv("APS5_NO_OWN_IMAGE_REFRESH") != nullptr;
     return !disabled;
@@ -2859,6 +2868,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
+        if (source != nullptr && ProofGuardsDepthViews() && DepthSurfaceOverlaps(context.device, address, bytes)) {
+            depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
+            return fail(FastFail::Depth);
+        }
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -2995,6 +3008,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (surface.collected == 0) return false;
         if (PendingStorageOverlaps(address, bytes, surface.source)) return false;
         if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return false;
+        if (surface.source != nullptr && ProofGuardsDepthViews() && DepthSurfaceOverlaps(context.device, address, bytes)) return false;
         if (surface.source != nullptr) {
             // The view follows the image: it needs the image current with guest memory, as the
             // lookup's Refresh would make it.

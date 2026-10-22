@@ -168,7 +168,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         reportedEvents[i] = total;
     }
     const auto busy = static_cast<double>(commitNs) * 100.0 / windowNs;
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; indirect commits %llu, indirect drains (args overlap) %llu; submits after commits: %llu for an end-of-pipe interrupt over open work, %llu by label deadline, %llu by size cap; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), static_cast<unsigned long long>(counted[2]), static_cast<unsigned long long>(counted[3]), static_cast<unsigned long long>(counted[4]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};

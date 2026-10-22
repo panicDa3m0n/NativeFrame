@@ -126,7 +126,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         first = false;
         countLabelOutcome(reason);
         if (reason != 0 && reason != 5) {
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (reason != 1 && reason != 7 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(label.address, bytes, 4);
             KernelWakeSleepers_nid_no_patch();
         }

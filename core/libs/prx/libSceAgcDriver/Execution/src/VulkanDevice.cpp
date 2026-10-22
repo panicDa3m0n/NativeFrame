@@ -2312,13 +2312,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
+    const bool syncUnimported = queue == 0 && !recorder.SubmitHeld();
     const auto unimported = [&] {
         recorder.Sync();
-        return 1;
+        return 7;
     };
-    if (!Graphics::HostImportCovers(context, address, bytes.size())) return unimported();
+    if (syncUnimported && !Graphics::HostImportCovers(context, address, bytes.size())) return unimported();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
-    if (import == nullptr) return unimported();
+    if (import == nullptr) return syncUnimported ? unimported() : 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.

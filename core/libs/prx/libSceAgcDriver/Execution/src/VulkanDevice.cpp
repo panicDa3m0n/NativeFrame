@@ -3699,6 +3699,10 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
     return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
 }
 
+std::shared_ptr<const Graphics::DrawInputSpeculation> VulkanDevice::SpeculateDrawInputs(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    return Graphics::SpeculateDrawInputs(graphicsContext(), graphics, shaders);
+}
+
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }

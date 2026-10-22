@@ -1004,6 +1004,7 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
     if (Graphics::PreparedDrawKeys() && std::all_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr; })) preparedKey = Graphics::PrepareDrawKey(localDevice->Device(), stages, static_cast<std::uint32_t>(graphics.colors.size()));
     if (preparedKey && preparedKey->probe != nullptr) preparedKey->probe->epoch = jobEpoch;
     if (preparedKey && preparedKey->speculation != nullptr) preparedKey->speculation->epoch = jobEpoch;
+    if (preparedKey && recipe == nullptr && Graphics::SpecInputs()) preparedKey->inputs = localDevice->SpeculateDrawInputs(graphics, stages);
     auto held = std::make_shared<Held>(Held{input, std::move(localDevice), std::move(decode), relocatedDecode, drawParameters, std::move(stages), std::move(snapshots), std::move(recipe), std::move(recipeStages), drawKey, std::move(results), std::move(memory), std::move(linked), std::move(stageCaptures), std::move(matched), std::move(matchedRegions), std::move(fresh), std::move(decodeReads), std::move(shaderMemory), std::move(entry), std::move(dataEntry), std::move(compiledStages), std::move(stageData), std::move(preparedKey)});
     const auto commitQueue = submission.queue;
     const auto commitPacket = input->commitPacket;

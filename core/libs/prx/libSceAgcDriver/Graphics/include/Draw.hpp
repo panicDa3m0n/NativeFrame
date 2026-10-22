@@ -7,8 +7,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <chrono>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -65,15 +67,37 @@ struct DrawSpeculation {
     bool epochSame = true;
     bool ready = false;
 };
+// O22.T3 (APS5_SPEC_INPUTS=1): what a draw's prepare thread derives from its stages and state alone
+// (the fragment outputs, the vertex input layout, the described set layouts and the pipeline for a
+// recorded draw without proxied targets or stencil replay). The commit takes the outputs for the
+// same state and stage objects on the same device, and the pipeline when its own vertex layout,
+// set layout keys and attachment layout match too. APS5_VERIFY_SPEC_INPUTS=1 derives them again at
+// the commit and reports any difference.
+struct DrawInputSpeculation {
+    VkDevice device = VK_NULL_HANDLE;
+    const State* state = nullptr;
+    const CompiledShader* shaders = nullptr;
+    std::size_t shaderCount = 0;
+    std::set<std::uint32_t> fragmentOutputs;
+    VertexInputLayout vertexInput;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    std::shared_ptr<Pipeline> pipeline;
+};
 struct PreparedDrawKey {
     ResourceCache::Key key;
     std::size_t hash = 0;
     std::shared_ptr<DrawSpeculationProbe> probe;
     std::shared_ptr<DrawSpeculation> speculation;
+    std::shared_ptr<const DrawInputSpeculation> inputs;
 };
 bool PreparedDrawKeys();
 bool SpecProbe();
 bool SpecBindings();
+bool SpecInputs();
+std::shared_ptr<const DrawInputSpeculation> SpeculateDrawInputs(const Context& context, const State& state, std::span<const CompiledShader> shaders);
+const std::set<std::uint32_t>* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders);
+std::shared_ptr<Pipeline> TakeSpeculatedPipeline(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, bool lean, bool proxiedTargets);
 // The two halves of a DrawSpeculation outside a parallel-prepared draw (tests): what a prepare
 // thread makes for a key whose template SharedResourceCache holds, and the commit's check, which
 // takes the bindings (null for a draw without snapshots) or returns false for PrepareDrawBindings.

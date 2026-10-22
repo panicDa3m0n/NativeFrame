@@ -81,6 +81,33 @@ GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color) {
 
 namespace {
 
+enum SpecInputEvent : std::size_t { SpecInputsPrepared, SpecInputsUnprepared, SpecOutputsTaken, SpecPipelineTaken, SpecRefusedDevice, SpecRefusedDraw, SpecRefusedLean, SpecRefusedProxied, SpecRefusedLayouts, SpecRefusedVertex, SpecInputsMismatched, SpecInputEvents };
+constexpr std::array<const char*, SpecInputEvents> SpecInputEventNames{"prepared", "not prepared", "outputs taken", "pipelines taken", "refused for another device", "refused for another draw", "refused for a transitioned draw", "refused for a proxied target", "refused for other set layouts", "refused for another vertex layout", "verify mismatches"};
+
+std::array<std::atomic<std::uint64_t>, SpecInputEvents>& specInputEvents() {
+    static std::array<std::atomic<std::uint64_t>, SpecInputEvents> events{};
+    return events;
+}
+
+void noteSpecInput(SpecInputEvent event) {
+    specInputEvents()[event].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool VerifySpecInputs() {
+    static const bool enabled = std::getenv("APS5_VERIFY_SPEC_INPUTS") != nullptr;
+    return enabled;
+}
+
+void reportSpecInputMismatch(const char* what) {
+    noteSpecInput(SpecInputsMismatched);
+    static std::atomic<int> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[spec-inputs] APS5_VERIFY_SPEC_INPUTS: the speculated %s differ from the commit's\n", what);
+}
+
+bool SameVertexLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
+    return std::ranges::equal(a.bindings, b.bindings, [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; }) && std::ranges::equal(a.attributes, b.attributes, [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; });
+}
+
 std::size_t colorKeyCount(const ColorTarget& color, std::size_t bytes) {
     if (color.mipCount != 1 || color.depth != 1 || !color.dccPipeAligned) return DccKeyBytes(bytes);
     return DccKeyCount(ColorTextureTileMode(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, bytes);
@@ -579,6 +606,15 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     std::fprintf(stderr, "%s\n", line);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    if (SpecInputs()) {
+        std::string specText;
+        for (std::size_t i = 0; i < SpecInputEvents; ++i) {
+            char item[96];
+            std::snprintf(item, sizeof(item), "%s %s %llu", i == 0 ? "" : ",", SpecInputEventNames[i], static_cast<unsigned long long>(specInputEvents()[i].exchange(0, std::memory_order_relaxed)));
+            specText += item;
+        }
+        std::fprintf(stderr, "[spec-inputs] 10 s:%s\n", specText.c_str());
+    }
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -1069,7 +1105,7 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRec
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawInputSpeculation* speculated = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1111,6 +1147,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (const auto* taken = TakeSpeculatedOutputs(speculated, context, state, shaders)) {
+        inputs.fragmentOutputs = *taken;
+        inputs.shaderStages = PipelineStages(shaders);
+        outcome.validateMemoized = outcome.validateHit = true;
+        if (VerifySpecInputs()) {
+            bool memoized = false, hit = false;
+            auto own = CachedFragmentOutputs(context, shaders, state, memoized, hit);
+            if (own != inputs.fragmentOutputs) {
+                reportSpecInputMismatch("fragment outputs");
+                inputs.fragmentOutputs = std::move(own);
+            }
+        }
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
@@ -2479,6 +2527,85 @@ bool SpecBindings() {
     return enabled;
 }
 
+bool SpecInputs() {
+    static const bool enabled = std::getenv("APS5_SPEC_INPUTS") != nullptr;
+    return enabled;
+}
+
+std::shared_ptr<const DrawInputSpeculation> SpeculateDrawInputs(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    const bool speculable = !shaders.empty() && context.descriptorCache != nullptr && std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->stencilReferences.empty() && !shader.program->Identity().Empty(); });
+    if (!speculable) {
+        noteSpecInput(SpecInputsUnprepared);
+        return nullptr;
+    }
+    try {
+        auto speculation = std::make_shared<DrawInputSpeculation>();
+        speculation->device = context.device;
+        speculation->state = &state;
+        speculation->shaders = shaders.data();
+        speculation->shaderCount = shaders.size();
+        bool memoized = false, hit = false;
+        speculation->fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        if (!attributes.empty()) {
+            std::shared_ptr<const VertexInputLayout> retained;
+            if (context.vertexInputs != nullptr) {
+                static const bool byShape = std::getenv("APS5_NO_VERTEX_SHAPE_CACHE") == nullptr;
+                retained = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+                if (retained == nullptr && byShape) retained = context.vertexInputs->TryGetByShape(attributes);
+            }
+            speculation->vertexInput = retained != nullptr ? *retained : BuildVertexInputLayout(context, attributes);
+        }
+        auto described = DescribeSetLayouts(context, shaders);
+        const auto masked = maskedState(state, speculation->fragmentOutputs);
+        speculation->pipeline = CachedPipeline(context, masked.has_value() ? *masked : state, speculation->vertexInput, described.View(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+        speculation->mainKey = std::move(described.mainKey);
+        speculation->fragmentKey = std::move(described.fragmentKey);
+        noteSpecInput(SpecInputsPrepared);
+        return speculation;
+    } catch (const std::exception&) {
+        noteSpecInput(SpecInputsUnprepared);
+        return nullptr;
+    }
+}
+
+const std::set<std::uint32_t>* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (speculation == nullptr) return nullptr;
+    if (speculation->device != context.device) {
+        noteSpecInput(SpecRefusedDevice);
+        return nullptr;
+    }
+    if (speculation->state != &state || speculation->shaders != shaders.data() || speculation->shaderCount != shaders.size()) {
+        noteSpecInput(SpecRefusedDraw);
+        return nullptr;
+    }
+    noteSpecInput(SpecOutputsTaken);
+    return &speculation->fragmentOutputs;
+}
+
+std::shared_ptr<Pipeline> TakeSpeculatedPipeline(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, bool lean, bool proxiedTargets) {
+    if (speculation == nullptr || speculation->pipeline == nullptr || speculation->device != context.device) return nullptr;
+    if (speculation->state != &state || speculation->shaders != shaders.data() || speculation->shaderCount != shaders.size()) return nullptr;
+    if (!lean) {
+        noteSpecInput(SpecRefusedLean);
+        return nullptr;
+    }
+    if (proxiedTargets) {
+        noteSpecInput(SpecRefusedProxied);
+        return nullptr;
+    }
+    if (!std::ranges::equal(layouts.mainKey, speculation->mainKey) || !std::ranges::equal(layouts.fragmentKey, speculation->fragmentKey)) {
+        noteSpecInput(SpecRefusedLayouts);
+        return nullptr;
+    }
+    if (!SameVertexLayout(vertexInput, speculation->vertexInput)) {
+        noteSpecInput(SpecRefusedVertex);
+        return nullptr;
+    }
+    noteSpecInput(SpecPipelineTaken);
+    return speculation->pipeline;
+}
+
 std::shared_ptr<DrawSpeculation> SpeculateDrawBindings(const PreparedDrawKey& prepared, std::span<const CompiledShader> shaders) {
     return speculateDrawBindings(prepared, shaders);
 }
@@ -2530,7 +2657,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    const auto* specInputs = SpecInputs() && prepared != nullptr ? prepared->inputs.get() : nullptr;
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, specInputs);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2803,7 +2931,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
-    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
+    const bool proxiedTargets = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; });
+    if (proxiedTargets) recipeOut = nullptr;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
         if (!masked.has_value()) masked = state;
@@ -2827,7 +2956,16 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
-    auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    auto pipeline = stencilReplay.empty() ? TakeSpeculatedPipeline(specInputs, context, state, shaders, inputs.VertexLayout(), resources->SetLayouts(), lean, proxiedTargets) : stencilReplay.front().second;
+    if (pipeline == nullptr) {
+        pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    } else if (stencilReplay.empty() && VerifySpecInputs()) {
+        auto own = CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        if (own != pipeline) {
+            reportSpecInputMismatch("pipeline");
+            pipeline = std::move(own);
+        }
+    }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;

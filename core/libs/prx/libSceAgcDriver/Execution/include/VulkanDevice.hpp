@@ -316,6 +316,7 @@ public:
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const Graphics::PreparedDrawKey* prepared = nullptr);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
+    std::shared_ptr<const Graphics::DrawInputSpeculation> SpeculateDrawInputs(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe

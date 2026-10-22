@@ -1960,19 +1960,26 @@ bool StoredPagesSince(std::uint64_t address, std::size_t bytes, std::uint64_t ge
         const auto found = tracker.driverPieces.find(block);
         if (found == tracker.driverPieces.end()) continue;
         const auto& entry = found->second;
-        if (entry.whole > generation || entry.dropped > generation) continue;
+        if (entry.whole > generation || entry.dropped > generation || entry.possibleWhole > generation || entry.possibleDropped > generation) continue;
         mark(from, to, false);
+        if (const auto walk = tracker.walkPages.find(block); walk != tracker.walkPages.end()) {
+            for (auto page = (from - begin) / WritePageBytes; page <= (to - 1 - begin) / WritePageBytes; ++page) {
+                if (walk->second.pages[page] > generation) mark(begin + page * WritePageBytes, begin + (page + 1) * WritePageBytes, true);
+            }
+        }
         if (cpuPrecise) {
             const auto& pages = tracker.cpuPages.find(block)->second.pages;
             for (auto page = (from - begin) / WritePageBytes; page <= (to - 1 - begin) / WritePageBytes; ++page) {
                 if (pages[page] > generation) mark(begin + page * WritePageBytes, begin + (page + 1) * WritePageBytes, true);
             }
         }
-        for (const auto& piece : entry.pieces) {
-            if (piece.generation <= generation || piece.end <= piece.begin) continue;
-            const auto pieceFrom = std::max(from, begin + piece.begin);
-            const auto pieceTo = std::min(to, begin + piece.end);
-            if (pieceFrom < pieceTo) mark(pieceFrom, pieceTo, true);
+        for (const auto* pieces : {&entry.pieces, &entry.possiblePieces}) {
+            for (const auto& piece : *pieces) {
+                if (piece.generation <= generation || piece.end <= piece.begin) continue;
+                const auto pieceFrom = std::max(from, begin + piece.begin);
+                const auto pieceTo = std::min(to, begin + piece.end);
+                if (pieceFrom < pieceTo) mark(pieceFrom, pieceTo, true);
+            }
         }
     }
     return true;

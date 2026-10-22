@@ -391,6 +391,12 @@ class SilentStubSectionTests(unittest.TestCase):
         result = self.check_stub("# Project technical debt\n\n### Build\n\n- A toolchain limitation.\n", "docs/dev/TechnicalDebt.md")
         self.assertNotIn("[debt-file]", result.stdout + result.stderr)
 
+    def test_entry_without_a_core_link_in_a_library_file_is_rejected(self):
+        result = self.check_stub("# libSceExample technical debt\n\n### Functional\n\n- A driver limitation.\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/dev/debt/libSceExample.md:5: error: [debt-file]", result.stdout)
+        self.assertIn("docs/dev/TechnicalDebt.md", result.stdout)
+
 
 class TestFixtureExportTests(unittest.TestCase):
     def check(self, path, text=None):
@@ -699,6 +705,20 @@ class RepositoryChecksTests(unittest.TestCase):
                 self.assertEqual([number for number, _ in check.added[name]], [1, 2])
                 check.code()
                 self.assertEqual(check.findings, [("comment", name, 2, "")])
+
+    def test_large_export_set_checks_duplicates_without_command_line_limit(self):
+        first = self.root / "core/libs/prx/libSceA/Export.cpp"
+        first.parent.mkdir(parents=True)
+        first.write_text("int APS5_VABI sceLargeExportSet1999(int value) { return value; }\n", encoding="utf-8")
+        self.commit()
+        second = self.root / "core/libs/prx/libSceB/Export.cpp"
+        second.parent.mkdir(parents=True)
+        second.write_text("".join(f"int APS5_VABI sceLargeExportSet{index}(int value) {{ return value; }}\n" for index in range(2000)), encoding="utf-8")
+        self.commit()
+        first.write_text("", encoding="utf-8")
+        check = Check("HEAD~1", "HEAD")
+        check.code()
+        self.assertEqual(check.findings, [("duplicate-export", "core/libs/prx/libSceB/Export.cpp", 2000, "sceLargeExportSet1999 is also in libSceA")])
 
     def test_checks_from_a_subdirectory_see_the_whole_repository(self):
         definition = "int APS5_VABI sceFooBar(int a, int b) { return a + b; }\n"

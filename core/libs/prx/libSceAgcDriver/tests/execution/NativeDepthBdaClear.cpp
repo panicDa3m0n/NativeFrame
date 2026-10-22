@@ -25,7 +25,9 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <utility>
 
 namespace AgcDriver {
 
@@ -153,10 +155,12 @@ int RunNativeClear(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
     target.clearDepth = 1.0f;
     Require(DepthSurfaceView(context, target) == view, "changing the native clear value replaced its attachment");
-    NoteHtileDepthClear(target.htileAddress, metadataBytes, metadataBytes);
+    std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
+    if (NoteHtileDepthClear(target.htileAddress, metadataBytes, metadataBytes)) htileClear.emplace(target.htileAddress, metadataBytes);
+    Require(htileClear.has_value(), "the full BDA clear was not registered for completion");
     const auto generation = Memory::TrackerGeneration();
     userData[4] = 0xfffffff0u;
-    device.Dispatch(compile(), groups, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device.Dispatch(compile(), groups, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(code.data()), nullptr, nullptr, htileClear);
     device.WaitIdle();
     for (std::size_t offset = 0; offset < BlockBytes; offset += 4u) {
         std::uint32_t value = 0;

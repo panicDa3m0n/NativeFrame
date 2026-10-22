@@ -455,6 +455,10 @@ void SleepUntil(std::uint64_t deadlineNanos) {
 bool SleepNanosUnlessChanged(std::uint64_t nanos, const std::atomic<std::uint64_t>& counter, std::uint64_t observed) {
     const std::uint64_t deadlineNanos = NowNanos() + nanos;
 #ifdef _WIN32
+    if (Coarse() || nanos < YIELD_BELOW_NANOS) {
+        SleepNanos(nanos);
+        return false;
+    }
     Waiter* waiter = ThisThreadWaiter();
     if (!waiter->wake) waiter->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!waiter->wake) throw std::runtime_error("TimedWait: CreateEventW failed for a wakeable sleep");
@@ -472,6 +476,7 @@ bool SleepNanosUnlessChanged(std::uint64_t nanos, const std::atomic<std::uint64_
             sleepers.erase(std::find(sleepers.begin(), sleepers.end(), wake));
         }
     } unregister{waiter->wake};
+    ResetEvent(waiter->wake);
     std::uint64_t now = NowNanos();
     if (counter.load(std::memory_order_seq_cst) != observed) return true;
     if (deadlineNanos > now + LEAD_NANOS) {

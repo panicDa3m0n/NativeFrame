@@ -5,6 +5,7 @@
 #include "SDL_keyboard.h"
 
 #include <cstdlib>
+#include <stdexcept>
 
 extern "C" {
 int APS5_VABI sceKeyboardInit(void);
@@ -12,7 +13,9 @@ int APS5_VABI sceKeyboardOpen(int, std::int32_t, std::int32_t, const void*);
 int APS5_VABI sceKeyboardClose(std::int32_t);
 int APS5_VABI sceKeyboardRead(std::int32_t, KeyboardData*, std::int32_t);
 int APS5_VABI sceKeyboardReadState(std::int32_t, KeyboardData*);
-int APS5_VABI sceKeyboardGetKey2Char(std::int32_t, std::int32_t, std::uint32_t, std::uint32_t, std::uint16_t, KeyboardCharData*);
+int APS5_VABI sceKeyboardGetKey2Char(std::int32_t, std::int32_t, std::uint8_t, std::uint8_t, std::uint16_t, KeyboardCharData*);
+int APS5_VABI sceKeyboardConnectPort(void);
+int APS5_VABI sceKeyboardDisconnectAll(void);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -112,13 +115,15 @@ int main() {
     Require(Char(KEYBOARD_LED_CAPS_LOCK, 0, 0x1e) == '1' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x1e) == '!');
     Require(Char(0, 0, 0x27) == '0' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x27) == ')');
     Require(Char(0, 0, 0x28) == '\n' && Char(0, 0, 0x2a) == '\b' && Char(0, 0, 0x2b) == '\t' && Char(0, 0, 0x2c) == ' ');
-    Require(Char(0, 0, 0x29) == 0 && Char(0, 0, 0x32) == 0 && Char(0, 0, 0x3a) == 0 && Char(0, 0, 0xe1) == 0);
+    Require(Char(0, 0, 0x29) == 0 && Char(0, 0, 0x3a) == 0 && Char(0, 0, 0xe1) == 0);
     Require(Char(0, 0, 0x31) == '\\' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x31) == '|');
     Require(Char(0, 0, 0x34) == '\'' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x34) == '"');
     Require(Char(0, 0, 0x38) == '/' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x38) == '?');
     Require(Char(0, 0, 0x59) == 0 && Char(KEYBOARD_LED_NUM_LOCK, 0, 0x59) == '1');
     Require(Char(KEYBOARD_LED_NUM_LOCK, 0, 0x62) == '0' && Char(KEYBOARD_LED_NUM_LOCK, 0, 0x63) == '.');
     Require(Char(0, 0, 0x54) == '/' && Char(0, 0, 0x57) == '+' && Char(0, 0, 0x58) == '\n');
+    Require(Char(0, 0, 0x32) == '\\' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x32) == '|');
+    Require(Char(0, 0, 0x64) == '\\' && Char(0, KEYBOARD_MOD_LEFT_SHIFT, 0x64) == '|');
     Require(Char(0, 0, 0x87) == 0 && Char(0, 0, 0x89) == 0);
 
     constexpr std::uint32_t shift = KEYBOARD_MOD_LEFT_SHIFT;
@@ -131,7 +136,7 @@ int main() {
     Require(Jis(0, 0x31) == ']' && Jis(shift, 0x31) == '}' && Jis(0, 0x32) == ']' && Jis(shift, 0x32) == '}');
     Require(Jis(0, 0x33) == ';' && Jis(shift, 0x33) == '+' && Jis(0, 0x34) == ':' && Jis(shift, 0x34) == '*');
     Require(Jis(0, 0x35) == 0 && Jis(shift, 0x35) == 0 && Jis(0, 0x36) == ',' && Jis(shift, 0x37) == '>' && Jis(shift, 0x38) == '?');
-    Require(Jis(0, 0x87) == '\\' && Jis(shift, 0x87) == '_' && Jis(0, 0x89) == '\\' && Jis(shift, 0x89) == '|');
+    Require(Jis(0, 0x87) == '\\' && Jis(shift, 0x87) == '_' && Jis(0, 0x89) == 0x00A5 && Jis(shift, 0x89) == '|');
     Require(Jis(0, 0x59, KEYBOARD_LED_NUM_LOCK) == '1' && Jis(0, 0x59) == 0 && Jis(0, 0x55) == '*' && Jis(0, 0xe1) == 0);
     Require(sceKeyboardGetKey2Char(KEYBOARD_HANDLE, KEYBOARD_ARRANGEMENT_101, 0, 0, 0x04, nullptr) == KEYBOARD_ERROR_INVALID_ARG);
     Require(sceKeyboardGetKey2Char(KEYBOARD_HANDLE, KEYBOARD_ARRANGEMENT_106, 0, 0, 0x04, nullptr) == KEYBOARD_ERROR_INVALID_ARG);
@@ -144,4 +149,20 @@ int main() {
     Require(sceKeyboardOpen(1, 0, 0, nullptr) == KEYBOARD_HANDLE);
     Require(sceKeyboardRead(KEYBOARD_HANDLE, data, 1) == 1 && data[0].length == 1 && data[0].key_code[0] == 0);
     Require(sceKeyboardClose(KEYBOARD_HANDLE) == KEYBOARD_OK);
+
+    bool threwConnect = false;
+    try {
+        sceKeyboardConnectPort();
+    } catch (const std::runtime_error&) {
+        threwConnect = true;
+    }
+    Require(threwConnect);
+
+    bool threwDisconnect = false;
+    try {
+        sceKeyboardDisconnectAll();
+    } catch (const std::runtime_error&) {
+        threwDisconnect = true;
+    }
+    Require(threwDisconnect);
 }

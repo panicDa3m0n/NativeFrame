@@ -1,4 +1,6 @@
 #include "SceTypes.hpp"
+#include "ProcessParametersFixture.hpp"
+#include <array>
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
 #include <chrono>
@@ -12,6 +14,7 @@
 
 extern "C" {
 int APS5_VABI sceHttpUriParse(SceHttpUriElement*, const char*, void*, std::size_t*, std::size_t);
+int APS5_VABI sceHttpUriCopy(SceHttpUriElement*, const SceHttpUriElement*, void*, std::size_t, std::size_t*);
 int APS5_VABI sceHttpUriMerge(char*, const char*, const char*, std::size_t*, std::size_t, std::uint32_t);
 int APS5_VABI sceHttpSetInflateGZIPEnabled(int, int);
 int APS5_VABI sceHttpSetRequestStatusCallback(int, void (APS5_VABI *)(int, int, void*), void*);
@@ -26,6 +29,8 @@ int APS5_VABI sceHttpWaitRequest(HttpEpollHandle, HttpNBEvent*, int, int);
 int APS5_VABI sceHttpAbortWaitRequest(HttpEpollHandle);
 int APS5_VABI sceHttpInit_nid_postfix(int, int, std::uint64_t);
 int APS5_VABI sceHttpTerm_nid_postfix(int);
+int APS5_VABI sceHttpAuthCacheFlush(int);
+int APS5_VABI sceHttpCookieFlush(int);
 int APS5_VABI sceHttpReadData(int, void*, std::size_t);
 int APS5_VABI sceHttpCreateRequest2(int, const char*, const char*, std::uint64_t);
 int APS5_VABI sceHttpsEnableOption(int, std::uint32_t);
@@ -43,9 +48,32 @@ int APS5_VABI sceHttpSetAuthInfoCallback(int, HttpAuthInfoCallback, void*);
 int APS5_VABI sceHttpParseStatusLine(const char*, std::size_t, std::int32_t*, std::int32_t*, std::int32_t*, const char**, std::size_t*);
 }
 
+alignas(16) static std::array<std::byte, 0x40> processParameters{};
+
 static void Require(bool value) { if (!value) std::abort(); }
 
 static bool Equal(const char* left, const char* right) { return std::strcmp(left, right) == 0; }
+
+static void CheckUriParseCharacters() {
+    char pool[256];
+    SceHttpUriElement element{};
+    Require(sceHttpUriParse(&element, "HtTpS://AZaz09-._/path", pool, nullptr, sizeof(pool)) == 0);
+    Require(Equal(element.scheme, "HtTpS") && Equal(element.hostname, "AZaz09-._") && element.port == 443);
+    Require(sceHttpUriParse(&element, "aZ09+.-://host/", pool, nullptr, sizeof(pool)) == 0);
+    Require(Equal(element.scheme, "aZ09+.-") && element.port == 0);
+    for (unsigned value = 128; value <= 255; ++value) {
+        const std::string byte(1, static_cast<char>(value));
+        const std::string urls[] = {
+            "http://" + byte + "/", "http://[" + byte + "]/", byte + "://host/",
+            "a" + byte + "://host/", "http://host:" + byte + "/"
+        };
+        for (const auto& url : urls) {
+            std::size_t required = 0;
+            Require(sceHttpUriParse(nullptr, url.c_str(), nullptr, &required, 0) == static_cast<int>(0x80433060));
+            Require(sceHttpUriParse(&element, url.c_str(), pool, nullptr, sizeof(pool)) == static_cast<int>(0x80433060));
+        }
+    }
+}
 
 static void CheckUriEscapeBytes() {
     constexpr char unreserved[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
@@ -68,12 +96,34 @@ static void CheckUriEscapeBytes() {
     }
 }
 
-static int AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
+static int APS5_VABI AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
 static void APS5_VABI RequestStatusCallback(int, int, void* argument) {
     ++*static_cast<int*>(argument);
 }
 
 int main() {
+    const std::uint64_t processSize = processParameters.size();
+    const std::uint32_t processMagic = 0x4942524f;
+    std::uint32_t sdkVersion = 0x1000000;
+    std::memcpy(processParameters.data(), &processSize, sizeof(processSize));
+    std::memcpy(processParameters.data() + 8, &processMagic, sizeof(processMagic));
+    std::memcpy(processParameters.data() + 16, &sdkVersion, sizeof(sdkVersion));
+    Require(ProcessParametersFixture::Install(processParameters.data(), processParameters.size()));
+    for (const std::uint32_t version : {0u, 0xffffffu, 0x1000000u}) {
+        std::memcpy(processParameters.data() + 16, &version, sizeof(version));
+        for (unsigned value = 1; value < 256; ++value) {
+            if (value == '%') continue;
+            const char input[]{static_cast<char>(value), 0};
+            char output[]{'x', 'x'};
+            std::size_t required = 123;
+            const bool allowed = version >= 0x1000000 || (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') || value == '*' || value == '-' || value == '.' || value == '_' || value == '+';
+            Require(sceHttpUriUnescape(output, &required, sizeof(output), input) == (allowed ? 0 : static_cast<int>(0x80433060)));
+            Require(allowed ? output[0] == input[0] && output[1] == 0 && required == 2 : output[0] == 'x' && output[1] == 'x' && required == 123);
+        }
+        char output[2]{};
+        Require(sceHttpUriUnescape(output, nullptr, sizeof(output), "%7E") == 0 && output[0] == '~');
+    }
+    std::memcpy(processParameters.data() + 16, &sdkVersion, sizeof(sdkVersion));
     int callbackCount = 0;
     const auto request = sceHttpCreateRequest2(1, "GET", "/", 0);
     Require(sceHttpSetRequestStatusCallback(request, RequestStatusCallback, &callbackCount) == 0);
@@ -129,7 +179,7 @@ int main() {
     Require(sceHttpUriParse(&element, "http://[::1]:8080/index.html", pool, nullptr, sizeof(pool)) == 0);
     Require(Equal(element.hostname, "::1") && element.port == 8080 && Equal(element.path, "/index.html"));
     Require(sceHttpUriBuild(built, nullptr, sizeof(built), &element, buildAll) == 0);
-    Require(Equal(built, "http://[::1]:8080/index.html"));
+    Require(Equal(built, "http://::1:8080/index.html"));
 
     Require(sceHttpUriParse(&element, "mailto:someone@example.com", pool, nullptr, sizeof(pool)) == 0);
     Require(element.opaque != 0 && element.port == 0);
@@ -153,6 +203,30 @@ int main() {
     Require(sceHttpUriBuild(built, nullptr, sizeof(built), nullptr, buildAll) == invalidUrl);
     Require(sceHttpUriBuild(nullptr, nullptr, 0, &element, buildAll) == invalidValue);
 
+    {
+        SceHttpUriElement bounded{};
+        bounded.opaque = 2;
+        char scheme[33];
+        char hostname[256];
+        std::memset(scheme, 's', sizeof(scheme));
+        std::memset(hostname, 'h', sizeof(hostname));
+        bounded.scheme = scheme;
+        bounded.hostname = hostname;
+        char output[512];
+        Require(sceHttpUriBuild(output, &required, sizeof(output), &bounded, 3) == 0);
+        Require(required == 32 + 1 + 2 + 255 + 1);
+        Require(output[32] == ':' && output[33] == '/' && output[34] == '/');
+        Require(output[required - 1] == '\0');
+        scheme[0] = '\0';
+        Require(sceHttpUriBuild(output, &required, sizeof(output), &bounded, 1) == 0);
+        Require(required == 4 && Equal(output, "//"));
+        char prefix[] = "HTTPS-extra";
+        bounded.scheme = prefix;
+        bounded.port = 443;
+        Require(sceHttpUriBuild(output, &required, sizeof(output), &bounded, 4) == 0);
+        Require(required == 3 && Equal(output, "//"));
+    }
+
     char escaped[64];
     Require(sceHttpUriEscape(nullptr, &required, 0, "a b/~\xC3\xA9") == 0);
     Require(required == std::strlen("a%20b%2F~%C3%A9") + 1);
@@ -160,37 +234,63 @@ int main() {
     Require(sceHttpUriEscape(escaped, nullptr, sizeof(escaped), "a b/~\xC3\xA9") == 0);
     Require(Equal(escaped, "a%20b%2F~%C3%A9"));
     Require(sceHttpUriEscape(escaped, nullptr, sizeof(escaped), nullptr) == invalidValue);
-    CheckUriEscapeBytes();
-#ifdef _WIN32
     const std::string previousCtype = std::setlocale(LC_CTYPE, nullptr);
+    Require(std::setlocale(LC_CTYPE, "C") != nullptr);
+    CheckUriEscapeBytes();
+    CheckUriParseCharacters();
+#ifdef _WIN32
     Require(std::setlocale(LC_CTYPE, ".1252") != nullptr);
     CheckUriEscapeBytes();
-    Require(std::setlocale(LC_CTYPE, previousCtype.c_str()) != nullptr);
+    CheckUriParseCharacters();
+#else
+    for (const char* locale : {"en_US.ISO8859-1", "en_US.iso88591", "en_US.UTF-8"}) {
+        if (!std::setlocale(LC_CTYPE, locale)) continue;
+        CheckUriEscapeBytes();
+        CheckUriParseCharacters();
+    }
 #endif
+    Require(std::setlocale(LC_CTYPE, previousCtype.c_str()) != nullptr);
 
     constexpr const char* unescapeCases[][2] = {
         {"", ""}, {"plain+text", "plain+text"}, {"a%20b%2F~%c3%a9", "a b/~\xC3\xA9"},
-        {"%41%4a%4F%ff", "AJO\xFF"}, {"%2520", "%20"},
-        {"%", "%"}, {"%1", "%1"}, {"%1g%gg%+1%-1", "%1g%gg%+1%-1"}
+        {"%41%4a%4F%ff", "AJO\xFF"}, {"%2520", "%20"}
     };
     for (const auto& row : unescapeCases) {
         const std::size_t size = std::strlen(row[1]) + 1;
         Require(sceHttpUriUnescape(nullptr, &required, 0, row[0]) == 0 && required == size);
         std::memset(escaped, 'Z', sizeof(escaped));
-        Require(sceHttpUriUnescape(escaped, &required, size - 1, row[0]) == outOfMemory && required == size);
-        for (char c : escaped) Require(c == 'Z');
+        required = 123;
+        Require(sceHttpUriUnescape(escaped, &required, size - 1, row[0]) == outOfMemory && required == 123);
+        Require(std::memcmp(escaped, row[1], size - 1) == 0 && escaped[size - 1] == 'Z');
         Require(sceHttpUriUnescape(escaped, nullptr, size, row[0]) == 0);
         Require(Equal(escaped, row[1]) && escaped[size] == 'Z');
+    }
+    for (const char* malformed : {"%", "%1", "%1g", "%gg", "%+1", "%-1", "% 1", "abc%", "%%41", "%4%41"}) {
+        std::memset(escaped, 'Z', sizeof(escaped));
+        required = 77;
+        Require(sceHttpUriUnescape(escaped, &required, sizeof(escaped), malformed) == invalidUrl && required == 77 && escaped[0] == 'Z');
+        Require(sceHttpUriUnescape(nullptr, &required, 0, malformed) == invalidUrl && required == 77);
     }
     Require(sceHttpUriUnescape(escaped, &required, sizeof(escaped), "a%00b") == 0);
     Require(required == 4 && std::memcmp(escaped, "a\0b", 4) == 0);
     std::strcpy(escaped, "%41%2f%2520");
     Require(sceHttpUriUnescape(escaped, &required, sizeof(escaped), escaped) == 0);
     Require(Equal(escaped, "A/%20") && required == 6);
-    Require(sceHttpUriUnescape(nullptr, nullptr, 0, "valid") == 0);
+    Require(sceHttpUriUnescape(nullptr, nullptr, 0, "valid") == invalidValue);
     required = 123;
     Require(sceHttpUriUnescape(escaped, &required, sizeof(escaped), nullptr) == invalidValue);
     Require(required == 123 && Equal(escaped, "A/%20"));
+
+    for (const char* malformed : {"%", "%1", "%1g", "%gg", "%+1", "%-1", "prefix%4", "prefix%xy"}) {
+        std::memset(escaped, 'Z', sizeof(escaped));
+        required = 123;
+        Require(sceHttpUriUnescape(escaped, &required, sizeof(escaped), malformed) == static_cast<int>(0x80433060));
+        Require(required == 123);
+        for (char value : escaped) Require(value == 'Z');
+    }
+    std::memset(escaped, 'Z', sizeof(escaped));
+    Require(sceHttpUriUnescape(escaped, &required, 2, "a%20b") == outOfMemory);
+    Require(required == 123 && escaped[0] == 'a' && escaped[1] == ' ' && escaped[2] == 'Z');
 
     char bytes[256], encodedBytes[766], decodedBytes[256];
     for (std::size_t i = 1; i < 256; ++i) bytes[i - 1] = static_cast<char>(i);
@@ -253,6 +353,13 @@ int main() {
     constexpr int beforeInit = static_cast<int>(0x80431001);
     constexpr int aborted = static_cast<int>(0x80431080);
     constexpr int invalidId = static_cast<int>(0x80431100);
+    const auto flushCaches = [](int id, int expected) {
+        Require(sceHttpAuthCacheFlush(id) == expected);
+        Require(sceHttpCookieFlush(id) == expected);
+    };
+    flushCaches(0, beforeInit);
+    flushCaches(-1, beforeInit);
+    flushCaches(request, beforeInit);
     HttpEpollHandle epoll = nullptr;
     HttpNBEvent events[2]{};
     Require(sceHttpCreateEpoll(1, &epoll) == beforeInit);
@@ -260,6 +367,12 @@ int main() {
     Require(sceHttpTerm_nid_postfix(1) == beforeInit);
     const int context = sceHttpInit_nid_postfix(0, 0, 0x10000);
     Require(context > 0);
+    flushCaches(context, 0);
+    flushCaches(context, 0);
+    flushCaches(0, invalidId);
+    flushCaches(-1, invalidId);
+    flushCaches(INT32_MAX, invalidId);
+    flushCaches(request, invalidId);
     Require(sceHttpCreateEpoll(-1, &epoll) == invalidId);
     Require(sceHttpCreateEpoll(context, nullptr) == invalidValue);
     Require(sceHttpCreateEpoll(context, &epoll) == 0 && epoll != nullptr);
@@ -303,12 +416,23 @@ int main() {
     Require(sceHttpCreateEpoll(context, &epoll) == 0);
     const int otherContext = sceHttpInit_nid_postfix(0, 0, 0x10000);
     Require(otherContext > 0 && otherContext != context);
+    flushCaches(otherContext, 0);
     Require(sceHttpTerm_nid_postfix(otherContext) == 0);
+    flushCaches(otherContext, invalidId);
+    flushCaches(context, 0);
     Require(sceHttpTerm_nid_postfix(otherContext) == invalidId);
     Require(sceHttpWaitRequest(epoll, events, 2, 0) == 0);
     Require(waitWokenBy([&] { Require(sceHttpTerm_nid_postfix(context) == 0); }) == 0);
     Require(sceHttpWaitRequest(epoll, events, 2, 0) == beforeInit);
     Require(sceHttpTerm_nid_postfix(context) == beforeInit);
+    flushCaches(context, beforeInit);
+    const int newContext = sceHttpInit_nid_postfix(0, 0, 0x10000);
+    Require(newContext > 0 && newContext != context && newContext != otherContext);
+    flushCaches(context, invalidId);
+    flushCaches(otherContext, invalidId);
+    flushCaches(newContext, 0);
+    Require(sceHttpTerm_nid_postfix(newContext) == 0);
+    flushCaches(newContext, beforeInit);
 
     char data[16];
     Require(sceHttpReadData(1, data, sizeof(data)) == network);
@@ -410,7 +534,33 @@ int main() {
     Require(sceHttpUriSweepPath(sweptPath, "/a/b/../c", 6) == 0 && Equal(sweptPath, "/a/b/"));
     Require(sceHttpUriSweepPath(sweptPath, "/ab/c", 3) == 0 && Equal(sweptPath, "/a"));
     Require(sceHttpUriSweepPath(sweptPath, "/a/./b", 5) == 0 && Equal(sweptPath, "/a/."));
-    Require(sceHttpUriSweepPath(sweptPath, "/a/b/../c", 8) == 0 && Equal(sweptPath, "/a/b/.."));
-    char sweptByte[2] = {'x', 'x'};
-    Require(sceHttpUriSweepPath(sweptByte, "/", 1) == 0 && sweptByte[0] == '\0' && sweptByte[1] == 'x');
+    Require(sceHttpUriSweepPath(sweptPath, "/a/b/../c", 8) == 0 && Equal(sweptPath, "/a/"));
+    Require(sceHttpUriSweepPath(sweptPath, "/a/b/../c", 5) == 0 && Equal(sweptPath, "/a/b"));
+    Require(sweep("/a/b/..", "/a/b/.."));
+    Require(sweep("/a/b/./.", "/a/b/."));
+    char sweptByte[3] = {'x', 'x', 'x'};
+    Require(sceHttpUriSweepPath(sweptByte, "/a", 1) == 0 && sweptByte[0] == '/' && sweptByte[1] == '\0' && sweptByte[2] == 'x');
+    sweptByte[0] = 'x';
+    Require(sceHttpUriSweepPath(sweptByte, "", 1) == 0 && sweptByte[0] == '\0');
+
+    {
+        SceHttpUriElement source{};
+        char parsedPool[256];
+        Require(sceHttpUriParse(&source, "http://user:pw@example.com:8080/a/b?q=1#frag", parsedPool, nullptr, sizeof(parsedPool)) == 0);
+        SceHttpUriElement copy{};
+        char pool[256];
+        std::size_t needed = 0;
+        Require(sceHttpUriCopy(nullptr, &source, nullptr, 0, &needed) == 0 && needed == 5 + 12 + 5 + 5 + 3);
+        Require(sceHttpUriCopy(&copy, &source, pool, sizeof(pool), nullptr) == 0);
+        Require(std::strcmp(copy.scheme, "http") == 0 && std::strcmp(copy.hostname, "example.com") == 0 && std::strcmp(copy.path, "/a/b") == 0);
+        Require(std::strcmp(copy.username, "user") == 0 && std::strcmp(copy.password, "pw") == 0 && copy.port == 8080);
+        Require(copy.query == nullptr && copy.fragment == nullptr && copy.opaque == 0);
+        Require(sceHttpUriCopy(&copy, &source, pool, needed - 1, nullptr) == static_cast<int>(0x80431022));
+        Require(copy.scheme == nullptr && copy.hostname == nullptr && pool[0] == 0);
+        Require(sceHttpUriCopy(&copy, &source, pool, needed, &needed) == 0 && needed == 30);
+        Require(sceHttpUriCopy(&copy, nullptr, pool, sizeof(pool), nullptr) == static_cast<int>(0x80433060));
+        Require(sceHttpUriCopy(nullptr, &source, nullptr, 0, nullptr) == static_cast<int>(0x804311FE));
+        SceHttpUriElement empty{};
+        Require(sceHttpUriCopy(&copy, &empty, pool, sizeof(pool), &needed) == 0 && needed == 5 && copy.scheme != nullptr && copy.scheme[0] == 0);
+    }
 }

@@ -33,8 +33,8 @@ constexpr std::array<IntegerType, 8> kIntegerTypes{{
     {"i8", 8, true}, {"i16", 16, true}, {"i32", 32, true}, {"i64", 64, true},
 }};
 
-constexpr std::array<std::string_view, 7> kIgnoredTopLevelKeys{"relinker_version", "relinker_commit", "config", "config_sha256", "main_target", "settings", "settings_sha256"};
-constexpr std::array<std::string_view, 8> kReservedNames{"format", "relinker_version", "relinker_commit", "config", "config_sha256", "main_target", "settings", "settings_sha256"};
+constexpr std::array<std::string_view, 8> kIgnoredTopLevelKeys{"relinker_version", "relinker_commit", "config", "config_sha256", "main_target", "linux_base", "settings", "settings_sha256"};
+constexpr std::array<std::string_view, 9> kReservedNames{"format", "relinker_version", "relinker_commit", "config", "config_sha256", "main_target", "linux_base", "settings", "settings_sha256"};
 constexpr std::array<std::string_view, 10> kEntryKeys{"name", "target", "va", "type", "expected", "value", "min", "max", "align", "description"};
 
 std::string HexValue(const std::uint64_t value) {
@@ -245,12 +245,18 @@ struct EntryRange {
     std::string Reason;
 };
 
-std::uint64_t HeaderTableEnd(const ElfHeader& header) {
-    const std::uint64_t table = header.ProgramHeaderOffset + static_cast<std::uint64_t>(header.ProgramHeaderCount) * header.ProgramHeaderEntrySize;
-    return std::max<std::uint64_t>(64, table);
+bool TouchesHeaderArea(const ElfHeader& header, const std::uint64_t offset, const std::uint64_t length) {
+    const auto overlaps = [offset, length](const std::uint64_t start, const std::uint64_t size) {
+        return offset < start + size && start < offset + length;
+    };
+    if (overlaps(0, Elfpatcher::kElfHeaderSize)) return true;
+    if (header.ProgramHeaderCount == 0 || header.ProgramHeaderEntrySize == 0) return false;
+    const std::uint64_t tableSize = static_cast<std::uint64_t>(header.ProgramHeaderCount) * header.ProgramHeaderEntrySize;
+    if (tableSize > std::numeric_limits<std::uint64_t>::max() - header.ProgramHeaderOffset) return true;
+    return overlaps(header.ProgramHeaderOffset, tableSize);
 }
 
-EntryRange ResolveEntry(const std::vector<ProgramHeader>& segments, const std::uint64_t fileSize, const std::uint64_t headerEnd, const PatchEntry& entry) {
+EntryRange ResolveEntry(const std::vector<ProgramHeader>& segments, const std::uint64_t fileSize, const ElfHeader& header, const PatchEntry& entry) {
     const std::uint64_t length = entry.Expected.size();
     for (const auto& segment : segments) {
         if (segment.Type != Elfpatcher::PT_LOAD) continue;
@@ -259,7 +265,7 @@ EntryRange ResolveEntry(const std::vector<ProgramHeader>& segments, const std::u
         if (delta >= segment.FileSize || length > segment.FileSize - delta) continue;
         if (segment.Offset > fileSize || segment.FileSize > fileSize - segment.Offset) return {std::nullopt, "PT_LOAD file mapping is out of bounds"};
         const PatchedRange range{segment.Offset + delta, length, entry.VirtualAddress};
-        if (range.Offset < headerEnd) return {std::nullopt, "range overlaps the ELF header or program header table"};
+        if (TouchesHeaderArea(header, range.Offset, length)) return {std::nullopt, "range overlaps the ELF header or program header table"};
         return {range, {}};
     }
     return {std::nullopt, "range is not inside the file bytes of one PT_LOAD"};
@@ -267,9 +273,9 @@ EntryRange ResolveEntry(const std::vector<ProgramHeader>& segments, const std::u
 
 std::vector<EntryRange> ResolveEach(const ElfReader& reader, const std::vector<PatchEntry>& entries) {
     const auto segments = reader.ReadProgramHeaders();
-    const auto headerEnd = HeaderTableEnd(reader.ReadHeader());
+    const auto header = reader.ReadHeader();
     std::vector<EntryRange> resolved;
-    for (const auto& entry : entries) resolved.push_back(ResolveEntry(segments, reader.GetFileSize(), headerEnd, entry));
+    for (const auto& entry : entries) resolved.push_back(ResolveEntry(segments, reader.GetFileSize(), header, entry));
     return resolved;
 }
 
@@ -294,8 +300,8 @@ void RejectEntryOverlaps(const std::vector<PatchEntry>& entries, const std::vect
     }
 }
 
-bool IsElfDyn(const std::vector<std::uint8_t>& bytes) {
-    return bytes.size() >= 18 && bytes[0] == 0x7f && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F' && bytes[16] == Elfpatcher::ET_DYN && bytes[17] == 0;
+bool IsElfOfType(const std::vector<std::uint8_t>& bytes, const std::uint16_t type) {
+    return bytes.size() >= 18 && bytes[0] == 0x7f && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F' && bytes[16] == (type & 0xff) && bytes[17] == (type >> 8);
 }
 
 VerifyResult VerifyOne(const PatchEntry& entry, const EntryRange& resolved, const std::vector<std::uint8_t>& bytes, const bool outputMode) {
@@ -404,6 +410,10 @@ PatchFile ParsePatchFile(const std::string_view text) {
         if (!mainTarget->IsString || mainTarget->Text.empty()) FailLine(mainTarget->Line, "main_target must be a nonempty string", "main_target");
         file.MainTarget = mainTarget->Text;
     }
+    if (const auto* linuxBase = Find(top, "linux_base")) {
+        if (linuxBase->IsString || linuxBase->Number.Negative) FailLine(linuxBase->Line, "linux_base must be a non-negative integer", "linux_base");
+        file.LinuxBase = linuxBase->Number.Magnitude;
+    }
     return file;
 }
 
@@ -499,7 +509,7 @@ std::vector<AppliedPatch> AggregateManifest(const std::vector<std::vector<Applie
     return merged;
 }
 
-std::string WriteManifest(const std::vector<AppliedPatch>& patches, const std::string& mainTarget, const std::string& configPath) {
+std::string WriteManifest(const std::vector<AppliedPatch>& patches, const std::string& mainTarget, const std::string& configPath, const std::optional<std::uint64_t> linuxBase) {
     const auto holdable = [](const std::string& text) {
         return std::none_of(text.begin(), text.end(), [](const char character) {
             return character == '"' || character == '\\' || (static_cast<unsigned char>(character) < 0x20 && character != '\t') || character == 0x7f;
@@ -513,6 +523,7 @@ std::string WriteManifest(const std::vector<AppliedPatch>& patches, const std::s
     if (!config.empty() && !holdable(config)) config = std::filesystem::path(Io::NativePath(configPath)).filename().generic_string();
     std::ostringstream manifest;
     manifest << "format = 1\nmain_target = " << quoted(mainTarget, "main_target") << '\n';
+    if (linuxBase) manifest << "linux_base = " << HexValue(*linuxBase) << '\n';
     if (!config.empty()) manifest << "config = " << quoted(config, "config") << '\n';
     for (const auto& patch : patches) {
         manifest << "\n[[patch]]\n";
@@ -547,8 +558,12 @@ std::vector<VerifyResult> VerifyPatches(const PatchFile& file, const std::vector
         for (std::size_t index = 0; index < executables.size(); ++index)
             for (std::size_t other = index + 1; other < executables.size(); ++other)
                 if (executables[index].Name == executables[other].Name) throw Domain::RelinkerException("ambiguous patch target: " + executables[index].Name);
-        for (const auto& executable : executables)
-            if (!IsElfDyn(executable.Bytes)) throw Domain::RelinkerException(executable.Name + " is not an ET_DYN Linux ELF output (ET_EXEC from --linux-fixed-base, PE and Mach-O outputs are not supported): verify the input instead");
+        for (const auto& executable : executables) {
+            const bool fixed = IsElfOfType(executable.Bytes, Elfpatcher::ET_EXEC);
+            if (!fixed && !IsElfOfType(executable.Bytes, Elfpatcher::ET_DYN)) throw Domain::RelinkerException(executable.Name + " is not a Linux ELF output (PE and Mach-O outputs are not supported): verify the input instead");
+            if (fixed && !file.LinuxBase) throw Domain::RelinkerException(executable.Name + " is an ET_EXEC Linux ELF output, but the patch file has no linux_base: verify the manifest written by its conversion");
+            if (!fixed && file.LinuxBase) throw Domain::RelinkerException(executable.Name + " is an ET_DYN Linux ELF output, but the patch file has linux_base = " + HexValue(*file.LinuxBase) + ": verify the output of the conversion that wrote it");
+        }
     } else {
         std::vector<std::string> names;
         for (const auto& executable : executables) names.push_back(executable.Name);
@@ -577,13 +592,19 @@ std::vector<VerifyResult> VerifyPatches(const PatchFile& file, const std::vector
             }
             continue;
         }
+        const std::uint64_t base = outputMode && IsElfOfType(target->Bytes, Elfpatcher::ET_EXEC) ? *file.LinuxBase : 0;
         std::vector<PatchEntry> own;
-        for (const auto other : indices) own.push_back(file.Entries[other]);
+        for (const auto other : indices) {
+            own.push_back(file.Entries[other]);
+            if (own.back().VirtualAddress > std::numeric_limits<std::uint64_t>::max() - base) throw Domain::RelinkerException(Describe(own.back()) + " lies outside the address space at linux_base = " + HexValue(base));
+            own.back().VirtualAddress += base;
+        }
         const ElfReader reader(target->Bytes);
         const auto resolved = ResolveEach(reader, own);
         RejectEntryOverlaps(own, resolved);
         for (std::size_t position = 0; position < indices.size(); ++position) {
             results[indices[position]] = VerifyOne(own[position], resolved[position], target->Bytes, outputMode);
+            results[indices[position]].VirtualAddress = file.Entries[indices[position]].VirtualAddress;
             done[indices[position]] = true;
         }
     }

@@ -15,7 +15,7 @@ jobs:
   conventions:
     name: Conventions
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -26,8 +26,16 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: git fetch --no-tags origin "$HEAD_SHA"
+      - name: Fetch AnyPS5 main
+        run: git fetch --no-tags https://github.com/boykopovar/AnyPS5.git main
       - name: Check conventions with the trusted base script
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 -I tools/check_conventions.py --base "$BASE_SHA" --head "$HEAD_SHA"
+        run: |
+          upstream=$(git merge-base "$HEAD_SHA" FETCH_HEAD)
+          if git merge-base --is-ancestor "$upstream" "$BASE_SHA"; then
+            python3 -I tools/check_conventions.py --base "$BASE_SHA" --head "$HEAD_SHA"
+          else
+            python3 -I tools/check_conventions.py --base "$upstream" --head "$HEAD_SHA" --commits-base "$BASE_SHA"
+          fi

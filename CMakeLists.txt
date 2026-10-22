@@ -216,6 +216,8 @@ if(BUILD_TESTING)
         add_test(NAME conventions_duplicate_pattern COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_duplicate_pattern.py)
         set_tests_properties(conventions_duplicate_pattern PROPERTIES TIMEOUT 120)
+        add_test(NAME conventions_commits_base COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_commits_base.py)
         add_test(NAME check_compile COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_compile.py)
         add_test(NAME performance_compare COMMAND ${Python3_EXECUTABLE}

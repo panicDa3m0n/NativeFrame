@@ -4573,6 +4573,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // As for a GPU copy, storage results pending in the range reach the import first (the
             // flush is recorded ahead of the seeds, in the batch opened first); then the range slab.
             static_cast<void>(recorder->Commands());
+            const PublishSiteScope site(PublishSite::UploadCopied);
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             if (takeShadow(region, shadowKey)) {
                 gpuCopies.push_back(&region);
@@ -4609,7 +4610,10 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // an address-based shader maps are exempt (they hold every pending image, and such shaders
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
-            if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            if (!(addressable && region.hostBacked) || bdaFlush) {
+                const PublishSiteScope site(PublishSite::UploadInPlace);
+                StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            }
             // A read-only range a range slab holds whole is read from the slab instead (after the
             // flush: a storage write-back into the slab's units lands in it, one into the import
             // takes the authority of its pages, and the source is then refused).
@@ -4623,6 +4627,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
             static_cast<void>(recorder->Commands());
+            const PublishSiteScope site(PublishSite::UploadGpuCopy);
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);

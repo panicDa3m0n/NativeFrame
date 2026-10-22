@@ -740,6 +740,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto observedKeys = keys.has_value() ? *keys : scanKeys();
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
     bool stagedFlushed = false;
+    const PublishSiteScope site(PublishSite::SampledTexture);
     if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         generation = GuestMemory::CollectWrites(address, bytes);
@@ -3354,13 +3355,32 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             struct RegionsTag {};
             auto& regions = ThreadScratch<std::vector<StorageTexture::PendingQuery>, RegionsTag>();
             regions.clear();
-            for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
-            for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
+            struct BoundTag {};
+            auto& bound = ThreadScratch<std::vector<std::uint8_t>, BoundTag>();
+            bound.clear();
+            static const bool publishBound = std::getenv("APS5_PROOF_PUBLISHES_SLAB_BOUND") != nullptr;
+            for (const auto& region : directRegions) {
+                regions.push_back({region.begin, region.end, nullptr, nullptr, false});
+                bound.push_back(region.shadow && !publishBound ? 1 : 0);
+            }
+            for (const auto& [begin, end] : guestMemory.Writes()) {
+                regions.push_back({begin, end, nullptr, nullptr, false});
+                bound.push_back(!publishBound && guestMemory.ShadowBound(begin, end) ? 1 : 0);
+            }
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
-            // published by the flush, as one over a pending image is stored.
-            for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            // published by the flush, as one over a pending image is stored. One bound to a range
+            // slab reads and writes the slab: its pending images are stored (into the slab's
+            // units), its live slab bytes stay there (APS5_PROOF_PUBLISHES_SLAB_BOUND publishes them).
+            for (std::size_t index = 0; index < regions.size(); ++index) {
+                const auto& region = regions[index];
+                const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+                const PublishSiteScope site(PublishSite::ProofPending);
+                if (bound[index] != 0) {
+                    if (region.overlaps) StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region", PublishScope::None);
+                } else if (region.overlaps || AnyShadowedOverlaps(region.begin, bytes)) {
+                    StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region");
+                }
             }
         }
         // Variant C (APS5_BUFFER_SHADOW_LAZY): a range slab writer leaves its bytes live, and the
@@ -3369,6 +3389,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (BufferShadowLazy() && bufferShadowSerialSeen != shadowSerialBefore) {
             for (const auto& region : directRegions) {
                 const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+                const PublishSiteScope site(PublishSite::ProofInPlace);
                 if (!region.shadow && AnyShadowedOverlaps(region.begin, bytes)) StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region");
             }
             for (const auto& [begin, end] : guestMemory.Writes()) {
@@ -3388,6 +3409,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             importsProof = HostImportsIdentity(context);
         }
     } else {
+        const PublishSiteScope site(PublishSite::ProofDirect);
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
@@ -5282,6 +5304,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (direct && AnyShadowedOverlaps(item.address, item.size)) {
                 // Live slab or unit shadow bytes under the range: they reach the import before the
                 // draw reads it in place (a CPU snapshot would read the import's older bytes).
+                const PublishSiteScope site(PublishSite::DrawBindings);
                 StorageTexture::PublishShadowsOnly(item.address, item.size, PublishScope::Whole, "imported buffer region");
                 if (profiled) noteInPlaceSkip(InPlaceSkip::PendingWriter, item.size);
                 continue;

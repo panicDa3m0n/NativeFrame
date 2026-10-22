@@ -52,6 +52,16 @@ enum class PublishScope : std::uint8_t { None, Whole, PartialUnits };
 enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, CopyDestination, Fill, FillClear, Label, Keys, Scanout, Validate, Upload, TailMip, Evict, Retire, Teardown, Rehome, Border, Writer, Address, Count };
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
+// The caller a publish comes from, counted beside its reason in the shadow report ("by site").
+enum class PublishSite : std::uint8_t { Other, UploadCopied, UploadInPlace, UploadGpuCopy, SampledTexture, ProofPending, ProofInPlace, ProofDirect, DrawBindings, Count };
+// Names the calling thread's publish site while it lives.
+struct PublishSiteScope {
+    explicit PublishSiteScope(PublishSite site);
+    PublishSiteScope(const PublishSiteScope&) = delete;
+    PublishSiteScope& operator=(const PublishSiteScope&) = delete;
+    ~PublishSiteScope();
+    PublishSite previous;
+};
 
 struct ShadowSlab {
     ShadowSlab(const Context& context, VkBuffer buffer, VkDeviceMemory memory, std::uint64_t firstUnit, std::uint32_t units);

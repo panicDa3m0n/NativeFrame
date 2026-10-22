@@ -63,6 +63,8 @@
 //     under it into the import before its descriptors read it; the rest stays live for its table;
 //   ScrittoreAssorbito: a writer whose slab a later upload grows over before the writer's work is
 //     marked keeps its bytes (they reach the slab that holds the units now);
+//   ScrittoreRiusatoTiene: a reused build writing a range it binds to a range slab keeps the slab's
+//     live bytes there (its proof publishes none of them);
 //   RitiroPubblica: an import retired while its range stays registered publishes the live bytes;
 //   --evict: an evicted slab publishes its live bytes.
 
@@ -388,8 +390,8 @@ int RunCases(const Context& context, Recorder& recorder, WatchedBlock& watched, 
     return 0;
 }
 
-// A compute build reading [element, element + bytes) through one read-only element.
-std::shared_ptr<ShaderResources> ReaderBuild(const Context& context, std::uint64_t element, std::size_t bytes, ShaderRecompiler::RecompileResult& program) {
+// A compute build reading [element, element + bytes) through one element, or writing it.
+std::shared_ptr<ShaderResources> BufferBuild(const Context& context, std::uint64_t element, std::size_t bytes, ShaderRecompiler::RecompileResult& program, bool written) {
     ShaderRecompiler::DescriptorBinding binding;
     binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
     binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
@@ -397,10 +399,14 @@ std::shared_ptr<ShaderResources> ReaderBuild(const Context& context, std::uint64
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(bytes), 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.bufferWritten = {written};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     return std::make_shared<ShaderResources>(context, compute);
+}
+
+std::shared_ptr<ShaderResources> ReaderBuild(const Context& context, std::uint64_t element, std::size_t bytes, ShaderRecompiler::RecompileResult& program) {
+    return BufferBuild(context, element, bytes, program, false);
 }
 
 int RunLazy(const Context& context, Recorder& recorder, WatchedBlock& watched, const HostImport& import) {
@@ -462,6 +468,25 @@ int RunLazy(const Context& context, Recorder& recorder, WatchedBlock& watched, c
         Require(Holds(bytes + Unit + RegionBytes - Page / 2, Page / 2, 0x7c), "the draw's bindings did not publish the live bytes they read in place");
     }
     reader.reset();
+
+    // ScrittoreRiusatoTiene (O20.T6): a compute build writing region E, used once and then proved for
+    // its reuse; the units its use left live are the ones its reuse writes again in the same slab.
+    {
+        const auto e = address + (4u << 20u);
+        ShaderRecompiler::RecompileResult writerProgram;
+        auto writer = BufferBuild(context, e, RegionBytes, writerProgram, true);
+        writer->MarkGpuWrites(recorder);
+        uses.Settle();
+        Require(AnyShadowedOverlaps(e, RegionBytes), "the writer build's use left no live bytes in a range slab");
+        const CompiledShader writerCompute{ShaderRecompiler::ShaderStage::Compute, &writerProgram, 0};
+        Require(writer->Revalidate(std::span(&writerCompute, 1), nullptr), "the writer build was not reusable");
+        Require(AnyShadowedOverlaps(e, RegionBytes), "the reused writer build's proof published the live bytes of the slab it binds");
+        writer->MarkGpuWrites(recorder);
+        uses.Settle();
+        writer.reset();
+        PublishRangeSlabs(context, PublishReason::Address);
+        uses.Settle();
+    }
 
     // LettorePerIndirizzo: a build reading through BDA tables maps the imports, never the slabs, so
     // its use publishes every live range slab first (PublishRangeSlabs, the Address reason).

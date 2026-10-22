@@ -48,6 +48,9 @@ std::atomic<std::int64_t> tracePublishesLeft{[] {
     return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
 }()};
 std::atomic<std::int64_t> traceSeedsLeft{64};
+thread_local PublishSite publishSite = PublishSite::Other;
+constexpr std::size_t SiteCount = static_cast<std::size_t>(PublishSite::Count);
+constexpr const char* SiteNames[SiteCount] = {"other", "upload-copied", "upload-in-place", "upload-gpu-copy", "sampled-texture", "proof-pending", "proof-in-place", "proof-direct", "draw-bindings"};
 std::atomic<std::uint64_t> bufferShadowSerial{1};
 
 void bumpBufferShadowSerial() {
@@ -66,6 +69,7 @@ struct Statistics {
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
     std::atomic<std::uint64_t> rangeMade{0}, rangeGrown{0}, rangeRefused{0}, rangeRehomed{0};
     std::atomic<std::uint64_t> strandedMoved{0}, strandedPublished{0};
+    std::array<std::atomic<std::uint64_t>, SiteCount> sitePublished{}, sitePublishedBytes{};
 };
 
 Statistics& Stats() {
@@ -526,9 +530,11 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
+    Stats().sitePublished[static_cast<std::size_t>(publishSite)].fetch_add(1, std::memory_order_relaxed);
+    Stats().sitePublishedBytes[static_cast<std::size_t>(publishSite)].fetch_add(bytes, std::memory_order_relaxed);
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
         const auto packet = GuestMemory::CurrentPacket();
-        std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
+        std::fprintf(stderr, "[shadow] publish %s (%s): 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], SiteNames[static_cast<std::size_t>(publishSite)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     recordCopies(*shadow, copies, ranges, bytes);
     if (ShadowVerify()) verifyPublished(*shadow, copies);
@@ -957,6 +963,14 @@ void NoteShadowSeed(std::uint64_t begin, std::uint64_t end) {
     Stats().seeds.fetch_add(1, std::memory_order_relaxed);
     Stats().seedBytes.fetch_add(end - begin, std::memory_order_relaxed);
     if (traceSeedsLeft.load(std::memory_order_relaxed) > 0 && traceSeedsLeft.fetch_sub(1, std::memory_order_relaxed) > 0) std::fprintf(stderr, "[shadow] seed 0x%llx+0x%llx from the import\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+}
+
+PublishSiteScope::PublishSiteScope(PublishSite site) : previous(publishSite) {
+    publishSite = site;
+}
+
+PublishSiteScope::~PublishSiteScope() {
+    publishSite = previous;
 }
 
 PublishReason PublishReasonFor(const char* flushReason) {
@@ -1720,13 +1734,13 @@ std::string ShadowReport() {
     auto& statistics = Stats();
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto mib = [](unsigned long long bytes) { return bytes / 1048576.0; };
-    char text[256];
+    char text[1024];
     std::string line;
     if (!UnitShadowEnabled()) return "; shadow: off";
     std::snprintf(text, sizeof(text), "; shadow: retiled %llu/%.1f (refused %llu/%.1f to import), seeds %llu/%.1f, detiled from shadow %llu/%.1f, from import %llu/%.1f, tail publishes %llu, published", take(statistics.retiled), mib(take(statistics.retiledBytes)), take(statistics.refused), mib(take(statistics.refusedBytes)), take(statistics.seeds), mib(take(statistics.seedBytes)), take(statistics.detiledShadow), mib(take(statistics.detiledShadowBytes)), take(statistics.detiledImport), mib(take(statistics.detiledImportBytes)), take(statistics.tailPublishes));
     line += text;
     unsigned long long publishedTotal = 0, publishedBytesTotal = 0;
-    std::string reasons;
+    std::string reasons, sites;
     for (std::size_t i = 0; i < ReasonCount; ++i) {
         const auto count = take(statistics.published[i]);
         const auto bytes = take(statistics.publishedBytes[i]);
@@ -1735,6 +1749,13 @@ std::string ShadowReport() {
         if (count == 0) continue;
         std::snprintf(text, sizeof(text), " %s %llu/%.1f", ReasonNames[i], count, mib(bytes));
         reasons += text;
+    }
+    for (std::size_t i = 0; i < SiteCount; ++i) {
+        const auto count = take(statistics.sitePublished[i]);
+        const auto bytes = take(statistics.sitePublishedBytes[i]);
+        if (count == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f", SiteNames[i], count, mib(bytes));
+        sites += text;
     }
     const auto cpuDropped = take(statistics.staleDroppedCpu), driverDropped = take(statistics.staleDroppedDriver);
     unsigned long long liveSlabs = 0, liveBytes = 0, peakBytes = 0, retired = 0, rangeSlabs = 0;
@@ -1749,7 +1770,7 @@ std::string ShadowReport() {
             for (const auto& range : shadow->ranges) rangeSlabs += range.slab != nullptr ? 1u : 0u;
         }
     }
-    std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
+    std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s } by site {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), sites.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
     line += text;
     if (RangeSlabsEnabled()) {
         std::snprintf(text, sizeof(text), ", range slabs %llu live (made %llu, grown %llu, refused %llu, grid units rehomed %llu, stranded units moved %llu, published %llu)", rangeSlabs, take(statistics.rangeMade), take(statistics.rangeGrown), take(statistics.rangeRefused), take(statistics.rangeRehomed), take(statistics.strandedMoved), take(statistics.strandedPublished));

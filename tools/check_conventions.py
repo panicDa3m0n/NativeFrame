@@ -379,6 +379,8 @@ class Check:
     def pull_request(self, title, body):
         if not CONVENTIONAL.match(title):
             self.report("pr-title", "", 0, title)
+        if body is None:
+            return
         body = re.sub(r"<!--.*?-->", "", body or "", flags=re.S)
         sections = dict(zip(SECTION.findall(body), SECTION.split(body)[2::2]))
         for name in ("What", "Tested", "Checklist"):
@@ -391,6 +393,11 @@ class Check:
             self.report("pr-template", "", 0, "answer AI-assisted with yes or no")
         if checklist and not re.search(r"Depends on:\s*(?:[-*+]\s+)?(#\d+|none)\b", checklist, re.I):
             self.report("pr-template", "", 0, "fill Depends on with #N or none")
+
+
+def dependabot(pr):
+    user = pr.get("user") or {}
+    return user.get("login") == "dependabot[bot]" and user.get("type") == "Bot"
 
 
 def utf8(data):
@@ -537,7 +544,7 @@ def allowed_notes(path):
         return path == "AGENTS.md"
     if p.suffix.lower() not in NOTES:
         return None
-    return path in ("README.md", "CONTRIBUTING.md") or p.parts[0] == ".github" or p.parts[:2] in (("docs", "dev"), ("docs", "user"))
+    return path in ("README.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md") or p.parts[0] == ".github" or p.parts[:2] in (("docs", "dev"), ("docs", "user"), ("docs", "research"))
 
 
 def python_comments(text):
@@ -633,7 +640,7 @@ if __name__ == "__main__":
     check.env_reference()
     pr = json.load(open(args.event, encoding="utf-8")).get("pull_request") if args.event else None
     if pr:
-        check.pull_request(pr["title"], pr["body"])
+        check.pull_request(pr["title"], None if dependabot(pr) else pr["body"])
     elif args.title is not None or args.body:
         check.pull_request(args.title or "", open(args.body, encoding="utf-8-sig").read() if args.body else "")
     raise SystemExit(output(check, os.environ.get("GITHUB_REPOSITORY", "boykopovar/AnyPS5")))

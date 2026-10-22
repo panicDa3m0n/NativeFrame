@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -242,15 +243,20 @@ bool RecorderAlive(std::uint64_t id) {
 }
 
 // Completion actions in progress on this thread (finish()): a pending-write sync the flush hook
-// makes from inside one (a copied buffer's write-back store) is skipped, see SyncThrough.
-thread_local int completionDepth = 0;
+// makes from inside one (a copied buffer's write-back store) is skipped, see SyncThrough. A host
+// thread-local (one FLS slot), not thread_local: MinGW's emulated TLS costs a lock per access, and
+// every proof asks it.
+struct CompletionDepthTag {};
+int& completionDepth() {
+    return HostThreadLocal<int, CompletionDepthTag>();
+}
 // This thread's hook syncs that waited for an unsignaled target (Recorder::ThreadHookWaits).
 thread_local std::uint64_t hookRealWaits = 0;
 
 }
 
 bool Recorder::InCompletion() {
-    return completionDepth != 0;
+    return completionDepth() != 0;
 }
 
 namespace {
@@ -1017,6 +1023,7 @@ private:
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
+    if (BufferShadowProbe()) ProbeBufferRead(ProbeReader::Hook, address, bytes);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from
@@ -1025,7 +1032,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // rest of this one's, and this queue's queued label follows every batch of its own in flight
     // anyway, so the write-back landing first is the order the hardware gives.
     if (!QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes)) {
-        if (completionDepth != 0 && HookCompletionGuard()) {
+        if (completionDepth() != 0 && HookCompletionGuard()) {
             queuedLabelHookInCompletion.fetch_add(1, std::memory_order_relaxed);
         } else if (auto* record = queuedLabelRecorder.load(std::memory_order_acquire); record != nullptr) {
             queuedLabelHookRecords.fetch_add(1, std::memory_order_relaxed);
@@ -1048,7 +1055,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // (its own stamp makes the others stale). Inside a completion action a store has no publish
     // recorded: the batch is not waited for, and the copy would land over the store later.
     const auto site = GuestMemory::CurrentReadSite();
-    const auto scope = site != GuestMemory::ReadSite::Store ? PublishScope::Whole : completionDepth != 0 ? PublishScope::None : PublishScope::PartialUnits;
+    const auto scope = site != GuestMemory::ReadSite::Store ? PublishScope::Whole : completionDepth() != 0 ? PublishScope::None : PublishScope::PartialUnits;
     bool published = false;
     // The classification is made before the store (the store changes what it measures); profile only.
     StorageTexture::AccessClassification classification{};
@@ -1079,7 +1086,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
-            if (HookFullSync() || completionDepth != 0) recorder->Sync();
+            if (HookFullSync() || completionDepth() != 0) recorder->Sync();
             else recorder->SyncThrough(address, bytes, true);
         }
     }
@@ -1448,24 +1455,63 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+namespace {
+
+// The [gputime] line's pass starts (O17.T2): why a draw began a render pass instead of continuing
+// the open one, and the PM4 opcode being committed when other work ended an open pass.
+enum class PassStart : std::size_t { Continued, Closed, Forced, Samples, Key, Hazard, Count };
+constexpr const char* PassStartNames[] = {"continued", "closed", "forced", "samples", "key", "hazard"};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PassStart::Count)> passStarts{};
+std::array<std::atomic<std::uint64_t>, 256> passClosesByOpcode{};
+// The timed work (its class key) that ended an open pass (BeginGpuTiming on an open pass).
+std::array<std::atomic<std::uint64_t>, 64> passClosesByClass{};
+std::atomic<std::uint64_t> passClosesByProgram{0};
+thread_local bool startingDrawPass = false;
+// An open pass other work ended: charged to the next timed range begun before the next draw's pass
+// (the work that needed the pass ended), else counted as untimed.
+thread_local bool pendingPassClose = false;
+std::atomic<std::uint64_t> passClosesUntimed{0};
+void notePassStart(PassStart reason) {
+    if (Recorder::GpuTimingEnabled()) passStarts[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        notePassStart(!pass.open ? PassStart::Closed : forced ? PassStart::Forced : PassStart::Samples);
+        if (pendingPassClose) {
+            pendingPassClose = false;
+            passClosesUntimed.fetch_add(1, std::memory_order_relaxed);
+        }
+        startingDrawPass = true;
         const auto commands = Commands();
+        startingDrawPass = false;
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        notePassStart(PassStart::Continued);
+        return {open->commands, true, false};
+    }
+    notePassStart(pass.key != key ? PassStart::Key : PassStart::Hazard);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    startingDrawPass = true;
     endOpenRenderPass(!merge);
+    startingDrawPass = false;
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide};
+}
+
+bool Recorder::RenderPassOpen() const {
+    return open != nullptr && open->renderPass.open;
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -1487,6 +1533,10 @@ void Recorder::SealPassWriteOnly() {
 
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    if (!startingDrawPass && GpuTimingEnabled()) {
+        passClosesByOpcode[GuestMemory::CurrentPacket().opcode & 0xffu].fetch_add(1, std::memory_order_relaxed);
+        pendingPassClose = true;
+    }
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
@@ -1835,6 +1885,20 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+// The frame map (TagGpuTiming, NoteDrawPlacement, NoteProgramPlacement), per pass tag or program.
+struct PlacementTotals {
+    std::uint64_t ranges = 0;
+    double ms = 0;
+    std::uint64_t uses = 0;
+    std::uint64_t addressBased = 0;
+    std::uint64_t hostBytes = 0;
+    std::uint64_t deviceBytes = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+};
+std::map<std::uint64_t, PlacementTotals> placementByPass;
+std::map<std::uint64_t, PlacementTotals> placementByProgram;
+std::map<std::uint64_t, TimingTotals> timingByDrawProgram;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -1982,6 +2046,11 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
+    if (pendingPassClose || (open != nullptr && open->renderPass.open && !startingDrawPass)) {
+        pendingPassClose = false;
+        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) passClosesByClass[static_cast<std::size_t>(key - ClassKey(CommandClass::DispatchLeading)) & 63u].fetch_add(1, std::memory_order_relaxed);
+        else passClosesByProgram.fetch_add(1, std::memory_order_relaxed);
+    }
     Commands();
     return beginTiming(key);
 }
@@ -2013,6 +2082,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedTags.push_back(0);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2023,6 +2093,42 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+bool Recorder::DrawTimingEnabled() {
+    static const bool enabled = GpuTimingEnabled() && std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    return enabled;
+}
+
+std::uint32_t Recorder::BeginDrawTiming(std::uint64_t key) {
+    if (!DrawTimingEnabled() || open == nullptr || open->commands == VK_NULL_HANDLE) return NoTiming;
+    return beginTiming(DrawProgramKeyBit | key);
+}
+
+void Recorder::TagGpuTiming(std::uint32_t index, std::uint64_t tag) {
+    if (index == NoTiming || open == nullptr || index >= open->timedTags.size()) return;
+    open->timedTags[index] = tag;
+}
+
+void Recorder::NoteDrawPlacement(std::uint64_t tag, std::uint32_t width, std::uint32_t height, std::uint64_t hostBytes, std::uint64_t deviceBytes) {
+    if (!GpuTimingEnabled()) return;
+    std::lock_guard lock(timingMutex);
+    auto& totals = placementByPass[tag];
+    ++totals.uses;
+    totals.hostBytes += hostBytes;
+    totals.deviceBytes += deviceBytes;
+    totals.width = width;
+    totals.height = height;
+}
+
+void Recorder::NoteProgramPlacement(std::uint64_t program, std::uint64_t hostBytes, std::uint64_t deviceBytes, bool addressBased) {
+    if (!GpuTimingEnabled()) return;
+    std::lock_guard lock(timingMutex);
+    auto& totals = placementByProgram[program];
+    ++totals.uses;
+    if (addressBased) ++totals.addressBased;
+    totals.hostBytes += hostBytes;
+    totals.deviceBytes += deviceBytes;
 }
 
 void Recorder::CountSamples() {
@@ -2496,11 +2602,23 @@ void Recorder::readGpuTiming(Batch& batch) {
             continue;
         }
         const auto key = batch.timedKeys[i];
+        if ((key & DrawProgramKeyBit) != 0) {
+            // A draw's own range lies inside its pass's: apart from the classes and the union.
+            auto& totals = timingByDrawProgram[key & ~DrawProgramKeyBit];
+            ++totals.count;
+            totals.ms += ns / 1e6;
+            continue;
+        }
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId);
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
+        if (key == ClassKey(CommandClass::Draw) && i < batch.timedTags.size()) {
+            auto& pass = placementByPass[batch.timedTags[i]];
+            ++pass.ranges;
+            pass.ms += ns / 1e6;
+        }
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
@@ -2532,9 +2650,73 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
-    AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    const auto mibPerPresent = [&](std::uint64_t bytes) { return static_cast<double>(bytes) / 1048576.0 * perPresent; };
+    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) {
+        AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+        if (const auto found = placementByProgram.find(hot[i].first); found != placementByProgram.end() && found->second.uses != 0) {
+            const auto& place = found->second;
+            AgcDriver::ProfilePrint_nid_no_patch(" (bus %.1f vram %.1f MiB per present%s)", mibPerPresent(place.hostBytes), mibPerPresent(place.deviceBytes), place.addressBased != 0 ? ", address-based" : "");
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("; by class:%s", classes.c_str());
+    // The draw class by pass: its ranges' time (a continued draw lies inside its pass's range),
+    // and per present the draws and the bytes they bind in guest memory (bus) and in device memory.
+    std::vector<std::pair<std::uint64_t, PlacementTotals>> passes(placementByPass.begin(), placementByPass.end());
+    std::sort(passes.begin(), passes.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    double passMs = 0, drawMs = 0;
+    std::uint64_t passBus = 0, passDevice = 0;
+    for (const auto& [tag, place] : passes) {
+        passMs += place.ms;
+        passBus += place.hostBytes;
+        passDevice += place.deviceBytes;
+    }
+    if (const auto found = timingByKey.find(ClassKey(CommandClass::Draw)); found != timingByKey.end()) drawMs = found->second.ms;
+    AgcDriver::ProfilePrint_nid_no_patch("; draw passes: %zu targets, %.0f ms of the draw class's %.0f ms, bus %.1f vram %.1f MiB per present:", passes.size(), passMs, drawMs, mibPerPresent(passBus), mibPerPresent(passDevice));
+    for (std::size_t i = 0; i < passes.size() && i < 12; ++i) {
+        const auto& [tag, place] = passes[i];
+        AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx %ux%u x%llu %.0fms (%.1f draws, bus %.1f vram %.1f MiB per present)", static_cast<unsigned long long>(tag), place.width, place.height, static_cast<unsigned long long>(place.ranges), place.ms, static_cast<double>(place.uses) * perPresent, mibPerPresent(place.hostBytes), mibPerPresent(place.deviceBytes));
+    }
+    if (!timingByDrawProgram.empty()) {
+        std::vector<std::pair<std::uint64_t, TimingTotals>> drawPrograms(timingByDrawProgram.begin(), timingByDrawProgram.end());
+        std::sort(drawPrograms.begin(), drawPrograms.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        double drawProgramMs = 0;
+        for (const auto& [program, totals] : drawPrograms) drawProgramMs += totals.ms;
+        AgcDriver::ProfilePrint_nid_no_patch("; draw programs: %zu variants, %.0f ms inside the passes:", drawPrograms.size(), drawProgramMs);
+        for (std::size_t i = 0; i < drawPrograms.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(drawPrograms[i].first), static_cast<unsigned long long>(drawPrograms[i].second.count), drawPrograms[i].second.ms);
+        timingByDrawProgram.clear();
+    }
+    {
+        std::string starts;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(PassStart::Count); ++i) {
+            char text[48];
+            std::snprintf(text, sizeof(text), " %s %llu", PassStartNames[i], static_cast<unsigned long long>(passStarts[i].exchange(0, std::memory_order_relaxed)));
+            starts += text;
+        }
+        std::vector<std::pair<std::uint64_t, unsigned>> closers;
+        for (unsigned opcode = 0; opcode < 256; ++opcode) {
+            if (const auto count = passClosesByOpcode[opcode].exchange(0, std::memory_order_relaxed); count != 0) closers.emplace_back(count, opcode);
+        }
+        std::sort(closers.rbegin(), closers.rend());
+        std::string by;
+        for (std::size_t i = 0; i < closers.size() && i < 8; ++i) {
+            char text[32];
+            std::snprintf(text, sizeof(text), " 0x%02x:%llu", closers[i].second, static_cast<unsigned long long>(closers[i].first));
+            by += text;
+        }
+        std::string classes;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(CommandClass::Count) - static_cast<std::size_t>(CommandClass::DispatchLeading) && i < 64; ++i) {
+            if (const auto count = passClosesByClass[i].exchange(0, std::memory_order_relaxed); count != 0) {
+                char text[64];
+                std::snprintf(text, sizeof(text), " %s:%llu", CommandClassNames[i], static_cast<unsigned long long>(count));
+                classes += text;
+            }
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("; pass starts:%s; passes ended by other work, by opcode:%s; by the timed work after them:%s program:%llu untimed:%llu", starts.c_str(), by.c_str(), classes.c_str(), static_cast<unsigned long long>(passClosesByProgram.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(passClosesUntimed.exchange(0, std::memory_order_relaxed)));
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("\n");
     timingByKey.clear();
+    placementByPass.clear();
+    placementByProgram.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
     lock.unlock();
@@ -2713,6 +2895,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         spanned += to - from;
     }
     equal.assign(spans.size(), 0);
+    const ProbeHostRead probeRead(address, bytes);
     if (compared) CompareSpans(spans, equal);
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;
@@ -3609,7 +3792,7 @@ void Recorder::FlushDeferredReleases() {
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
     const auto end = address + bytes;
-    if (completionDepth != 0 && !CompletionStoreSyncs()) {
+    if (completionDepth() != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::
         // WriteBack) reached the flush hook, and a batch still in flight notes the range. Every
         // batch in flight now was recorded after the completing one (finish runs front to back),
@@ -3625,8 +3808,8 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         ++holdCounters.completionSyncsSkipped;
         return;
     }
-    if (completionDepth != 0) ++holdCounters.completionSyncsWaited;
-    const auto completionWaitStart = completionDepth != 0 && DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (completionDepth() != 0) ++holdCounters.completionSyncsWaited;
+    const auto completionWaitStart = completionDepth() != 0 && DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct CompletionWait {
         std::chrono::steady_clock::time_point start;
         ~CompletionWait() {
@@ -3639,7 +3822,7 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         const void* site = announcedSite != nullptr ? announcedSite : __builtin_return_address(0);
         if (syncThroughUnlocked(address, end, source, site)) return;
         // A completion-store wait (kill switch above) is already counted as 'waited'.
-        if (completionDepth == 0) ++holdCounters.hookLockedWaits;
+        if (completionDepth() == 0) ++holdCounters.hookLockedWaits;
     }
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
         // The announced site (or this call's caller) names the sync, not this function.
@@ -3980,8 +4163,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
         struct InCompletion {
-            InCompletion() { ++completionDepth; }
-            ~InCompletion() { --completionDepth; }
+            InCompletion() { ++completionDepth(); }
+            ~InCompletion() { --completionDepth(); }
         } inCompletion;
         for (auto& action : batch->completions) {
             try {

@@ -25,7 +25,7 @@ public:
     using Commit = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
-    enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, Count };
+    enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, SubmitInterrupt, SubmitDeadline, SubmitCap, Count };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();

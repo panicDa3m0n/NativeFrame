@@ -4107,6 +4107,189 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// O16.T16 (APS5_RANGE_SLABS): range slabs of the unit shadow. A writer into a range slab is recorded
+// as a buffer writer records it: its seeds from the import, its bytes, its own stamp (MarkWritten),
+// then MarkShadowed at the generation taken after the stamp.
+bool rangeSlabTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::uint64_t page = 4096;
+    constexpr std::size_t bytes = (17u << 20u);
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the range slab test block refused: range slabs not tested\n";
+        return false;
+    }
+    if (!Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: range slabs not tested\n";
+        return false;
+    }
+    Require(import->base == address && import->bytes == bytes, "the import does not cover the block");
+    CollectWritesUncached(address, bytes);
+    if (!RangeSlabsEnabled()) {
+        Require(!RangeShadowDestination(context, *import, address + unit, address + 2 * unit).has_value(), "range slabs are off but a range destination was offered");
+        Require(SlabBoundary(*import, address) == address + 128 * unit, "range slabs are off but the grid boundary moved");
+        std::cout << "range slabs off (APS5_RANGE_SLABS unset): RangeShadowDestination inert\n";
+        return true;
+    }
+    const auto* words = static_cast<const std::uint8_t*>(block);
+    auto* bytesOut = static_cast<volatile std::uint8_t*>(block);
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto write = [&](const ShadowDestination& destination, std::uint64_t begin, std::uint64_t length, std::uint8_t value) {
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(length), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination.slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (const auto& [seedBegin, seedEnd] : destination.seedUnits) {
+            const VkBufferCopy seed{HostImportOffset(*import, seedBegin), SlabOffset(*import, *destination.slab, seedBegin), seedEnd - seedBegin};
+            copyBuffer(commands, import->buffer, destination.buffer, 1, &seed);
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, SlabOffset(*import, *destination.slab, begin), length};
+        copyBuffer(commands, pattern->Handle(), destination.buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        MarkWritten(begin, static_cast<std::size_t>(length));
+        const ShadowedRange range{begin, begin + length, destination.slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    };
+
+    // SlabIntervallo12MiB: 12 MiB from unit 3 + 100 bytes, across the grid boundary at unit 128,
+    // lands in one slab of units 3..195 at the range's own offset, seeded whole, read from that
+    // slab and published exactly.
+    const auto twelveBegin = address + 3 * unit + 100;
+    constexpr std::uint64_t twelveBytes = 12u << 20u;
+    const auto twelveEnd = twelveBegin + twelveBytes;
+    auto twelve = RangeShadowDestination(context, *import, twelveBegin, twelveEnd);
+    Require(twelve.has_value(), "a 12 MiB range across a grid slab boundary got no range destination");
+    Require(twelve->slab->firstUnit == 3 && twelve->slab->units == 193, "the 12 MiB range slab does not cover exactly units 3..195");
+    Require(twelve->offset == 100 && twelve->offset == SlabOffset(*import, *twelve->slab, twelveBegin), "the 12 MiB range's offset in its slab is wrong");
+    Require(twelve->seedUnits.size() == 1 && twelve->seedUnits[0].first == twelveBegin && twelve->seedUnits[0].second == twelveEnd, "a new range slab does not seed the whole range");
+    Require(SlabBoundary(*import, twelveBegin) == address + 196 * unit && SlabBoundary(*import, address + 150 * unit) == address + 196 * unit, "the slab boundary inside a range slab is not its end");
+    Require(SlabBoundary(*import, address) == address + 3 * unit && SlabBoundary(*import, address + 196 * unit) == address + 256 * unit, "a grid unit's boundary does not stop at the range slab");
+    Require(!ShadowDestinationFor(context, *import, address + 2 * unit, address + 4 * unit).has_value(), "a grid piece reaching into a range slab was accepted");
+    write(*twelve, twelveBegin, twelveBytes, 0x5a);
+    {
+        const std::pair<std::uint64_t, std::uint64_t> run{3 * unit, 196 * unit};
+        const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {});
+        Require(sources.size() == 3, "the 12 MiB range does not read as import, slab, import (" + std::to_string(sources.size()) + " pieces)");
+        Require(!sources[0].shadow && sources[0].begin == 3 * unit && sources[0].end == 3 * unit + 100, "the bytes before the 12 MiB range do not read the import");
+        Require(sources[1].shadow && sources[1].begin == 3 * unit + 100 && sources[1].end == twelveEnd - address && sources[1].slab == twelve->slab && sources[1].offset == 100, "the 12 MiB range does not read its slab");
+        Require(!sources[2].shadow && sources[2].begin == twelveEnd - address && sources[2].end == 196 * unit, "the bytes after the 12 MiB range do not read the import");
+    }
+    Require(PublishShadow(twelveBegin, static_cast<std::size_t>(twelveBytes), PublishScope::Whole, PublishReason::Hook) == 193, "the 12 MiB publish did not copy its 193 units");
+    recorder.Sync();
+    Require(words[3 * unit + 99] == 0x11 && words[3 * unit + 100] == 0x5a && words[128 * unit] == 0x5a && words[twelveEnd - address - 1] == 0x5a && words[twelveEnd - address] == 0x11, "the published 12 MiB range is wrong");
+
+    // ProprietarioUnico: a second range reaching past a range slab makes one slab over both; the
+    // first range's bytes move with it, and every unit keeps one owner.
+    auto first = RangeShadowDestination(context, *import, address + 200 * unit, address + 204 * unit);
+    Require(first.has_value() && first->slab->firstUnit == 200 && first->slab->units == 4, "the first range slab does not cover units 200..203");
+    write(*first, address + 200 * unit, 4 * unit, 0x6b);
+    auto second = RangeShadowDestination(context, *import, address + 202 * unit + 50, address + 208 * unit);
+    Require(second.has_value() && second->slab != first->slab && second->slab->firstUnit == 200 && second->slab->units == 8, "an overlapping range did not grow one slab over both");
+    Require(second->offset == 2 * unit + 50, "the overlapping range's offset in the grown slab is wrong");
+    Require(second->seedUnits.size() == 1 && second->seedUnits[0].first == address + 204 * unit && second->seedUnits[0].second == address + 208 * unit, "the grown slab seeds bytes the first range wrote");
+    write(*second, address + 202 * unit + 50, 6 * unit - 50, 0x7c);
+    {
+        auto grid = ShadowDestinationFor(context, *import, address + 201 * unit, address + 202 * unit);
+        Require(grid.has_value() && grid->slab == second->slab && grid->seedUnits.empty(), "a write-back over a unit of the grown slab lands elsewhere");
+    }
+    Require(PublishShadow(address + 200 * unit, static_cast<std::size_t>(8 * unit), PublishScope::Whole, PublishReason::Hook) == 8, "the grown slab's publish did not copy its 8 units");
+    recorder.Sync();
+    Require(words[200 * unit] == 0x6b && words[202 * unit + 49] == 0x6b, "the first range's bytes did not move into the grown slab");
+    Require(words[202 * unit + 50] == 0x7c && words[208 * unit - 1] == 0x7c && words[208 * unit] == 0x11, "the second range's bytes are wrong");
+
+    // PaginaCpu: a CPU store on page 3 of a unit the GPU wrote whole takes that page only; the other
+    // 15 pages still read the slab.
+    const auto cpuUnit = address + 220 * unit;
+    auto whole = RangeShadowDestination(context, *import, cpuUnit, cpuUnit + unit);
+    Require(whole.has_value(), "the whole-unit range got no destination");
+    write(*whole, cpuUnit, unit, 0x77);
+    bytesOut[220 * unit + 3 * page + 10] = 0x99;
+    CollectWritesUncached(cpuUnit, unit);
+    {
+        const std::pair<std::uint64_t, std::uint64_t> run{220 * unit, 221 * unit};
+        const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {});
+        Require(sources.size() == 3, "a CPU store on one page does not split the unit at that page (" + std::to_string(sources.size()) + " pieces)");
+        Require(sources[0].shadow && sources[0].end == 220 * unit + 3 * page && !sources[1].shadow && sources[1].begin == 220 * unit + 3 * page && sources[1].end == 220 * unit + 4 * page && sources[2].shadow && sources[2].begin == 220 * unit + 4 * page && sources[2].end == 221 * unit, "the CPU's page does not read the import, or the other pages do not read the slab");
+    }
+    Require(PublishShadow(cpuUnit, unit, PublishScope::Whole, PublishReason::Hook) == 1, "the unit with a CPU page did not publish its other pages");
+    recorder.Sync();
+    Require(words[220 * unit] == 0x77 && words[220 * unit + 3 * page - 1] == 0x77 && words[220 * unit + 4 * page] == 0x77 && words[221 * unit - 1] == 0x77, "the slab pages were not published");
+    Require(words[220 * unit + 3 * page + 10] == 0x99 && words[220 * unit + 3 * page] == 0x11, "the publish overwrote the CPU's page");
+
+    // PubblicaSoloScritto: a CPU byte before the range on its first page (stored before the
+    // writer, so the page stays the slab's) survives the publish, which copies only the range.
+    const auto exactBegin = address + 230 * unit + 100;
+    const auto exactEnd = address + 230 * unit + 3 * page + 50;
+    bytesOut[230 * unit + 50] = 0x55;
+    CollectWritesUncached(address + 230 * unit, unit);
+    auto exact = RangeShadowDestination(context, *import, exactBegin, exactEnd);
+    Require(exact.has_value(), "the unaligned range got no destination");
+    write(*exact, exactBegin, exactEnd - exactBegin, 0x66);
+    Require(PublishShadow(exactBegin, static_cast<std::size_t>(exactEnd - exactBegin), PublishScope::Whole, PublishReason::Hook) == 1, "the unaligned range was not published");
+    recorder.Sync();
+    Require(words[230 * unit + 100] == 0x66 && words[230 * unit + 3 * page + 49] == 0x66, "the unaligned range's bytes are wrong");
+    Require(words[230 * unit + 50] == 0x55 && words[230 * unit + 99] == 0x11 && words[230 * unit + 3 * page + 50] == 0x11, "the publish copied bytes outside the written range");
+
+    // PagineDiBordo: the first page of a range that shares bytes with its neighbours is published
+    // at once; a later CPU store on a neighbour byte then takes the page from the slab, but the
+    // import already holds the GPU's bytes.
+    const auto borderBegin = address + 240 * unit + 100;
+    const auto borderEnd = address + 240 * unit + 2 * page;
+    auto border = RangeShadowDestination(context, *import, borderBegin, borderEnd);
+    Require(border.has_value(), "the border range got no destination");
+    write(*border, borderBegin, borderEnd - borderBegin, 0x44);
+    {
+        const ShadowedRange range{borderBegin, borderEnd, border->slab};
+        Require(PublishShadowBorders(*import, std::span(&range, 1)) == 1, "the border page was not published at once");
+    }
+    recorder.Sync();
+    Require(words[240 * unit + 100] == 0x44 && words[240 * unit + page - 1] == 0x44 && words[240 * unit + 99] == 0x11, "the border page's bytes are wrong");
+    Require(words[240 * unit + page] == 0x11, "an interior page was published with the border");
+    Require(AnyShadowedOverlaps(borderBegin, 1), "the border publish took the unit's freshness");
+    bytesOut[240 * unit + 50] = 0x55;
+    CollectWritesUncached(address + 240 * unit, unit);
+    Require(PublishShadow(borderBegin, static_cast<std::size_t>(borderEnd - borderBegin), PublishScope::Whole, PublishReason::Hook) == 1, "the border range's interior page was not published");
+    recorder.Sync();
+    Require(words[240 * unit + 50] == 0x55 && words[240 * unit + 100] == 0x44 && words[240 * unit + page] == 0x44 && words[240 * unit + 2 * page - 1] == 0x44 && words[240 * unit + 2 * page] == 0x11, "the GPU's bytes on the border page were lost to the CPU's neighbour");
+
+    if (ShadowVerify()) {
+        const auto report = ShadowReport();
+        Require(report.find(", mismatches 0") != std::string::npos, "the shadow verification found differences: " + report);
+    }
+    std::cout << "range slabs: one slab per range, one owner per unit, CPU wins the page, publishes exact\n";
+    return true;
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -9217,6 +9400,17 @@ int main(int argc, char** argv) {
             }
             if (!unitShadowTests(device, recorder)) {
                 std::cout << "skipped, the device does not import watched host memory for unit shadows\n";
+                return 77;
+            }
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--range-slab-only") {
+            if (!AgcDriver::Graphics::UnitShadowEnabled() || device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, unit shadows or host imports are unavailable\n";
+                return 77;
+            }
+            if (!rangeSlabTests(device, recorder)) {
+                std::cout << "skipped, the device does not import watched host memory for range slabs\n";
                 return 77;
             }
             return 0;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -739,6 +740,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto observedKeys = keys.has_value() ? *keys : scanKeys();
     const bool stagedClear = source != nullptr && resource.dccAddress != 0 && (IsDccClear(observedKeys) || observedKeys == DccKeys::ClearSingle);
     bool stagedFlushed = false;
+    const PublishSiteScope site(PublishSite::SampledTexture);
     if ((source == nullptr || stagedClear) && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         generation = GuestMemory::CollectWrites(address, bytes);
@@ -2201,8 +2203,23 @@ void ShaderResources::buildComplete() {
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
+        // Lazy range slabs: a read-only build's BDA table maps their live bytes (BdaResources); one
+        // that stores through addresses reads and writes the imports, which get the live bytes first.
+        const bool mapsLiveSlabs = usesBda && BufferShadowLazy() && bdaReadOnly && bdaOverlayAllowed && context.bufferDeviceAddress;
+        if (usesBda && BufferShadowLazy() && !mapsLiveSlabs) {
+            if (bdaReadOnly) PublishRangeSlabs(context, PublishReason::Address);
+            else PublishRangeSlabsForAddressWriter(context);
+            NoteAddressPublish();
+        } else if (mapsLiveSlabs) {
+            // The units its table cannot map whole (LiveRangeSlabSpans) reach the import first, and
+            // so do those its descriptors read in place.
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> partial;
+            static_cast<void>(LiveRangeSlabSpans(context, &partial));
+            for (const auto& [begin, end] : partial) PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, PublishReason::Address);
+            static_cast<void>(guestMemory.PublishLiveUnderOwnRanges());
+        }
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, mapsLiveSlabs);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         finishImageTables();
         phase(BuildPhase::Bda);
@@ -2385,6 +2402,7 @@ void ShaderResources::noteReusable() {
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
         if (serial == 0) return;
         directRegions.push_back({begin, end, serial});
+        directRegions.back().shadow = guestMemory.ShadowBound(begin, end);
     }
     for (const auto& cut : guestMemory.CutRegions()) {
         for (auto& region : directRegions) {
@@ -2695,6 +2713,23 @@ void countOwnRefresh(bool storage) {
 
 // APS5_NO_OWN_IMAGE_REFRESH=1: a Pending failure of the fast proof takes the full walk, as before
 // the own-object refresh (T1).
+// A texture the sampled cache released (dropped while held, or refused by its budget) stays alive
+// outside the budget for as long as a template holds it: no proof reuses such a template, as the
+// resource cache drops it (APS5_PROOF_KEEPS_RELEASED reuses it as before).
+bool ProofRefusesReleased() {
+    static const bool keeps = std::getenv("APS5_PROOF_KEEPS_RELEASED") != nullptr;
+    return !keeps;
+}
+
+// A sampled view of a storage image over memory a depth surface now covers: the lookup no longer
+// views that image (cachedStorageTexture serves the depth surface), so the view may read texels
+// the depth surface has replaced; the proof refuses it, as it does the storage image itself
+// (APS5_PROOF_IGNORES_DEPTH_VIEWS keeps the view as before).
+bool ProofGuardsDepthViews() {
+    static const bool ignores = std::getenv("APS5_PROOF_IGNORES_DEPTH_VIEWS") != nullptr;
+    return !ignores;
+}
+
 bool OwnImageRefreshEnabled() {
     static const bool disabled = std::getenv("APS5_NO_OWN_IMAGE_REFRESH") != nullptr;
     return !disabled;
@@ -2823,6 +2858,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
+        if (ProofRefusesReleased() && textures[i] != nullptr && textures[i]->Released()) return fail(FastFail::Evicted);
         if (surface.depth) {
             if (!depthStillServes(i)) return fail(FastFail::Depth);
             continue;
@@ -2832,6 +2868,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
+        if (source != nullptr && ProofGuardsDepthViews() && DepthSurfaceOverlaps(context.device, address, bytes)) {
+            depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
+            return fail(FastFail::Depth);
+        }
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -2957,6 +2997,7 @@ bool ShaderResources::fastRevalidateEach() {
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return false;
+        if (ProofRefusesReleased() && textures[i] != nullptr && textures[i]->Released()) return false;
         if (surface.depth) {
             if (!depthStillServes(i)) return false;
             continue;
@@ -2967,6 +3008,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (surface.collected == 0) return false;
         if (PendingStorageOverlaps(address, bytes, surface.source)) return false;
         if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return false;
+        if (surface.source != nullptr && ProofGuardsDepthViews() && DepthSurfaceOverlaps(context.device, address, bytes)) return false;
         if (surface.source != nullptr) {
             // The view follows the image: it needs the image current with guest memory, as the
             // lookup's Refresh would make it.
@@ -3157,6 +3199,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    const auto shadowSerialBefore = BufferShadowSerial();
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -3319,18 +3362,68 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    // Lazy range slabs (see the build): a read-only build whose table maps live slab bytes, or that
+    // would need to, is made again with a table of the live bytes of now; one that stores through
+    // addresses publishes them.
+    if (usesBda && BufferShadowLazy()) {
+        if (!(bdaReadOnly && bdaOverlayAllowed && context.bufferDeviceAddress)) {
+            if (bdaReadOnly) PublishRangeSlabs(context, PublishReason::Address);
+            else PublishRangeSlabsForAddressWriter(context);
+            NoteAddressPublish();
+        } else if ((bda != nullptr && bda->Overlaid()) || !LiveRangeSlabSpans(context).empty()) {
+            return finish(false, false, ProofFailure::Changed);
+        }
+    }
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             struct RegionsTag {};
             auto& regions = ThreadScratch<std::vector<StorageTexture::PendingQuery>, RegionsTag>();
             regions.clear();
-            for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
-            for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
+            struct BoundTag {};
+            auto& bound = ThreadScratch<std::vector<std::uint8_t>, BoundTag>();
+            bound.clear();
+            static const bool publishBound = std::getenv("APS5_PROOF_PUBLISHES_SLAB_BOUND") != nullptr;
+            for (const auto& region : directRegions) {
+                regions.push_back({region.begin, region.end, nullptr, nullptr, false});
+                bound.push_back(region.shadow && !publishBound ? 1 : 0);
+            }
+            for (const auto& [begin, end] : guestMemory.Writes()) {
+                regions.push_back({begin, end, nullptr, nullptr, false});
+                bound.push_back(!publishBound && guestMemory.ShadowBound(begin, end) ? 1 : 0);
+            }
             StorageTexture::ScanPending(regions);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
-            // published by the flush, as one over a pending image is stored.
-            for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            // published by the flush, as one over a pending image is stored. One bound to a range
+            // slab reads and writes the slab: its pending images are stored (into the slab's
+            // units), its live slab bytes stay there (APS5_PROOF_PUBLISHES_SLAB_BOUND publishes them).
+            for (std::size_t index = 0; index < regions.size(); ++index) {
+                const auto& region = regions[index];
+                const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+                const PublishSiteScope site(PublishSite::ProofPending);
+                if (bound[index] != 0) {
+                    if (region.overlaps) StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region", PublishScope::None);
+                } else if (region.overlaps || AnyShadowedOverlaps(region.begin, bytes)) {
+                    StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region");
+                }
+            }
+        }
+        // Variant C (APS5_BUFFER_SHADOW_LAZY): a range slab writer leaves its bytes live, and the
+        // in-place ranges of this set publish them first, as for a unit shadow's results above,
+        // whenever a range slab changed since the last proof. Ranges bound to a slab read it.
+        if (BufferShadowLazy() && bufferShadowSerialSeen != shadowSerialBefore) {
+            for (const auto& region : directRegions) {
+                const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+                const PublishSiteScope site(PublishSite::ProofInPlace);
+                if (!region.shadow && AnyShadowedOverlaps(region.begin, bytes)) StorageTexture::FlushPending(region.begin, bytes, nullptr, "imported buffer region");
+            }
+            for (const auto& [begin, end] : guestMemory.Writes()) {
+                const auto bytes = static_cast<std::size_t>(end - begin);
+                if (!guestMemory.ShadowBound(begin, end) && AnyShadowedOverlaps(begin, bytes)) StorageTexture::FlushPending(begin, bytes, nullptr, "written buffer range");
+            }
+        }
+        if (ShadowVerify() && BufferShadowLazy()) {
+            for (const auto& region : directRegions) {
+                if (!region.shadow) NoteShadowVerification(!AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin)), region.begin, region.end - region.begin);
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
@@ -3340,6 +3433,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             importsProof = HostImportsIdentity(context);
         }
     } else {
+        const PublishSiteScope site(PublishSite::ProofDirect);
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
@@ -3356,6 +3450,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    bufferShadowSerialSeen = shadowSerialBefore;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }
@@ -3472,6 +3567,13 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key, std::size_t
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex);
     return found(key, hash);
+}
+
+std::weak_ptr<ShaderResources> ResourceCache::Peek(const Key& key, std::size_t hash) {
+    std::lock_guard lock(mutex);
+    const auto entry = index.find(HashedKey{&key, hash});
+    if (entry == index.end()) return {};
+    return entry->second->second;
 }
 
 std::shared_ptr<ShaderResources> ResourceCache::found(const Key& key, std::size_t hash) {
@@ -4988,6 +5090,14 @@ ShaderResources::DrawBindings::~DrawBindings() {
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
+    return movedBuffers(shaders, &recorder, nullptr);
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::SpeculativeMovedBuffers(std::span<const CompiledShader> shaders, const InPlaceRanges* pending) const {
+    return movedBuffers(shaders, nullptr, pending);
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::movedBuffers(std::span<const CompiledShader> shaders, const Recorder* recorder, const InPlaceRanges* pending) const {
     std::vector<MovedBuffer> moved;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
     for (const auto& shader : shaders) {
@@ -5027,7 +5137,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                const bool pendingWriter = recorder != nullptr ? recorder->PendingWriteOverlaps(begin, bytes) : Recorder::SnapshotOverlaps(pending, begin, bytes);
+                if (guestMemory.WritesOverlap(begin, bytes) || pendingWriter || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
@@ -5099,6 +5210,50 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+namespace {
+// Moved data-word buffers (PrepareDrawBindings): 32 cached per template, and a cached buffer no
+// recorded work holds any more is rewritten for the next words instead of a new buffer.
+// APS5_NO_WORD_BUFFER_REUSE=1 keeps eight by content only, as before.
+bool WordBufferReuse() {
+    static const bool enabled = std::getenv("APS5_NO_WORD_BUFFER_REUSE") == nullptr;
+    return enabled;
+}
+}
+
+namespace {
+// APS5_SPEC_BINDINGS=1: prepare threads make a draw's bindings (ShaderResources::SpeculateDrawBindings).
+bool SpecBindingsOn() {
+    static const bool enabled = std::getenv("APS5_SPEC_BINDINGS") != nullptr;
+    return enabled;
+}
+
+// A prepare thread's draw upload ring (the recorder's DrawUpload is the committer's). Never
+// destroyed: a thread that outlives the device must not destroy a chunk after it, and a chunk of
+// a replaced device is let go without destroying it either.
+struct SpeculativeRing {
+    std::shared_ptr<Buffer> chunk;
+    VkDeviceSize used = 0;
+    VkDevice device = VK_NULL_HANDLE;
+};
+
+Recorder::UploadSlice SpeculativeUpload(const Context& context, std::size_t bytes) {
+    thread_local SpeculativeRing* ring = new SpeculativeRing;
+    if (ring->device != context.device) {
+        if (ring->chunk != nullptr) static_cast<void>(new std::shared_ptr<Buffer>(std::move(ring->chunk)));
+        ring->chunk.reset();
+        ring->device = context.device;
+    }
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    auto offset = (ring->used + alignment - 1) & ~(alignment - 1);
+    if (ring->chunk == nullptr || offset + bytes > ring->chunk->Bytes().size()) {
+        ring->chunk = std::make_shared<Buffer>(context, std::max(Recorder::DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.SnapshotProperties());
+        offset = 0;
+    }
+    ring->used = offset + bytes;
+    return {ring->chunk, offset, ring->chunk->Bytes().data() + offset};
+}
+}
+
 std::size_t ShaderResources::DrawUploadLimit() {
     static const std::size_t limit = [] {
         const char* value = std::getenv("APS5_DRAW_UPLOAD_MAX");
@@ -5111,15 +5266,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const bool profiled = BuildProfiled();
     if (profiled) preparedSnapshotBytes = 0;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    struct DrawReadsTag {};
+    auto& reads = HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, DrawReadsTag>();
     guestMemory.InPlaceReads(reads);
+    if (SpecBindingsOn()) publishInPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct DrawSelectedTag {};
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, DrawSelectedTag>();
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
@@ -5127,20 +5283,31 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            constexpr std::size_t MovedWordBufferSlots = 8;
+            const auto slots = WordBufferReuse() ? std::size_t{32} : std::size_t{8};
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
             std::shared_ptr<Buffer> buffer;
-            if (held != movedWordBuffers.end()) {
-                buffer = held->buffer;
-            } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const auto fill = [&] {
                 std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
+            };
+            // A slot of this allocation whose buffer nothing else holds (no recorded work, no draw's
+            // bindings: only this cache) takes the new words in place, so most draws whose words
+            // change make no buffer (a new one is a pool take that recreates the exact-sized VkBuffer).
+            const auto spare = held != movedWordBuffers.end() || !WordBufferReuse() ? movedWordBuffers.end() : std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.buffer.use_count() == 1; });
+            if (held != movedWordBuffers.end()) {
+                buffer = held->buffer;
+            } else if (spare != movedWordBuffers.end()) {
+                buffer = spare->buffer;
+                fill();
+                spare->words = override->words;
+            } else {
+                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                fill();
                 MovedWordBuffer entry{index, override->words, override->size, buffer};
-                if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
-                else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+                if (movedWordBuffers.size() < slots) movedWordBuffers.push_back(std::move(entry));
+                else movedWordBuffers[movedWordBufferNext++ % slots] = std::move(entry);
             }
             selected.push_back(index);
             result->snapshots.push_back({0, std::move(buffer), 0, override->size});
@@ -5158,6 +5325,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 continue;
             }
             const bool direct = readInPlace();
+            if (direct && AnyShadowedOverlaps(item.address, item.size)) {
+                // Live slab or unit shadow bytes under the range: they reach the import before the
+                // draw reads it in place (a CPU snapshot would read the import's older bytes).
+                const PublishSiteScope site(PublishSite::DrawBindings);
+                StorageTexture::PublishShadowsOnly(item.address, item.size, PublishScope::Whole, "imported buffer region");
+                if (profiled) noteInPlaceSkip(InPlaceSkip::PendingWriter, item.size);
+                continue;
+            }
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) {
                 if (profiled && direct) noteInPlaceSkip(InPlaceSkip::PendingWriter, item.size);
                 continue;
@@ -5174,6 +5349,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
+        if (BufferShadowProbe()) ProbeBufferRead(ProbeReader::DrawSnapshot, begin, bytes);
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
@@ -5221,10 +5397,17 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
+    writeDrawDescriptors(*result, selected);
+    recorder.Keep(result);
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    return result;
+}
+
+void ShaderResources::writeDrawDescriptors(DrawBindings& result, std::span<const std::size_t> selected) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    struct DrawCountsTag {};
+    auto& counts = HostThreadLocal<std::array<std::vector<VkDescriptorPoolSize>, 2>, DrawCountsTag>();
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);
@@ -5239,25 +5422,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
-    result->cache = context.descriptorCache;
+    result.cache = context.descriptorCache;
     if (described[0] || splitSets) {
-        result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
-        result->layout = _layout;
-        Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        result.allocation = result.cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
+        result.layout = _layout;
+        Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (described[1] || splitSets) {
-        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
-        result->fragmentLayout = fragment.layout;
-        Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        result.fragmentAllocation = result.cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
+        result.fragmentLayout = fragment.layout;
+        Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
-    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
+    struct DrawBuffersTag {};
+    auto& buffers = HostThreadLocal<std::vector<VkDescriptorBufferInfo>, DrawBuffersTag>();
     buffers = descriptorBuffers;
-    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
-    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    struct DrawWritesTag {};
+    auto& writes = HostThreadLocal<std::vector<VkWriteDescriptorSet>, DrawWritesTag>();
     writes = descriptorWrites;
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct DrawIndicesTag {};
+    auto& snapshotIndices = HostThreadLocal<std::vector<std::size_t>, DrawIndicesTag>();
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     auto nextWrite = writes.begin();
@@ -5265,23 +5448,84 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto original = setOf(binding) == 0 ? _set : fragment.set;
         while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
             auto& write = *nextWrite++;
-            write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+            write.dstSet = setOf(binding) == 0 ? result.allocation.set : result.fragmentAllocation.set;
             if (binding.allocations.empty()) continue;
             const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
             write.pBufferInfo = buffers.data() + offset;
             for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
-                const auto& snapshot = result->snapshots[snapshotIndex];
+                const auto& snapshot = result.snapshots[snapshotIndex];
                 buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
             }
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
-    return result;
+}
+
+void ShaderResources::publishInPlaceReads(const InPlaceRanges& reads) const {
+    const auto current = publishedInPlace.load(std::memory_order_relaxed);
+    if (current != nullptr && *current == reads) return;
+    publishedInPlace.store(std::make_shared<const InPlaceRanges>(reads), std::memory_order_release);
+}
+
+ShaderResources::SpeculativeBindings ShaderResources::SpeculateDrawBindings(std::span<const MovedBuffer> moved, const InPlaceRanges& reads, const InPlaceRanges* pending) const {
+    SpeculativeBindings out;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return out;
+    const auto maxSnapshotBytes = maxDrawSnapshotBytes;
+    const auto uploadLimit = DrawUploadLimit();
+    std::size_t totalSnapshotBytes = 0;
+    auto result = std::make_shared<DrawBindings>();
+    struct SpeculatedSelectedTag {};
+    auto& selected = HostThreadLocal<std::vector<std::size_t>, SpeculatedSelectedTag>();
+    selected.clear();
+    // The same choices as PrepareDrawBindings, with the published reads and pending writes.
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (override != moved.end() && !override->words.empty()) {
+            auto slice = SpeculativeUpload(context, override->size);
+            std::memcpy(slice.bytes, override->words.data(), override->size);
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+            selected.push_back(index);
+            result->snapshots.push_back({0, std::move(slice.buffer), slice.offset, override->size});
+            continue;
+        }
+        std::uint64_t address = item.address;
+        std::size_t size = item.size;
+        if (override != moved.end()) {
+            address = override->address;
+            size = override->size;
+        } else {
+            if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            if (!direct) continue;
+            if (Recorder::SnapshotOverlaps(pending, item.address, item.size) || AnyShadowedOverlaps(item.address, item.size)) {
+                out.refusal = SpecRefusal::PendingWriter;
+                return out;
+            }
+        }
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (bytes == 0 || bytes > uploadLimit) {
+            out.refusal = SpecRefusal::Large;
+            return out;
+        }
+        auto slice = SpeculativeUpload(context, bytes);
+        std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
+        selected.push_back(index);
+        result->snapshots.push_back({begin, std::move(slice.buffer), slice.offset, bytes});
+        out.ranges.emplace_back(begin, bytes);
+        totalSnapshotBytes += bytes;
+    }
+    if (selected.empty()) return out;
+    writeDrawDescriptors(*result, selected);
+    out.bindings = std::move(result);
+    return out;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
@@ -5312,6 +5556,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    if (BufferShadowProbe()) {
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) ProbeBufferRead(ProbeReader::InPlace, begin, static_cast<std::size_t>(end - begin));
+    }
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
@@ -5333,6 +5580,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
     guestMemory.NoteStagedCopies();
+    if (BufferShadowProbe() || BufferReadProbe()) guestMemory.ProbeWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

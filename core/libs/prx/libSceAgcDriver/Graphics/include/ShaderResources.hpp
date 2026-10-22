@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -185,9 +186,28 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::vector<std::uint32_t> words;
+        bool operator==(const MovedBuffer&) const = default;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // O16.T9 (APS5_SPEC_BINDINGS=1): a draw's bindings made on a prepare thread, off the GPU mutex,
+    // from the parts of this object a build fixes (allocations, bindings, descriptor writes, data
+    // patches, the written ranges), for the commit to take after its checks (DrawSpeculation in
+    // Draw.hpp). The in-place reads, which change under the mutex, are the copy the last
+    // PrepareDrawBindings published; `pending` is the recorder's published pending-write snapshot
+    // (Recorder::PendingWriteSnapshot), standing in for PendingWriteOverlaps. Snapshots go to a ring
+    // of the calling thread; a draw with a range behind pending GPU work or over the upload limit
+    // gets none (the commit makes them).
+    using InPlaceRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    std::shared_ptr<const InPlaceRanges> PublishedInPlaceReads() const { return publishedInPlace.load(std::memory_order_acquire); }
+    std::optional<std::vector<MovedBuffer>> SpeculativeMovedBuffers(std::span<const CompiledShader> shaders, const InPlaceRanges* pending) const;
+    enum class SpecRefusal : std::size_t { None, PendingWriter, Large };
+    struct SpeculativeBindings {
+        std::shared_ptr<DrawBindings> bindings;
+        std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+        SpecRefusal refusal = SpecRefusal::None;
+    };
+    SpeculativeBindings SpeculateDrawBindings(std::span<const MovedBuffer> moved, const InPlaceRanges& inPlace, const InPlaceRanges* pending) const;
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -223,6 +243,7 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& WriteOnlyRanges() const { return writeOnlyRanges; }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
+    void PlacementBytes(std::uint64_t& hostBytes, std::uint64_t& deviceBytes) const { guestMemory.PlacementBytes(hostBytes, deviceBytes); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
@@ -399,6 +420,9 @@ private:
         std::uint64_t serial;
         std::uint64_t regionEnd = 0;
         std::uint64_t committedEnd = 0;
+        // Bound to a range slab (GuestBufferMemory::ShadowBound): read and written there, so the
+        // proof publishes nothing for it.
+        bool shadow = false;
     };
 
     // The build is two stages. A (buildPrepare, no device lock): the binding plan with its layout
@@ -535,6 +559,8 @@ private:
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // O17.T4 (diagnostic): whether APS5_BDA_OVERLAY_MASK lets this build map live slab bytes.
+    bool bdaOverlayAllowed = true;
     bool bdaReadOnly = true;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
@@ -568,6 +594,12 @@ private:
         std::shared_ptr<Buffer> buffer;
     };
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
+    // The in-place reads the last PrepareDrawBindings saw (PublishedInPlaceReads); written under
+    // the GPU mutex only, read by prepare threads.
+    mutable std::atomic<std::shared_ptr<const InPlaceRanges>> publishedInPlace;
+    void publishInPlaceReads(const InPlaceRanges& reads) const;
+    void writeDrawDescriptors(DrawBindings& result, std::span<const std::size_t> selected) const;
+    std::optional<std::vector<MovedBuffer>> movedBuffers(std::span<const CompiledShader> shaders, const Recorder* recorder, const InPlaceRanges* pending) const;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
@@ -608,6 +640,9 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    // BufferShadowSerial at the last proof (O16.T17): when it moved, the in-place ranges publish
+    // the range slabs' live bytes over them.
+    std::uint64_t bufferShadowSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
@@ -667,6 +702,10 @@ public:
     static std::size_t Hash(const Key& key) noexcept;
     std::shared_ptr<ShaderResources> Find(const Key& key);
     std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
+    // The entry under the key without touching the LRU, the miss and return counts or the Find
+    // count, as a weak reference: a reader off the GPU mutex (the O16.T8 speculation probe) never
+    // becomes the last owner of an entry removed meanwhile.
+    std::weak_ptr<ShaderResources> Peek(const Key& key, std::size_t hash);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

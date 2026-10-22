@@ -450,7 +450,10 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         bool deferred = false;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue] { deliverGuestEopInterrupt(queue); }, queue == 0);
-            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+            if (deferred && workOpen) {
+                DrawPipeline::Queue0().Note(DrawPipeline::Event::SubmitInterrupt);
+                localDevice->SubmitRecorded(queue == 0);
+            }
         }
         if (!deferred) deliverGuestEopInterrupt(queue);
     }
@@ -462,7 +465,9 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    if (!due && !capped) return;
+    DrawPipeline::Queue0().Note(due ? DrawPipeline::Event::SubmitDeadline : DrawPipeline::Event::SubmitCap);
+    localDevice->SubmitRecorded(true);
 }
 
 }

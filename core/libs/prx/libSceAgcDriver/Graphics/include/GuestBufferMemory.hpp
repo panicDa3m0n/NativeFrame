@@ -110,6 +110,8 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
+struct ShadowSlab;
+struct ShadowSlabPin;
 class Recorder;
 
 template<typename TRange>
@@ -296,6 +298,12 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    // Whether a region bound to a range slab (writer or reader, see Region::shadow) covers
+    // [begin, end): such a range is read and written in the slab, never in the import.
+    bool ShadowBound(std::uint64_t begin, std::uint64_t end) const;
+    // ProbeGpuBufferWrite for every written range (APS5_BUFFER_SHADOW_PROBE): staged where a
+    // device-local copy region holds it, in place otherwise.
+    void ProbeWrites() const;
     void NoteStagedCopies();
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
@@ -329,11 +337,21 @@ public:
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
+    // The frame map (Recorder::NoteDrawPlacement): the bytes of the regions bound in guest memory
+    // (in place through an import, or from a host-visible staging buffer), which the GPU reads and
+    // writes through the bus, and of those bound in device memory (device-local staging buffers and
+    // range slabs). An address-based build's leased heaps are not counted.
+    void PlacementBytes(std::uint64_t& hostBytes, std::uint64_t& deviceBytes) const;
     struct SplitReads {
         std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
     };
     std::optional<SplitReads> SplitInPlaceReads() const;
+    // An address-based build whose BDA table maps live range slab bytes publishes nothing else, and
+    // its descriptors' ranges are served by the registered heaps it maps (inside its address
+    // space's base, or merged into them), which UploadFinish leaves unflushed: the live units under
+    // those ranges reach the import here, before the descriptors read it. The units published.
+    std::size_t PublishLiveUnderOwnRanges() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
@@ -400,6 +418,21 @@ private:
         std::uint64_t copyBackGeneration = 0;
         bool planned = false;
         std::vector<StagedPiece> plannedPieces {};
+        // O16.T13 (APS5_BUFFER_SHADOW, see shadowEligible): the region binds a range slab of its
+        // import's unit shadow at `shadowOffset` (gpuCopy and deviceLocal are set too, so the
+        // staging rules hold for it). `shadowSeeds` are copied in from the import before the work;
+        // RecordCopyBacks copies the written sub-ranges back from the slab into `copySource` as
+        // from a staging buffer, and MarkDirectWrites marks them fresh and published in the slab.
+        // `shadowImport` names the import (base, bytes, buffer, lead).
+        bool shadow = false;
+        // O16.T14: a read-only region bound to a range slab that holds every byte of it (see
+        // RangeShadowSource): no seed, no copy-back, out of the in-place reads.
+        bool shadowReader = false;
+        std::shared_ptr<ShadowSlab> shadowSlab {};
+        std::shared_ptr<ShadowSlabPin> shadowPin {};
+        VkDeviceSize shadowOffset = 0;
+        HostImport shadowImport {};
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> shadowSeeds {};
     };
     void planStagingCopy(Region& region, bool copiedBack, std::span<const Buffer* const> own);
 
@@ -446,6 +479,10 @@ private:
     // and an atomic element or a size within the written-shadow window. Independent of the import,
     // so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    bool shadowEligible(const Region& region, bool addressable) const;
+    bool takeShadow(Region& region, const HostImport& import);
+    bool takeShadowSource(Region& region, const HostImport& import);
+    void verifyShadowSeeded(Recorder& recorder, VkCommandBuffer commands, std::span<Region* const> copies) const;
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
@@ -475,6 +512,8 @@ private:
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
+    // The descriptors' ranges as added, before the registered heaps serve or absorb them.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ownRanges;
     bool committed = false;
 };
 

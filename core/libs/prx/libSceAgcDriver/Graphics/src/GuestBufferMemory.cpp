@@ -3573,6 +3573,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     validate(address, bytes);
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
+    ownRanges.emplace_back(begin, end);
     const Region* inside = nullptr;
     switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
@@ -3836,6 +3837,54 @@ std::uint64_t atomicStageMax() {
     return bytes;
 }
 
+// APS5_BUFFER_SHADOW (O16.T13): the written regions of recorded uses from
+// APS5_BUFFER_SHADOW_MIN_KIB (1024) to APS5_BUFFER_SHADOW_MAX_MIB (64) take a range slab instead of
+// a staging buffer or the import in place. Smaller ones keep today's staging (a slab has a device
+// memory of its own and covers whole 64 KiB units).
+std::uint64_t bufferShadowMin() {
+    static const std::uint64_t bytes = kibSetting("APS5_BUFFER_SHADOW_MIN_KIB", 1024);
+    return bytes;
+}
+
+std::uint64_t bufferShadowMax() {
+    static const std::uint64_t bytes = kibSetting("APS5_BUFFER_SHADOW_MAX_MIB", 64) << 10u;
+    return bytes;
+}
+
+// The [bufshadow] line every 10 s (cumulative and last 10 s): regions bound to a range slab by a
+// build and by a reuse, refusals (no destination; a reuse whose slab moved), seed and published
+// bytes.
+struct BufferShadowStatistics {
+    std::atomic<std::uint64_t> taken{0}, reused{0}, refused{0}, moved{0}, seedBytes{0}, publishedBytes{0}, readers{0}, readerBytes{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+BufferShadowStatistics& bufferShadowStats() {
+    static BufferShadowStatistics statistics;
+    return statistics;
+}
+
+void reportBufferShadow() {
+    auto& stats = bufferShadowStats();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.lastReport.load();
+    if (last == 0) {
+        stats.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
+    static std::uint64_t lastTaken = 0, lastReused = 0, lastSeed = 0, lastPublished = 0;
+    const auto taken = stats.taken.load(), reused = stats.reused.load(), seed = stats.seedBytes.load(), published = stats.publishedBytes.load();
+    std::fprintf(stderr, "[bufshadow] (cumulative): %llu regions bound to range slabs by builds, %llu by reuses, %llu refused, %llu reuses whose slab moved, %.1f MiB seeded, %.1f MiB published, %llu read-only regions bound to slabs by builds (%.1f MiB not read in place), %.1f MiB of copy-backs left live (lazy), %llu address-based builds mapping live slab bytes (%.1f MiB), %llu address-based uses that published them; last 10 s: %llu builds, %llu reuses, %.1f MiB seeded, %.1f MiB published\n",
+        static_cast<unsigned long long>(taken), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stats.refused.load()), static_cast<unsigned long long>(stats.moved.load()), seed / 1048576.0, published / 1048576.0, static_cast<unsigned long long>(stats.readers.load()), stats.readerBytes.load() / 1048576.0, LazyCopyBackSkippedBytes() / 1048576.0, static_cast<unsigned long long>(AddressOverlays()), AddressOverlayBytes() / 1048576.0, static_cast<unsigned long long>(AddressPublishes()),
+        static_cast<unsigned long long>(taken - lastTaken), static_cast<unsigned long long>(reused - lastReused), (seed - lastSeed) / 1048576.0, (published - lastPublished) / 1048576.0);
+    std::fprintf(stderr, "[bufshadow] %s\n", SlabAuthorityReport().c_str());
+    lastTaken = taken;
+    lastReused = reused;
+    lastSeed = seed;
+    lastPublished = published;
+}
+
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
     return deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
@@ -4057,6 +4106,101 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
 }
 
+// APS5_VERIFY_BUFFER_SHADOW: a use of a range slab region is correct when, once its seeds are in,
+// the slab holds the import's bytes over the whole region (the shader then reads and writes what it
+// would read and write in place, and the copy-back stores its writes). Both are read back at that
+// point of the batch and compared when it completed.
+void GuestBufferMemory::verifyShadowSeeded(Recorder& recorder, VkCommandBuffer commands, std::span<Region* const> copies) const {
+    bool any = false;
+    for (const auto* region : copies) any = any || region->shadow;
+    if (!any) return;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (const auto* region : copies) {
+        if (!region->shadow) continue;
+        const auto bytes = region->end - region->begin;
+        auto slab = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto import = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CopyBuffer(context, commands, region->shadowSlab->buffer, region->shadowOffset, slab->Handle(), 0, bytes);
+        CopyHostBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, import->Handle(), 0, bytes);
+        recorder.Keep(slab);
+        recorder.Keep(import);
+        const auto address = region->begin;
+        recorder.OnComplete([slab, import, address, bytes] {
+            slab->Invalidate();
+            import->Invalidate();
+            const auto left = slab->Bytes();
+            const auto right = import->Bytes();
+            NoteShadowVerification(std::memcmp(left.data(), right.data(), static_cast<std::size_t>(bytes)) == 0, address, bytes);
+        });
+    }
+    // The shader's stores come after the reads above; the host reads the copies at completion.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+}
+
+bool GuestBufferMemory::shadowEligible(const Region& region, bool addressable) const {
+    if (!BufferShadowEnabled() || !stagingAllowed || addressable || region.unstaged || region.shadow || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
+    const auto bytes = region.end - region.begin;
+    return bytes >= bufferShadowMin() && bytes <= bufferShadowMax() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+}
+
+bool GuestBufferMemory::ShadowBound(std::uint64_t begin, std::uint64_t end) const {
+    if (!uploaded || committed) return false;
+    return std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return region.shadow && region.begin <= begin && end <= region.end; });
+}
+
+bool GuestBufferMemory::takeShadowSource(Region& region, const HostImport& import) {
+    if (!BufferShadowReaders() || !stagingAllowed || region.unstaged || region.sparse || region.mirror != nullptr || WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) return false;
+    auto source = RangeShadowSource(context, import, region.begin, region.end);
+    if (!source.has_value()) return false;
+    HostImport key{};
+    key.base = import.base;
+    key.bytes = import.bytes;
+    key.buffer = import.buffer;
+    key.lead = import.lead;
+    region.shadow = true;
+    region.shadowReader = true;
+    region.shadowSlab = source->slab;
+    region.shadowPin = source->pin;
+    region.shadowOffset = source->offset;
+    region.shadowImport = key;
+    region.shadowSeeds.clear();
+    region.gpuCopy = true;
+    region.deviceLocal = true;
+    region.copySource = import.buffer;
+    region.copySourceBase = import.base - import.lead;
+    region.copiedBack = false;
+    region.direct = nullptr;
+    region.buffer.reset();
+    region.snapshot.clear();
+    bufferShadowStats().readers.fetch_add(1, std::memory_order_relaxed);
+    bufferShadowStats().readerBytes.fetch_add(region.end - region.begin, std::memory_order_relaxed);
+    return true;
+}
+
+bool GuestBufferMemory::takeShadow(Region& region, const HostImport& import) {
+    auto destination = RangeShadowDestination(context, import, region.begin, region.end);
+    if (!destination.has_value()) {
+        bufferShadowStats().refused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    region.shadow = true;
+    region.shadowSlab = destination->slab;
+    region.shadowPin = destination->pin;
+    region.shadowOffset = destination->offset;
+    region.shadowImport = import;
+    region.shadowSeeds = std::move(destination->seedUnits);
+    region.gpuCopy = true;
+    region.deviceLocal = true;
+    region.copySource = import.buffer;
+    region.copySourceBase = import.base - import.lead;
+    region.copiedBack = false;
+    region.direct = nullptr;
+    region.buffer.reset();
+    region.snapshot.clear();
+    bufferShadowStats().taken.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
@@ -4181,6 +4325,13 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             // staged region (see stagingEligible) takes the same path, aligned or not, with a
             // device-local buffer that the CPU fallback replaces (none without a recorder to
             // record the copies: UploadFinish then binds the region in place).
+            // A region that takes a range slab (see shadowEligible) is decided under the device lock
+            // by UploadFinish; no staging buffer is made for it here.
+            if (Recorder::Active() != nullptr && shadowEligible(region, addressable)) {
+                region.direct = entry;
+                region.pending = true;
+                continue;
+            }
             bool staged = Recorder::Active() != nullptr && stagingEligible(region, addressable);
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
@@ -4341,6 +4492,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             if (bound) continue;
         }
         bool copyOnGpu = false;
+        bool shadowCandidate = false;
+        HostImport shadowKey{};
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
@@ -4383,10 +4536,20 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 if (!covers(entry)) entry = nullptr;
                 runImport = entry != nullptr;
             }
+            // A region that takes a range slab is decided here and taken after the import lock.
+            shadowCandidate = entry != nullptr && !runImport && recorder != nullptr && shadowEligible(region, addressable);
+            if (shadowCandidate) {
+                shadowKey.base = entry->base;
+                shadowKey.bytes = entry->bytes;
+                shadowKey.buffer = entry->buffer;
+                shadowKey.lead = entry->lead;
+            }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
-            if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
+            if (shadowCandidate) {
+                region.direct = nullptr;
+            } else if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
                 region.direct = entry;
                 region.runCut = runImport;
                 region.snapshot.clear();
@@ -4405,13 +4568,56 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.copySourceBase = entry->base - entry->lead;
             }
         }
+        bool hostCopy = false;
+        if (shadowCandidate) {
+            // As for a GPU copy, storage results pending in the range reach the import first (the
+            // flush is recorded ahead of the seeds, in the batch opened first); then the range slab.
+            static_cast<void>(recorder->Commands());
+            const PublishSiteScope site(PublishSite::UploadCopied);
+            StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            if (takeShadow(region, shadowKey)) {
+                gpuCopies.push_back(&region);
+                continue;
+            }
+            // Refused (the budget, or the import changed under the flush): in place when the import
+            // serves the range aligned, else copied as without staging.
+            region.unstaged = true;
+            {
+                auto& state = Imports();
+                std::lock_guard lock(state.mutex);
+                const auto* entry = findImport(state, region.begin, region.end);
+                if (entry != nullptr && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
+                    region.direct = entry;
+                    region.snapshot.clear();
+                } else if (entry != nullptr && gpuCopyEligible(region)) {
+                    region.gpuCopy = true;
+                    region.deviceLocal = false;
+                    region.copySource = entry->buffer;
+                    region.copySourceBase = entry->base - entry->lead;
+                } else {
+                    hostCopy = true;
+                }
+            }
+            if (region.direct != nullptr) continue;
+            if (region.gpuCopy) {
+                gpuCopies.push_back(&region);
+                continue;
+            }
+        }
         if (region.direct != nullptr) {
             // The GPU reads this range in place, so storage results pending in it must be stored first
             // (outside the import lock: the store may import memory itself). The whole registered heaps
             // an address-based shader maps are exempt (they hold every pending image, and such shaders
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
-            if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            if (!(addressable && region.hostBacked) || bdaFlush) {
+                const PublishSiteScope site(PublishSite::UploadInPlace);
+                StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            }
+            // A read-only range a range slab holds whole is read from the slab instead (after the
+            // flush: a storage write-back into the slab's units lands in it, one into the import
+            // takes the authority of its pages, and the source is then refused).
+            if (recorder != nullptr && !addressable && takeShadowSource(region, *region.direct)) gpuCopies.push_back(&region);
             continue;
         }
         if (copyOnGpu) {
@@ -4421,11 +4627,13 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
             static_cast<void>(recorder->Commands());
+            const PublishSiteScope site(PublishSite::UploadGpuCopy);
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
             continue;
         }
+        static_cast<void>(hostCopy);
         if (region.deviceLocal) {
             // The staging shadow UploadPrepare made cannot take the CPU copy (no host mapping): the
             // region falls back to a host buffer of its own.
@@ -4577,6 +4785,20 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
+        if (region->shadow) {
+            // A range slab region: only the bytes the slab is not authoritative for come in.
+            region->copyInGeneration = GuestMemory::TrackerGeneration();
+            for (const auto& [from, to] : region->shadowSeeds) {
+                CopyHostBuffer(context, commands, region->copySource, from - region->copySourceBase, region->shadowSlab->buffer, region->shadowOffset + (from - region->begin), to - from);
+                recorder->NotePendingRead(from, static_cast<std::size_t>(to - from), Recorder::ReadKind::GpuCopy);
+                NoteShadowSeed(from, to);
+                bufferShadowStats().seedBytes.fetch_add(to - from, std::memory_order_relaxed);
+                copiedBytes += to - from;
+            }
+            region->shadowSeeds.clear();
+            recorder->Keep(region->shadowSlab);
+            continue;
+        }
         if (!region->planned) region->copyInGeneration = GuestMemory::TrackerGeneration();
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
@@ -4673,6 +4895,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     if (stagedAny) reportStaging();
+    if (ShadowVerify() && !BufferShadowLazy()) verifyShadowSeeded(*recorder, commands, copies);
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide).
@@ -4701,6 +4924,19 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 else merged.push_back(range);
             }
         }
+        if (region.shadow && BufferShadowLazy()) {
+            // Variant C: the written bytes stay live in the slab until a consumer publishes them;
+            // nothing is recorded (no barrier, no end of an open render pass).
+            for (const auto& [begin, end] : merged) {
+                const auto from = std::max(begin, region.begin);
+                const auto to = std::min(end, region.end);
+                if (from < to) NoteLazyCopyBackSkipped(to - from);
+            }
+            region.copiedBack = true;
+            region.shadowPin.reset();
+            reportBufferShadow();
+            continue;
+        }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -4714,10 +4950,18 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 recording = true;
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
-            // would have stored there itself had the range been bindable.
-            CopyHostBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            // would have stored there itself had the range been bindable. A range slab region copies
+            // from its slab, into the import it was uploaded from (kept by the batch even when it
+            // retired meanwhile).
+            if (region.shadow) {
+                CopyHostBuffer(context, commands, region.shadowSlab->buffer, region.shadowOffset + (from - region.begin), region.copySource, from - region.copySourceBase, to - from);
+                recorder.Keep(region.shadowSlab);
+                bufferShadowStats().publishedBytes.fetch_add(to - from, std::memory_order_relaxed);
+            } else {
+                CopyHostBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+                recorder.Keep(region.buffer);
+            }
             copiedBytes += to - from;
-            recorder.Keep(region.buffer);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
                 Copies().gpuCopyBackBytes.fetch_add(to - from, std::memory_order_relaxed);
@@ -4728,6 +4972,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
+        if (region.shadow) {
+            // The pin kept the slab from eviction between the destination and the copies.
+            region.shadowPin.reset();
+            reportBufferShadow();
+        }
     }
     if (!recording) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -4752,8 +5001,8 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
         std::snprintf(text, sizeof(text), "guest buffer view 0x%llx+0x%llx %s its GPU owner 0x%llx-0x%llx (buffer %d, direct %d, mirror %d)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), what, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.buffer != nullptr, region.direct != nullptr, region.mirror != nullptr);
         return std::string(text);
     };
-    if (!(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr))) Require(false, describe("exceeds"));
-    const auto base = region.direct != nullptr ? region.direct->base - region.direct->lead : region.mirror != nullptr ? region.mirror->base : region.begin;
+    if (!(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr || region.shadow))) Require(false, describe("exceeds"));
+    const auto base = region.direct != nullptr ? region.direct->base - region.direct->lead : region.mirror != nullptr ? region.mirror->base : region.shadow ? region.begin - region.shadowOffset : region.begin;
     const auto offset = address - base;
     Require(context.limits.minStorageBufferOffsetAlignment != 0, "no storage buffer offset alignment");
     Require(base % 4 == 0, "a guest buffer view in a GPU owner that does not start at a DWORD boundary is not implemented");
@@ -4767,7 +5016,7 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     }
     if (address - adjustment + range > end) Require(false, describe("rounded up to its view range exceeds"));
     Require(range <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
-    const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
+    const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.shadow ? region.shadowSlab->buffer : region.buffer->Handle();
     return {handle, offset - adjustment, range};
 }
 
@@ -4942,6 +5191,504 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     return CachedTable{tableSerial, tableRanges.get()};
 }
 
+namespace {
+
+#ifdef _WIN32
+// The written ranges the read probe watches (groups, with their counts) and their protected pages
+// (an open-addressed table, one entry per 4 KiB page with the protection it had). The fault handler
+// allocates nothing and takes only this lock, which no holder keeps across an access to guest
+// memory or a call that can wait on the loader lock.
+struct ReadProbeGroup {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t notes = 0;
+    std::uint64_t protects = 0;
+    std::uint64_t titleCaller = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeModule::Count)> reads{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProbeModule::Count)> writes{};
+};
+
+struct ReadProbePage {
+    std::uint64_t page = 0;
+    std::uint32_t group = 0;
+    DWORD previous = 0;
+    bool armed = false;
+    bool given = false;
+};
+
+struct ReadProbeCaller {
+    std::uint64_t pc = 0;
+    std::uint64_t faults = 0;
+    ProbeModule module = ProbeModule::Other;
+};
+
+struct ReadProbe {
+    static constexpr std::size_t Groups = 1024;
+    static constexpr unsigned PageBits = 18;
+    static constexpr std::size_t Pages = std::size_t{1} << PageBits;
+    static constexpr std::size_t Pending = 8192;
+    static constexpr std::size_t Callers = 16;
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::array<ReadProbeGroup, Groups> groups{};
+    std::size_t groupCount = 0;
+    std::array<ReadProbePage, Pages> pages{};
+    std::size_t pageCount = 0;
+    std::array<std::uint64_t, Pending> pending{};
+    std::size_t pendingCount = 0;
+    std::array<ReadProbeCaller, Callers> callers{};
+    std::size_t callerCount = 0;
+    BufferReadProbeCounts totals;
+    std::uintptr_t titleBegin = 0;
+    std::uintptr_t titleEnd = 0;
+    std::uintptr_t driverBegin = 0;
+    std::uintptr_t driverEnd = 0;
+    std::uint64_t lastReport = 0;
+};
+
+constexpr std::uint64_t ProbePage = 4096;
+constexpr std::uint32_t AnyGroup = 0xffffffffu;
+
+ReadProbe& readProbe() {
+    static ReadProbe probe;
+    return probe;
+}
+
+std::pair<std::uintptr_t, std::uintptr_t> moduleRange(HMODULE module) {
+    if (module == nullptr) return {0, 0};
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<std::uintptr_t>(dos->e_lfanew));
+    return {base, base + nt->OptionalHeader.SizeOfImage};
+}
+
+ProbeModule moduleOf(const ReadProbe& probe, std::uintptr_t pc) {
+    if (pc >= probe.titleBegin && pc < probe.titleEnd) return ProbeModule::Title;
+    if (pc >= probe.driverBegin && pc < probe.driverEnd) return ProbeModule::Driver;
+    return ProbeModule::Other;
+}
+
+// The module an access belongs to: the faulting instruction's, or, inside another module (the C
+// runtime's memcpy or memcmp, a system library), the first caller within four frames that is the
+// title's image or this driver.
+std::pair<ProbeModule, std::uintptr_t> callerOf(const ReadProbe& probe, const CONTEXT& faulting) {
+    auto pc = static_cast<std::uintptr_t>(faulting.Rip);
+    const auto first = moduleOf(probe, pc);
+    if (first != ProbeModule::Other) return {first, pc};
+    CONTEXT context = faulting;
+    for (int frame = 0; frame < 4; ++frame) {
+        DWORD64 imageBase = 0;
+        auto* function = RtlLookupFunctionEntry(context.Rip, &imageBase, nullptr);
+        if (function == nullptr) {
+            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+            context.Rsp += 8;
+        } else {
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip, function, &context, &handlerData, &establisher, nullptr);
+        }
+        if (context.Rip == 0) break;
+        const auto module = moduleOf(probe, static_cast<std::uintptr_t>(context.Rip));
+        if (module != ProbeModule::Other) return {module, static_cast<std::uintptr_t>(context.Rip)};
+    }
+    return {ProbeModule::Other, pc};
+}
+
+// The page's entry, inserted when asked while the table stays at most half full.
+ReadProbePage* pageEntry(ReadProbe& probe, std::uint64_t page, bool insert) {
+    auto index = static_cast<std::size_t>(((page / ProbePage) * 0x9e3779b97f4a7c15ull) >> (64u - ReadProbe::PageBits));
+    for (std::size_t step = 0; step < ReadProbe::Pages; ++step) {
+        auto& entry = probe.pages[index];
+        if (entry.page == page) return &entry;
+        if (entry.page == 0) {
+            if (!insert || probe.pageCount * 2 >= ReadProbe::Pages) return nullptr;
+            entry.page = page;
+            ++probe.pageCount;
+            return &entry;
+        }
+        index = (index + 1) & (ReadProbe::Pages - 1);
+    }
+    return nullptr;
+}
+
+enum class ArmPages : std::uint8_t { All, Given, Disarmed };
+
+// Makes the readable pages of [from, to) PAGE_NOACCESS, one VirtualProtect per run of chosen pages
+// of uniform protection: every page for a protect (taken into the group), the pages a scope gave
+// back, or the pages already known and not armed (driver and other faults). An armed page found
+// readable again was made accessible by someone else: it counts as lost and is armed again.
+bool armPages(ReadProbe& probe, std::uint64_t from, std::uint64_t to, std::uint32_t group, ArmPages which) {
+    bool armedAny = false;
+    for (auto at = from; at < to;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region)) == 0) break;
+        const auto regionEnd = std::min<std::uint64_t>(to, reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize);
+        if (region.State == MEM_COMMIT && (region.Protect & (PAGE_READWRITE | PAGE_READONLY)) != 0) {
+            std::uint64_t spanBegin = 0;
+            const auto flush = [&](std::uint64_t spanEnd) {
+                if (spanBegin == 0) return;
+                DWORD old = 0;
+                const bool done = VirtualProtect(reinterpret_cast<void*>(spanBegin), static_cast<SIZE_T>(spanEnd - spanBegin), PAGE_NOACCESS, &old) != 0;
+                for (auto page = spanBegin; page < spanEnd; page += ProbePage) pageEntry(probe, page, false)->armed = done;
+                armedAny = armedAny || done;
+                spanBegin = 0;
+            };
+            for (auto page = at; page < regionEnd; page += ProbePage) {
+                auto* entry = pageEntry(probe, page, which == ArmPages::All);
+                const bool chosen = entry != nullptr && (which == ArmPages::All || (which == ArmPages::Given ? entry->given : !entry->armed && !entry->given));
+                if (!chosen) {
+                    flush(page);
+                    continue;
+                }
+                if (entry->armed) ++probe.totals.lost;
+                if (which == ArmPages::All) entry->group = group;
+                entry->given = false;
+                entry->previous = region.Protect;
+                if (spanBegin == 0) spanBegin = page;
+            }
+            flush(regionEnd);
+        }
+        at = regionEnd;
+    }
+    return armedAny;
+}
+
+// Gives the armed pages of [from, to) (of one group, or any) their protection back, one
+// VirtualProtect per run of equal previous protection; `given` marks them for the end of a scope.
+std::uint64_t restorePages(ReadProbe& probe, std::uint64_t from, std::uint64_t to, std::uint32_t group, bool given) {
+    std::uint64_t restored = 0;
+    for (auto at = from; at < to;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region)) == 0) break;
+        const auto regionEnd = std::min<std::uint64_t>(to, reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize);
+        if (region.State == MEM_COMMIT && region.Protect == PAGE_NOACCESS) {
+            std::uint64_t spanBegin = 0;
+            DWORD spanPrevious = 0;
+            const auto flush = [&](std::uint64_t spanEnd) {
+                if (spanBegin == 0) return;
+                DWORD old = 0;
+                VirtualProtect(reinterpret_cast<void*>(spanBegin), static_cast<SIZE_T>(spanEnd - spanBegin), spanPrevious, &old);
+                spanBegin = 0;
+            };
+            for (auto page = at; page < regionEnd; page += ProbePage) {
+                auto* entry = pageEntry(probe, page, false);
+                if (entry == nullptr || !entry->armed || (group != AnyGroup && entry->group != group)) {
+                    flush(page);
+                    continue;
+                }
+                if (spanBegin != 0 && entry->previous != spanPrevious) flush(page);
+                if (spanBegin == 0) {
+                    spanBegin = page;
+                    spanPrevious = entry->previous;
+                }
+                entry->armed = false;
+                entry->given = given;
+                ++restored;
+            }
+            flush(regionEnd);
+        }
+        at = regionEnd;
+    }
+    return restored;
+}
+
+void noteCaller(ReadProbe& probe, ProbeModule module, std::uintptr_t pc) {
+    for (std::size_t i = 0; i < probe.callerCount; ++i) {
+        if (probe.callers[i].pc == pc) {
+            ++probe.callers[i].faults;
+            return;
+        }
+    }
+    if (probe.callerCount < ReadProbe::Callers) probe.callers[probe.callerCount++] = ReadProbeCaller{pc, 1, module};
+}
+
+// Arms again, in address order and in runs, the pages a driver or other fault gave back.
+void armPending(ReadProbe& probe) {
+    if (probe.pendingCount == 0) return;
+    std::sort(probe.pending.begin(), probe.pending.begin() + static_cast<std::ptrdiff_t>(probe.pendingCount));
+    std::size_t i = 0;
+    while (i < probe.pendingCount) {
+        auto stop = probe.pending[i] + ProbePage;
+        std::size_t j = i + 1;
+        while (j < probe.pendingCount && probe.pending[j] <= stop) {
+            stop = std::max(stop, probe.pending[j] + ProbePage);
+            ++j;
+        }
+        armPages(probe, probe.pending[i], stop, 0, ArmPages::Disarmed);
+        i = j;
+    }
+    probe.pendingCount = 0;
+}
+
+LONG CALLBACK readProbeFault(EXCEPTION_POINTERS* info) {
+    const auto* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
+    const bool write = record->ExceptionInformation[0] == 1;
+    const auto page = address / ProbePage * ProbePage;
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    auto* entry = pageEntry(probe, page, false);
+    if (entry == nullptr) {
+        ReleaseSRWLockExclusive(&probe.lock);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    MEMORY_BASIC_INFORMATION region{};
+    const bool queried = VirtualQuery(reinterpret_cast<void*>(page), &region, sizeof(region)) != 0 && region.State == MEM_COMMIT;
+    if (!entry->armed || !queried || region.Protect != PAGE_NOACCESS) {
+        // Not (or no longer) the probe's: another thread gave the page back since the fault, or
+        // someone else changed its protection. An access the page now allows is retried; the rest
+        // goes to the handlers after this one (the C library's write tracking).
+        const DWORD allows = write ? (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) : (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE);
+        const bool retry = queried && (region.Protect & allows) != 0;
+        ReleaseSRWLockExclusive(&probe.lock);
+        return retry ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    }
+    const auto [module, caller] = callerOf(probe, *info->ContextRecord);
+    const auto index = static_cast<std::size_t>(module);
+    const auto groupIndex = entry->group;
+    auto& group = probe.groups[groupIndex];
+    ++(write ? group.writes : group.reads)[index];
+    ++(write ? probe.totals.writes : probe.totals.reads)[index];
+    if (module == ProbeModule::Title) {
+        // The title's first access is the one counted: the whole range gets its protection back.
+        group.titleCaller = caller;
+        restorePages(probe, group.begin, group.end, groupIndex, false);
+    } else {
+        // The driver's and other modules' accesses give back only their page, armed again at the
+        // next protect, so they do not hide the title's.
+        noteCaller(probe, module, caller);
+        DWORD old = 0;
+        VirtualProtect(reinterpret_cast<void*>(page), ProbePage, entry->previous, &old);
+        entry->armed = false;
+        ++probe.totals.pageFaults;
+        if (probe.pendingCount < ReadProbe::Pending) probe.pending[probe.pendingCount++] = page;
+    }
+    ReleaseSRWLockExclusive(&probe.lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+std::size_t readProbeMinBytes() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_BUFFER_READ_PROBE_MIN_KIB");
+        return static_cast<std::size_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull) * 1024;
+    }();
+    return bytes;
+}
+
+void initReadProbe(ReadProbe& probe) {
+    static const bool installed = [&] {
+        const auto title = moduleRange(GetModuleHandleW(nullptr));
+        probe.titleBegin = title.first;
+        probe.titleEnd = title.second;
+        HMODULE driver = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&readProbeFault), &driver);
+        const auto own = moduleRange(driver);
+        probe.driverBegin = own.first;
+        probe.driverEnd = own.second;
+        AddVectoredExceptionHandler(1, readProbeFault);
+        return true;
+    }();
+    static_cast<void>(installed);
+}
+
+std::string moduleName(std::uintptr_t pc) {
+    HMODULE module = nullptr;
+    if (pc == 0 || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(pc), &module)) return "?";
+    char name[MAX_PATH]{};
+    const auto length = GetModuleFileNameA(module, name, MAX_PATH);
+    std::string path(name, length);
+    const auto slash = path.find_last_of("\\/");
+    char offset[32];
+    std::snprintf(offset, sizeof(offset), "+0x%llx", static_cast<unsigned long long>(pc - reinterpret_cast<std::uintptr_t>(module)));
+    return (slash == std::string::npos ? path : path.substr(slash + 1)) + offset;
+}
+
+// What a report prints, copied under the lock and printed after it (module names take the loader
+// lock, which a thread faulting on a protected page may hold).
+struct ReadProbeReport {
+    std::size_t groupCount = 0;
+    std::size_t pageCount = 0;
+    std::size_t pendingCount = 0;
+    BufferReadProbeCounts totals;
+    std::vector<ReadProbeGroup> groups;
+    std::vector<ReadProbeCaller> callers;
+};
+
+bool takeReadProbeReport(ReadProbe& probe, ReadProbeReport& report) {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (probe.lastReport == 0) probe.lastReport = nowMs;
+    if (nowMs - probe.lastReport < 10000) return false;
+    probe.lastReport = nowMs;
+    report.groupCount = probe.groupCount;
+    report.pageCount = probe.pageCount;
+    report.pendingCount = probe.pendingCount;
+    report.totals = probe.totals;
+    report.groups.assign(probe.groups.begin(), probe.groups.begin() + static_cast<std::ptrdiff_t>(probe.groupCount));
+    report.callers.assign(probe.callers.begin(), probe.callers.begin() + static_cast<std::ptrdiff_t>(probe.callerCount));
+    return true;
+}
+
+// Every range the title or another module touched, then the most protected others, up to twelve.
+void printReadProbeReport(ReadProbeReport& report) {
+    const auto& t = report.totals;
+    constexpr auto title = static_cast<std::size_t>(ProbeModule::Title);
+    constexpr auto other = static_cast<std::size_t>(ProbeModule::Other);
+    std::stable_sort(report.groups.begin(), report.groups.end(), [&](const ReadProbeGroup& a, const ReadProbeGroup& b) {
+        const bool aTouched = a.reads[title] + a.writes[title] + a.reads[other] + a.writes[other] != 0;
+        const bool bTouched = b.reads[title] + b.writes[title] + b.reads[other] + b.writes[other] != 0;
+        if (aTouched != bTouched) return aTouched;
+        return a.protects > b.protects;
+    });
+    std::string ranges;
+    for (std::size_t i = 0; i < report.groups.size() && i < 12; ++i) {
+        const auto& group = report.groups[i];
+        char where[256];
+        std::snprintf(where, sizeof(where), " [%llx %llu KiB: notes %llu, protects %llu, title r%llu w%llu, driver r%llu w%llu, other r%llu w%llu",
+            static_cast<unsigned long long>(group.begin), static_cast<unsigned long long>((group.end - group.begin) >> 10u), static_cast<unsigned long long>(group.notes), static_cast<unsigned long long>(group.protects),
+            static_cast<unsigned long long>(group.reads[0]), static_cast<unsigned long long>(group.writes[0]), static_cast<unsigned long long>(group.reads[1]), static_cast<unsigned long long>(group.writes[1]), static_cast<unsigned long long>(group.reads[2]), static_cast<unsigned long long>(group.writes[2]));
+        ranges += where;
+        if (group.titleCaller != 0) ranges += ", title last " + moduleName(static_cast<std::uintptr_t>(group.titleCaller));
+        ranges += "]";
+    }
+    std::string callers;
+    for (const auto& caller : report.callers) {
+        callers += " [" + moduleName(static_cast<std::uintptr_t>(caller.pc)) + (caller.module == ProbeModule::Driver ? " driver " : " other ") + std::to_string(caller.faults) + "]";
+    }
+    std::fprintf(stderr, "[bufread-probe] (cumulative): %zu ranges, %zu pages, %llu protects (%llu refused), %llu pages lost, %llu given to scopes, %llu given to driver or other faults (%zu pending); faults: title reads %llu writes %llu, driver reads %llu writes %llu, other reads %llu writes %llu; ranges:%s; callers:%s%c",
+        report.groupCount, report.pageCount, static_cast<unsigned long long>(t.protects), static_cast<unsigned long long>(t.refused), static_cast<unsigned long long>(t.lost), static_cast<unsigned long long>(t.scoped), static_cast<unsigned long long>(t.pageFaults), report.pendingCount,
+        static_cast<unsigned long long>(t.reads[0]), static_cast<unsigned long long>(t.writes[0]), static_cast<unsigned long long>(t.reads[1]), static_cast<unsigned long long>(t.writes[1]), static_cast<unsigned long long>(t.reads[2]), static_cast<unsigned long long>(t.writes[2]),
+        ranges.empty() ? " none" : ranges.c_str(), callers.empty() ? " none" : callers.c_str(), 10);
+}
+#endif
+
+}
+
+bool BufferReadProbe() {
+#ifdef _WIN32
+    static const bool enabled = std::getenv("APS5_BUFFER_READ_PROBE") != nullptr;
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+void ProbeProtectWrittenRange(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    const auto begin = (address + ProbePage - 1) / ProbePage * ProbePage;
+    const auto end = (address + bytes) / ProbePage * ProbePage;
+    if (end <= begin || end - begin < readProbeMinBytes()) return;
+    auto& probe = readProbe();
+    initReadProbe(probe);
+    ReadProbeReport report;
+    AcquireSRWLockExclusive(&probe.lock);
+    armPending(probe);
+    std::size_t group = probe.groupCount;
+    for (std::size_t i = 0; i < probe.groupCount; ++i) {
+        if (probe.groups[i].begin == begin && probe.groups[i].end == end) {
+            group = i;
+            break;
+        }
+    }
+    if (group == probe.groupCount && probe.groupCount < ReadProbe::Groups) {
+        probe.groups[group] = ReadProbeGroup{begin, end};
+        ++probe.groupCount;
+    }
+    if (group == probe.groupCount) {
+        ++probe.totals.refused;
+    } else {
+        ++probe.groups[group].notes;
+        if (armPages(probe, begin, end, static_cast<std::uint32_t>(group), ArmPages::All)) {
+            ++probe.groups[group].protects;
+            ++probe.totals.protects;
+        }
+    }
+    const bool reporting = takeReadProbeReport(probe, report);
+    ReleaseSRWLockExclusive(&probe.lock);
+    if (reporting) printReadProbeReport(report);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+ProbeHostRead::ProbeHostRead(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    if (!BufferReadProbe() || bytes == 0) return;
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    const auto from = address / ProbePage * ProbePage;
+    const auto to = (address + bytes + ProbePage - 1) / ProbePage * ProbePage;
+    const auto given = restorePages(probe, from, to, AnyGroup, true);
+    probe.totals.scoped += given;
+    ReleaseSRWLockExclusive(&probe.lock);
+    if (given != 0) {
+        scopeBegin = from;
+        scopeBytes = static_cast<std::size_t>(to - from);
+    }
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+ProbeHostRead::~ProbeHostRead() {
+#ifdef _WIN32
+    if (scopeBytes == 0) return;
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    armPages(probe, scopeBegin, scopeBegin + scopeBytes, 0, ArmPages::Given);
+    ReleaseSRWLockExclusive(&probe.lock);
+#endif
+}
+
+BufferReadProbeCounts BufferReadProbeTotals() {
+#ifdef _WIN32
+    auto& probe = readProbe();
+    AcquireSRWLockShared(&probe.lock);
+    const auto totals = probe.totals;
+    ReleaseSRWLockShared(&probe.lock);
+    return totals;
+#else
+    return {};
+#endif
+}
+
+void ResetBufferReadProbe() {
+#ifdef _WIN32
+    auto& probe = readProbe();
+    AcquireSRWLockExclusive(&probe.lock);
+    for (auto& entry : probe.pages) {
+        if (entry.page != 0 && entry.armed) {
+            DWORD old = 0;
+            VirtualProtect(reinterpret_cast<void*>(entry.page), ProbePage, entry.previous, &old);
+        }
+        entry = ReadProbePage{};
+    }
+    for (std::size_t i = 0; i < probe.groupCount; ++i) probe.groups[i] = ReadProbeGroup{};
+    probe.groupCount = 0;
+    probe.pageCount = 0;
+    probe.pendingCount = 0;
+    probe.callerCount = 0;
+    probe.totals = {};
+    ReleaseSRWLockExclusive(&probe.lock);
+#endif
+}
+
+void GuestBufferMemory::ProbeWrites() const {
+    for (const auto& [begin, end] : writes) {
+        std::uint64_t staged = 0;
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal) continue;
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) staged += to - from;
+        }
+        const auto bytes = end - begin;
+        if (BufferShadowProbe()) ProbeGpuBufferWrite(begin, static_cast<std::size_t>(bytes), staged * 2 >= bytes);
+        if (BufferReadProbe()) ProbeProtectWrittenRange(begin, static_cast<std::size_t>(bytes));
+    }
+}
+
 bool GuestBufferMemory::HasCopiedWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
@@ -4981,6 +5728,18 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+    }
+    // A range slab region's written bytes, copied back like a staging buffer's and stamped above,
+    // are the slab's too: fresh at the generation after the stamps, and already in the import.
+    for (const auto& region : regions) {
+        if (!region.shadow || !region.copiedBack) continue;
+        std::vector<ShadowedRange> marked;
+        for (const auto& [begin, end] : writes) {
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) marked.push_back({from, to, region.shadowSlab});
+        }
+        if (!marked.empty()) MarkShadowed(region.shadowImport, marked, GuestMemory::TrackerGeneration(), !BufferShadowLazy());
     }
 }
 
@@ -5093,6 +5852,7 @@ void GuestBufferMemory::WriteBack() {
             std::memcpy(mirror.shadow.data() + offset, current.data(), length);
             continue;
         }
+        if (region.shadow) continue;
         if (region.gpuCopy) {
             Require(region.buffer != nullptr && end <= region.end, "write-back range exceeds its GPU owner");
             if (region.copiedBack) {
@@ -5200,10 +5960,30 @@ void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::u
     }
 }
 
+void GuestBufferMemory::PlacementBytes(std::uint64_t& hostBytes, std::uint64_t& deviceBytes) const {
+    hostBytes = deviceBytes = 0;
+    if (!uploaded || committed) return;
+    for (const auto& region : regions) {
+        const auto bytes = region.end - region.begin;
+        if (region.shadow || (region.direct == nullptr && region.deviceLocal)) deviceBytes += bytes;
+        else hostBytes += bytes;
+    }
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     InPlaceReads(result);
     return result;
+}
+
+std::size_t GuestBufferMemory::PublishLiveUnderOwnRanges() const {
+    if (!uploaded || committed) return 0;
+    std::size_t units = 0;
+    for (const auto& [begin, end] : ownRanges) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (bytes != 0 && AnyShadowedOverlaps(begin, bytes)) units += PublishShadow(begin, bytes, PublishScope::Whole, PublishReason::Address);
+    }
+    return units;
 }
 
 std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceReads() const {
@@ -5246,6 +6026,21 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     std::vector<Region*> copies;
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
+        if (region.shadow) {
+            // The descriptors name the slab and offset the build took: a slab grown, evicted or
+            // retired since makes the reuse fail (the build is made again).
+            auto destination = region.shadowReader ? RangeShadowSource(context, region.shadowImport, region.begin, region.end) : RangeShadowDestination(context, region.shadowImport, region.begin, region.end);
+            if (!destination.has_value() || destination->slab != region.shadowSlab || destination->offset != region.shadowOffset) {
+                bufferShadowStats().moved.fetch_add(1, std::memory_order_relaxed);
+                throw std::runtime_error("the range slab of a reused build's region moved");
+            }
+            region.shadowPin = destination->pin;
+            region.shadowSeeds = std::move(destination->seedUnits);
+            region.copiedBack = false;
+            bufferShadowStats().reused.fetch_add(1, std::memory_order_relaxed);
+            copies.push_back(&region);
+            continue;
+        }
         // The previous use's copy-back was recorded by its MarkGpuWrites (or never, when that use
         // threw first: counted); this use records its own after its work, from the shadow this
         // copy-in refills. The import is the one the region was taken from (the caller checked its
@@ -5333,7 +6128,7 @@ void GuestBufferMemory::NoteStagedCopies() {
     if (!residentStaging() || !uploaded || committed) return;
     const auto generation = GuestMemory::TrackerGeneration();
     for (auto& region : regions) {
-        if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.buffer == nullptr) continue;
+        if (region.shadow || !region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.buffer == nullptr) continue;
         region.copyBackGeneration = generation;
         for (const auto& [begin, end] : writes) {
             const auto from = std::max(begin, region.begin);

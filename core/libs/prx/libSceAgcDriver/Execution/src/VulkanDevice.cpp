@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -2196,6 +2197,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
+    if (Graphics::BufferShadowProbe()) Graphics::ProbeBufferBoundary(Graphics::ProbeBoundary::Label);
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
@@ -3697,6 +3699,10 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
     return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
 }
 
+std::shared_ptr<const Graphics::DrawInputSpeculation> VulkanDevice::SpeculateDrawInputs(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    return Graphics::SpeculateDrawInputs(graphicsContext(), graphics, shaders);
+}
+
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }
@@ -4668,6 +4674,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (Graphics::Recorder::GpuTimingEnabled()) {
+        std::uint64_t hostBytes = 0, deviceBytes = 0;
+        resources.PlacementBytes(hostBytes, deviceBytes);
+        Graphics::Recorder::NoteProgramPlacement(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId, hostBytes, deviceBytes, resources.UsesAddressTable());
+    }
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, Graphics::HostImportOffset(*argumentImport, arguments));

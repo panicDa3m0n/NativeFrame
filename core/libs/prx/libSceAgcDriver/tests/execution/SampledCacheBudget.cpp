@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "VulkanTestDevice.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -165,9 +166,15 @@ private:
 
 class Block {
 public:
-    explicit Block(const Context& context) : context(context) {
+    // `watched`: guest arena memory, whose writes the tracker collects (the fast proofs need it).
+    explicit Block(const Context& context, bool watched = false) : context(context), watched(watched) {
 #ifdef _WIN32
-        memory = VirtualAlloc(nullptr, AllocationBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (watched) {
+            memory = GuestArena::GuestArenaAllocate_nid_postfix(AllocationBytes, 65536);
+            if (memory != nullptr) GuestArena::GuestArenaCommit_nid_postfix(memory, AllocationBytes, PAGE_READWRITE, AllocationBytes);
+        } else {
+            memory = VirtualAlloc(nullptr, AllocationBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
 #else
         memory = std::aligned_alloc(65536, AllocationBytes);
 #endif
@@ -181,7 +188,12 @@ public:
         GuestAllocations::Mutation().Remove(memory);
         HostImportFor(context, Surface(0), BlockBytes);
 #ifdef _WIN32
-        VirtualFree(memory, 0, MEM_RELEASE);
+        if (watched) {
+            GuestArena::GuestArenaReset_nid_postfix(memory, AllocationBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, AllocationBytes);
+        } else {
+            VirtualFree(memory, 0, MEM_RELEASE);
+        }
 #else
         std::free(memory);
 #endif
@@ -191,6 +203,7 @@ public:
 
 private:
     const Context& context;
+    bool watched = false;
     void* memory = nullptr;
 };
 
@@ -217,7 +230,7 @@ GuestTextureResource Resource(std::uint64_t address, std::uint32_t side = Side) 
     return DecodeTextureResource(words);
 }
 
-std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Block& block, std::size_t first, std::uint32_t count, bool sampled) {
+ShaderRecompiler::RecompileResult ImageProgram(const Block& block, std::size_t first, std::uint32_t count, bool sampled) {
     ShaderRecompiler::DescriptorBinding binding{};
     binding.kind = sampled ? ShaderRecompiler::DescriptorKind::SampledImage : ShaderRecompiler::DescriptorKind::StorageImage;
     binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
@@ -233,6 +246,11 @@ std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Bl
     }
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
+    return program;
+}
+
+std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Block& block, std::size_t first, std::uint32_t count, bool sampled) {
+    const auto program = ImageProgram(block, first, count, sampled);
     const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     return std::make_shared<ShaderResources>(context, shader);
 }
@@ -510,6 +528,37 @@ void releasedTests(Context context) {
     std::puts("resource cache released texture tests passed");
 }
 
+// O20.T8: a descriptor set whose sampled snapshot the cache released keeps it alive outside the
+// budget; its proof refuses it (the full walk would make another texture), as the resource cache
+// drops it.
+void releasedProofTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    ClearCachedTextures(context.device);
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::puts("released texture proof tests skipped: no write watching");
+        return;
+    }
+    Block block(context, true);
+    Require(AgcDriver::GuestMemory::Watched(block.Surface(0), Side * Side * 4u), "the proof fixture's block is not watched");
+    const auto program = ImageProgram(block, 3, 1, true);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    Require(resources->SampledTextures().size() == 1 && !resources->SampledTextures().front()->ViewsStorageImage(), "the proof fixture does not hold a sampled snapshot");
+    ShaderResources::ProofReport report;
+    Require(resources->Revalidate(std::span(&shader, 1), &report), "a descriptor set whose sampled snapshot is cached is not reusable");
+    Require(resources->Revalidate(std::span(&shader, 1), &report) && report.path == ShaderResources::ProofPath::Fast, "the cached descriptor set's second proof is not the fast one (path " + std::to_string(static_cast<int>(report.path)) + ", failure " + std::to_string(static_cast<int>(report.failure)) + ")");
+    ClearCachedTextures(context.device);
+    Require(resources->SampledTextures().front()->Released(), "the sampled cache dropped the held snapshot without marking it released");
+    const bool reused = resources->Revalidate(std::span(&shader, 1), &report);
+    Require(!reused, "a descriptor set whose sampled snapshot the cache released was proved reusable (path " + std::to_string(static_cast<int>(report.path)) + ")");
+    resources.reset();
+    ClearCachedTextures(context.device);
+    std::puts("released texture proof tests passed");
+}
+
 void rescanTests(const Context& context) {
     constexpr std::uint32_t SmallSide = 128;
     constexpr std::size_t SmallBytes = std::size_t{SmallSide} * SmallSide * 4u;
@@ -771,6 +820,7 @@ int main(int argc, char** argv) {
             snapshotTests(context);
             heldTests(context);
             releasedTests(context);
+            releasedProofTests(context);
             rescanTests(context);
             viewEvictionTests(context);
             viewTests(context);

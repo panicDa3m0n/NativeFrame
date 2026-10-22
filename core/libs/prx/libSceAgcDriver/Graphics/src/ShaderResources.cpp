@@ -2713,6 +2713,14 @@ void countOwnRefresh(bool storage) {
 
 // APS5_NO_OWN_IMAGE_REFRESH=1: a Pending failure of the fast proof takes the full walk, as before
 // the own-object refresh (T1).
+// A texture the sampled cache released (dropped while held, or refused by its budget) stays alive
+// outside the budget for as long as a template holds it: no proof reuses such a template, as the
+// resource cache drops it (APS5_PROOF_KEEPS_RELEASED reuses it as before).
+bool ProofRefusesReleased() {
+    static const bool keeps = std::getenv("APS5_PROOF_KEEPS_RELEASED") != nullptr;
+    return !keeps;
+}
+
 bool OwnImageRefreshEnabled() {
     static const bool disabled = std::getenv("APS5_NO_OWN_IMAGE_REFRESH") != nullptr;
     return !disabled;
@@ -2841,6 +2849,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
+        if (ProofRefusesReleased() && textures[i] != nullptr && textures[i]->Released()) return fail(FastFail::Evicted);
         if (surface.depth) {
             if (!depthStillServes(i)) return fail(FastFail::Depth);
             continue;
@@ -2975,6 +2984,7 @@ bool ShaderResources::fastRevalidateEach() {
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return false;
+        if (ProofRefusesReleased() && textures[i] != nullptr && textures[i]->Released()) return false;
         if (surface.depth) {
             if (!depthStillServes(i)) return false;
             continue;

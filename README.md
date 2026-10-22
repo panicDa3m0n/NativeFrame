@@ -32,7 +32,7 @@ NativeFrame is a performance-focused fork of AnyPS5. AnyPS5 makes PS5 titles sta
 **Experimental.** NativeFrame is a research codebase, not a product. There are no releases and no graphical interface yet.
 
 - Development and all measurements so far happen on one Windows 11 machine (Intel Core i7-11700K, NVIDIA RTX 4070 Ti SUPER) with one reference title, Astro Bot, in one fixed scene.
-- In that scene the frame time went from about 200 ms (about 5 FPS) at the start of the fork to about 74 ms (about 13.5 FPS) with the recommended runtime switches. The first figure was measured with the draw profiler on, which adds a few milliseconds per frame. The limit today is the CPU: the chain that turns each draw call into Vulkan commands.
+- In that scene NativeFrame's driver changes took the frame time from about 200 ms (about 5 FPS) to about 74 ms (about 13.5 FPS) on an older AnyPS5 base. On 2026-10-22 `main` was realigned with AnyPS5 `main`, and those changes now come back one mechanism at a time, as pull requests here and to AnyPS5, each measured on the current base. The frame time of `main` is therefore AnyPS5's plus the changes merged so far; each pull request shows its own measurements.
 - The next steps, the measurements behind them and the open problems are in [docs/research](docs/research/README.md). Help is welcome: see the issues labeled **help wanted**.
 - Compatibility of a title with AnyPS5 does not mean it is playable in NativeFrame, and vice versa. NativeFrame does not keep a compatibility list yet.
 - Linux builds are inherited from AnyPS5 and should still work, but NativeFrame does not test them.
@@ -49,7 +49,7 @@ To run a converted title:
 To build:
 
 - Git, CMake 3.22.1 or newer, Ninja.
-- Windows: **WinLibs MinGW-w64 GCC 15.2.0** (`x86_64-ucrt-posix-seh`, release [`15.2.0posix-14.0.0-ucrt-r7`](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-14.0.0-ucrt-r7)). It is the only Windows toolchain supported, as in upstream.
+- Windows: **WinLibs MinGW-w64 GCC 15.2.0** (`x86_64-ucrt-posix-seh`, release [`15.2.0posix-14.0.0-ucrt-r7`](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-14.0.0-ucrt-r7)). NativeFrame's CI uses it. Upstream also supports MSYS2 UCRT64 GCC 16.2.0; see [docs/dev/BUILD.md](docs/dev/BUILD.md).
 - Python 3.9 or newer (optional, enables the Python tests).
 
 ## Building

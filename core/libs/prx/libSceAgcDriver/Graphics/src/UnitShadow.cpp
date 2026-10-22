@@ -65,6 +65,7 @@ struct Statistics {
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
     std::atomic<std::uint64_t> rangeMade{0}, rangeGrown{0}, rangeRefused{0}, rangeRehomed{0};
+    std::atomic<std::uint64_t> strandedMoved{0}, strandedPublished{0};
 };
 
 Statistics& Stats() {
@@ -665,6 +666,54 @@ void recordSlabMoves(const Context& context, const std::shared_ptr<ShadowSlab>& 
     for (const auto& slab : from) recorder->Keep(slab);
 }
 
+// Bytes a write was recorded into a slab that no longer holds their units when the write is marked
+// (a range slab grew over the slab or took its grid units in between: its moves were recorded
+// before the write). `to` holds the units now; without one the bytes go to the import.
+struct StrandedPiece {
+    std::shared_ptr<ShadowSlab> from;
+    std::shared_ptr<ShadowSlab> to;
+    VkDeviceSize sourceOffset;
+    VkDeviceSize destinationOffset;
+    VkDeviceSize bytes;
+    std::uint64_t address;
+};
+
+bool strandedRescue() {
+    static const bool enabled = std::getenv("APS5_NO_STRANDED_RESCUE") == nullptr;
+    return enabled;
+}
+
+// Records the stranded bytes' copies behind the write that made them, as the moves are recorded.
+void recordStrandedCopies(const Context& context, VkBuffer importBuffer, const std::vector<StrandedPiece>& pieces) {
+    if (pieces.empty()) return;
+    auto* recorder = Recorder::Active();
+    std::unique_ptr<CommandBatch> batch;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (recorder != nullptr) {
+        commands = recorder->Commands();
+    } else {
+        batch = std::make_unique<CommandBatch>(context);
+        commands = batch->Handle();
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (const auto& piece : pieces) {
+        if (piece.to != nullptr) CopyBuffer(context, commands, piece.from->buffer, piece.sourceOffset, piece.to->buffer, piece.destinationOffset, piece.bytes);
+        else CopyHostBuffer(context, commands, piece.from->buffer, piece.sourceOffset, importBuffer, piece.destinationOffset, piece.bytes);
+    }
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    if (batch) {
+        batch->SubmitAndWait();
+        return;
+    }
+    recorder->MarkCovered(copiedAccess);
+    for (const auto& piece : pieces) {
+        recorder->Keep(piece.from);
+        if (piece.to != nullptr) recorder->Keep(piece.to);
+        else recorder->NotePendingWrite(piece.address, static_cast<std::size_t>(piece.bytes));
+    }
+}
+
 }
 
 bool UnitShadowEnabled() {
@@ -1248,6 +1297,8 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     std::uint64_t bytes = 0;
     std::uint64_t lost = 0;
     bool grid = false, ranged = false;
+    std::vector<StrandedPiece> stranded;
+    std::shared_ptr<UnitShadow> strandedShadow;
     {
         std::lock_guard lock(registry.mutex);
         const auto shadow = find(registry, import);
@@ -1263,10 +1314,30 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
             for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(end - 1); ++unit) {
                 const auto& current = shadow->SlabOf(unit);
                 if (current == nullptr || current != slab) {
-                    // The copies went into a slab the shadow no longer holds: the import keeps
+                    // The copies went into a slab the shadow no longer holds. A range slab holding
+                    // the unit now, or the import when no slab does, gets them behind the write;
+                    // else (APS5_NO_STRANDED_RESCUE, or a grid slab replaced) the import keeps
                     // whatever it had, as after a refused piece.
-                    ++lost;
-                    continue;
+                    const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+                    const auto from = std::max(begin, unitBegin);
+                    const auto to = std::min(end, unitEnd);
+                    const bool toRange = current != nullptr && shadow->RangeOf(unit) != nullptr;
+                    if (!strandedRescue() || from >= to || slab == nullptr || (current != nullptr && !toRange)) {
+                        ++lost;
+                        continue;
+                    }
+                    const auto source = (from - shadow->base) - slab->firstUnit * UnitBytes;
+                    strandedShadow = shadow;
+                    if (!toRange) {
+                        // A published write's copy-back already put the bytes there.
+                        if (!published) {
+                            stranded.push_back({slab, nullptr, source, from - shadow->importBase + shadow->importLead, to - from, from});
+                            Stats().strandedPublished.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        continue;
+                    }
+                    stranded.push_back({slab, current, source, (from - shadow->base) - current->firstUnit * UnitBytes, to - from, from});
+                    Stats().strandedMoved.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (auto* range = shadow->RangeOf(unit)) {
                     const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
@@ -1285,6 +1356,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         }
         shadow->Recount();
     }
+    if (strandedShadow != nullptr) recordStrandedCopies(strandedShadow->context, strandedShadow->importBuffer, stranded);
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
         static std::atomic<int> reports{0};
@@ -1680,7 +1752,7 @@ std::string ShadowReport() {
     std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
     line += text;
     if (RangeSlabsEnabled()) {
-        std::snprintf(text, sizeof(text), ", range slabs %llu live (made %llu, grown %llu, refused %llu, grid units rehomed %llu)", rangeSlabs, take(statistics.rangeMade), take(statistics.rangeGrown), take(statistics.rangeRefused), take(statistics.rangeRehomed));
+        std::snprintf(text, sizeof(text), ", range slabs %llu live (made %llu, grown %llu, refused %llu, grid units rehomed %llu, stranded units moved %llu, published %llu)", rangeSlabs, take(statistics.rangeMade), take(statistics.rangeGrown), take(statistics.rangeRefused), take(statistics.rangeRehomed), take(statistics.strandedMoved), take(statistics.strandedPublished));
         line += text;
     }
     if (ShadowVerify()) {

@@ -59,6 +59,8 @@
 //   LettoreRiusatoPubblica: a reused build reading the range in place publishes it in its proof;
 //   SpeculazioneRifiutata: neither a draw's bindings nor a speculation copy a range with live bytes
 //     (the bindings publish it and read it in place);
+//   ScrittoreAssorbito: a writer whose slab a later upload grows over before the writer's work is
+//     marked keeps its bytes (they reach the slab that holds the units now);
 //   RitiroPubblica: an import retired while its range stays registered publishes the live bytes;
 //   --evict: an evicted slab publishes its live bytes.
 
@@ -526,6 +528,27 @@ int RunLazy(const Context& context, Recorder& recorder, WatchedBlock& watched, c
     uses.Settle();
     Require(Holds(bytes + Unit, Page, 0x4c), "the later writer's page did not reach the import");
     Require(Holds(bytes + Unit + Page, RegionBytes - Page, 0x3b), "the slab's bytes from before the stores through addresses came back over them");
+
+    // ScrittoreAssorbito (O20.T1): X takes a range slab over the first 2 MiB of region D; Y's upload of
+    // [D + 1 MiB, D + 3 MiB) grows a slab over X's before X's work is recorded, so the move of X's slab
+    // runs first and X's fill lands in the slab the units left. X writes the first MiB, Y the last.
+    {
+        const auto d = address + (12u << 20u);
+        constexpr std::size_t Mib = std::size_t{1} << 20u;
+        auto x = uses.Upload(d, 2 * Mib);
+        auto y = uses.Upload(d + Mib, 2 * Mib);
+        Require(uses.InSlab(x) && uses.InSlab(y) && x.info.buffer != y.info.buffer, "the upload over X's slab did not grow a new range slab");
+        uses.Shade(x, 0, Mib, 0x1d);
+        uses.Finish(x);
+        uses.Shade(y, Mib, Mib, 0x2e);
+        uses.Finish(y);
+        uses.Settle();
+        std::vector<std::byte> read(3 * Mib);
+        AgcDriver::GuestMemory::Read(d, read);
+        Require(Holds(read.data(), Mib, 0x1d), "the writer whose slab grew before its work was marked lost its bytes");
+        Require(Holds(read.data() + Mib, Mib, 0x11) && Holds(read.data() + 2 * Mib, Mib, 0x2e), "the bytes around the absorbed writer's are wrong");
+        Require(Holds(bytes + (12u << 20u), Mib, 0x1d) && !AnyShadowedOverlaps(d, 3 * Mib), "the absorbed writer's bytes did not reach the import");
+    }
 
     // RitiroPubblica: region C written lazily, then its registration replaced in one mutation (the
     // range stays registered, the import retires).

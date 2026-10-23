@@ -3441,8 +3441,11 @@ bool ShaderResources::EpochProofs() {
 }
 
 namespace {
+std::atomic<std::uint64_t> epochProofReuses{0};
+
 void noteEpochProof(bool reused, bool verified, bool failed) {
-    static std::atomic<std::uint64_t> reuses{0}, proofs{0}, checks{0}, failures{0};
+    auto& reuses = epochProofReuses;
+    static std::atomic<std::uint64_t> proofs{0}, checks{0}, failures{0};
     if (verified) checks.fetch_add(1, std::memory_order_relaxed);
     if (failed) failures.fetch_add(1, std::memory_order_relaxed);
     const auto count = (reused ? reuses : proofs).fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -3450,6 +3453,10 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
     if (!report) return;
     if (count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[epoch-proofs] resource proofs: %llu reused the epoch's, %llu proved; verify: %llu checked, %llu failed; storage refreshes reused %llu\n", static_cast<unsigned long long>(reuses.load()), static_cast<unsigned long long>(proofs.load()), static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(failures.load()), static_cast<unsigned long long>(StorageTexture::epochRefreshes.load()));
 }
+}
+
+std::uint64_t ShaderResources::EpochProofReuses() {
+    return epochProofReuses.load(std::memory_order_relaxed);
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {

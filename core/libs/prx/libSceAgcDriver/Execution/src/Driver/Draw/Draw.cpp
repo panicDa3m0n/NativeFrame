@@ -1346,7 +1346,7 @@ DrawPrepare::Prepared Driver::prepareParallelDraw(const std::shared_ptr<Parallel
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(held->localDevice, commitQueue, held->decode->state, held->drawParameters, held->stages, held->snapshots, held->recipe, held->recipeStages, held->drawKey, held->preparedKey ? &*held->preparedKey : nullptr);
-        }, std::move(writes));
+        }, std::move(writes), 0, {}, {}, true);
     };
     return prepared;
 }

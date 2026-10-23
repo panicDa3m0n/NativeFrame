@@ -26,6 +26,11 @@ class DrawPipeline {
 public:
     using Commit = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
+    struct Watch {
+        std::uint64_t retired = 0;
+        std::size_t items = 0;
+        std::vector<Range> writes;
+    };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, SubmitInterrupt, SubmitDeadline, SubmitCap, Count };
 
@@ -62,6 +67,11 @@ public:
     void Note(Event event) { events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t Events(Event event) const { return events[static_cast<std::size_t>(event)].load(std::memory_order_relaxed); }
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    Watch WatchWrites();
+    bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
+    std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
+    void NoteDecodeDrain() { decodeDrains.fetch_add(1, std::memory_order_relaxed); }
+    std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
     void ReleaseRunningReads();
@@ -116,6 +126,9 @@ private:
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
+    std::atomic<std::uint64_t> retiredItems{0};
+    std::atomic<std::uint64_t> decodeDrains{0};
+    std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
     std::uint64_t producerWakes = 0;
     bool committerWaiting = false;

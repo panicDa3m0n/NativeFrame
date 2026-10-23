@@ -32,6 +32,7 @@ int APS5_VABI FT_New_Face_nid_postfix(void*, const char*, std::int64_t, GuestFac
 int APS5_VABI FT_New_Memory_Face_nid_postfix(void*, const unsigned char*, std::int64_t, std::int64_t, GuestFaceRec**);
 int APS5_VABI FT_Done_Face_nid_postfix(GuestFaceRec*);
 int APS5_VABI FT_Set_Pixel_Sizes_nid_postfix(GuestFaceRec*, std::uint32_t, std::uint32_t);
+int APS5_VABI FT_Get_Kerning_nid_postfix(GuestFaceRec*, std::uint32_t, std::uint32_t, std::uint32_t, GuestVector*);
 std::uint32_t APS5_VABI FT_Get_Char_Index_nid_postfix(GuestFaceRec*, std::uint64_t);
 int APS5_VABI FT_Load_Glyph_nid_postfix(GuestFaceRec*, std::uint32_t, std::int32_t);
 int APS5_VABI FT_Load_Char_nid_postfix(GuestFaceRec*, std::uint64_t, std::int32_t);
@@ -453,6 +454,75 @@ int main() {
     const auto& guestMetrics = face->size->metrics;
     Require(guestMetrics.x_ppem == 100 && guestMetrics.y_ppem == 100 && guestMetrics.x_scale == metrics.x_scale && guestMetrics.y_scale == metrics.y_scale);
     Require(guestMetrics.ascender == metrics.ascender && guestMetrics.descender == metrics.descender && guestMetrics.height == metrics.height && guestMetrics.max_advance == metrics.max_advance);
+
+    GuestVector kerning{123, 456};
+    Require(FT_Get_Kerning_nid_postfix(nullptr, 1, 1, FT_KERNING_DEFAULT, &kerning) == FT_Err_Invalid_Face_Handle);
+    Require(kerning.x == 123 && kerning.y == 456);
+    Require(FT_Get_Kerning_nid_postfix(nullptr, 1, 1, FT_KERNING_DEFAULT, nullptr) == FT_Err_Invalid_Face_Handle);
+    Require(FT_Get_Kerning_nid_postfix(face, 1, 1, FT_KERNING_DEFAULT, nullptr) == FT_Err_Invalid_Argument);
+    Require(FT_Get_Kerning_nid_postfix(face, 1, 1, FT_KERNING_DEFAULT, &kerning) == 0);
+    Require(kerning.x == 0 && kerning.y == 0);
+
+    auto kernFont = font;
+    const std::uint32_t kernOffset = static_cast<std::uint32_t>(kernFont.size()) + 16;
+    kernFont[5] = 8;
+    kernFont[7] = 128;
+    kernFont[9] = 3;
+    kernFont[11] = 0;
+    for (std::size_t entry = 12; entry < 12 + 7 * 16; entry += 16) {
+        const std::uint32_t offset = (static_cast<std::uint32_t>(kernFont[entry + 8]) << 24) |
+            (static_cast<std::uint32_t>(kernFont[entry + 9]) << 16) |
+            (static_cast<std::uint32_t>(kernFont[entry + 10]) << 8) | kernFont[entry + 11];
+        std::vector<unsigned char> adjusted;
+        Put32(adjusted, offset + 16);
+        std::memcpy(kernFont.data() + entry + 8, adjusted.data(), 4);
+    }
+    std::vector<unsigned char> kernEntry{'k', 'e', 'r', 'n'};
+    Put32(kernEntry, 0);
+    Put32(kernEntry, kernOffset);
+    Put32(kernEntry, 24);
+    kernFont.insert(kernFont.begin() + 12 + 5 * 16, kernEntry.begin(), kernEntry.end());
+    PutAll16(kernFont, {0, 1, 0, 20, 1, 1, 6, 0, 0, 1, 1, -73});
+    {
+        std::ofstream file(root / "app0" / "kern.ttf", std::ios::binary);
+        file.write(reinterpret_cast<const char*>(kernFont.data()), static_cast<std::streamsize>(kernFont.size()));
+    }
+    FT_Face kernHost = nullptr;
+    GuestFaceRec* kernFace = nullptr;
+    Require(FT_New_Memory_Face(hostLibrary, kernFont.data(), static_cast<FT_Long>(kernFont.size()), 0, &kernHost) == 0);
+    Require(FT_New_Face_nid_postfix(library, "/app0/kern.ttf", 0, &kernFace) == 0);
+    Require(FT_HAS_KERNING(kernHost));
+    const unsigned modes[] = {FT_KERNING_DEFAULT, FT_KERNING_UNFITTED, FT_KERNING_UNSCALED, 99};
+    for (const unsigned size : {100u, 12u}) {
+        Require(FT_Set_Pixel_Sizes_nid_postfix(kernFace, 0, size) == 0 && FT_Set_Pixel_Sizes(kernHost, 0, size) == 0);
+        for (const unsigned mode : modes) {
+            FT_Vector expected{};
+            Require(FT_Get_Kerning(kernHost, 1, 1, mode, &expected) == 0);
+            kerning = {123, 456};
+            Require(FT_Get_Kerning_nid_postfix(kernFace, 1, 1, mode, &kerning) == 0);
+            Require(kerning.x == expected.x && kerning.y == expected.y && kerning.y == 0);
+            if (mode == FT_KERNING_UNSCALED) Require(kerning.x == -73);
+            if (size == 100 && mode == FT_KERNING_DEFAULT) Require(kerning.x == -448);
+            if (size == 100 && mode == FT_KERNING_UNFITTED) Require(kerning.x == -467);
+            for (const unsigned leftGlyph : {0x10001u, 0x7FFF0001u}) {
+                kerning = {123, 456};
+                Require(FT_Get_Kerning_nid_postfix(kernFace, leftGlyph, 1, mode, &kerning) == 0);
+                Require(kerning.x == 0 && kerning.y == 0);
+            }
+            kerning = {123, 456};
+            Require(FT_Get_Kerning_nid_postfix(kernFace, 1, 0x10001u, mode, &kerning) == 0);
+            Require(kerning.x == expected.x && kerning.y == expected.y);
+        }
+    }
+    for (const unsigned glyph : {0u, 2u, 0xFFFFFFFFu}) {
+        kerning = {123, 456};
+        Require(FT_Get_Kerning_nid_postfix(kernFace, glyph, 1, FT_KERNING_UNSCALED, &kerning) == 0);
+        Require(kerning.x == 0 && kerning.y == 0);
+        kerning = {123, 456};
+        Require(FT_Get_Kerning_nid_postfix(kernFace, 1, glyph, FT_KERNING_UNSCALED, &kerning) == 0);
+        Require(kerning.x == 0 && kerning.y == 0);
+    }
+    FT_Done_Face(kernHost);
 
     Require(FT_Get_Char_Index_nid_postfix(face, 'A') == 1 && FT_Get_Char_Index_nid_postfix(face, 'B') == 0);
     Require(FT_Get_Char_Index_nid_postfix(face, 0x100000041ull) == 1);

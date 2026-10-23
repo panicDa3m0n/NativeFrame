@@ -11,6 +11,7 @@
 #include <string_view>
 #include <system_error>
 #include <sys/stat.h>
+#include <ctime>
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
@@ -22,11 +23,13 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libc/include/CreationMask.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
-#include "prx/libkernel/KernelErrors.hpp"
+extern "C" int APS5_VABI getpid_nid_postfix(void);
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -41,6 +44,7 @@
 #endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
+extern "C" int APS5_VABI getpid_nid_postfix();
 
 namespace {
 #ifdef _WIN32
@@ -625,6 +629,16 @@ int APS5_VABI fchown_nid_postfix(int fd, std::uint32_t uid, std::uint32_t gid) {
     return 0;
 }
 
+int APS5_VABI sched_rr_get_interval_nid_postfix(int pid, KernelTimespec* interval) {
+    constexpr int GuestEsrch = 3;
+    const int self = getpid_nid_postfix();
+    if (pid != 0 && pid != self) return static_cast<int>(Fail(GuestEsrch));
+    if (interval == nullptr) return static_cast<int>(Fail(GuestEfault));
+    interval->tv_sec = 0;
+    interval->tv_nsec = 94000000;
+    return 0;
+}
+
 int APS5_VABI stat_nid_postfix(const char* path, FileStat* sb);
 int APS5_VABI lstat_nid_postfix(const char* path, FileStat* sb);
 
@@ -712,6 +726,13 @@ int APS5_VABI unlinkat_nid_postfix(int fd, const char* path, int flag) {
     return 0;
 }
 
+int APS5_VABI scePthreadCondattrGetclock(const PthreadCondattr* attr, KernelClockid* clockId) {
+    if (!attr || !*attr) return SCE_KERNEL_ERROR_EINVAL;
+    if (!clockId) throw std::runtime_error("scePthreadCondattrGetclock: null clock id");
+    *clockId = (*attr)->_clockid;
+    return 0;
+}
+
 int APS5_VABI renameat_nid_postfix(int oldfd, const char* from, int newfd, const char* to) {
     if (from == nullptr || to == nullptr) return static_cast<int>(Fail(GuestEfault));
     if (*from == '\0' || *to == '\0') return static_cast<int>(Fail(GuestEnoent));
@@ -784,6 +805,24 @@ int APS5_VABI scePthreadSetDefaultstacksize(std::size_t size) {
 
 void APS5_VABI scePthreadSetName(void* thread, const char* name) {
     pthread_set_name_np_nid_postfix(thread, name);
+}
+
+struct KernelTitleWorkaround {
+    std::int32_t version;
+    std::int32_t align;
+    std::uint64_t ids[2];
+};
+
+int APS5_VABI sceKernelTitleWorkaroundIsEnabled(const KernelTitleWorkaround* workaround, std::int32_t bit, std::int32_t* enabled) {
+    if (!workaround || !enabled) return static_cast<int>(0x8002000E);
+    if (static_cast<std::uint32_t>(bit) >= 0x3A) return static_cast<int>(0x80020016);
+    *enabled = static_cast<std::int32_t>((workaround->ids[bit >> 6] >> (bit & 0x3F)) & 1);
+    return 0;
+}
+
+int APS5_VABI sceKernelGetProcessType(int pid) {
+    if (pid != getpid_nid_postfix() && pid != -1 && pid != 0) return static_cast<int>(0x80020003);
+    return 0;
 }
 
 }

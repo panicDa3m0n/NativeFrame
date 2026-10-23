@@ -103,7 +103,7 @@ struct ShadowedRange {
 // published, clears stale ones. Returns the units copied. Inside a completion action a store's
 // publish records nothing (the store's own stamp makes the unit stale; a recorded publish would land
 // over the store later).
-std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason);
+std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, bool waited = false);
 // No GpuMutex, no tracker: conservative (a unit with a generation and no publish counts), for
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);

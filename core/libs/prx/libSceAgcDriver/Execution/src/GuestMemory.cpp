@@ -2306,7 +2306,7 @@ std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) mutex.lock();
+    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
 }
 
 bool GpuMutexType::tryEnter() {
@@ -2388,7 +2388,7 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            if (!tryEnter()) LockSpinning(mutex, HandoffSpinWindow());
+            enter();
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {

@@ -400,8 +400,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         reportedEvents[i] = total;
     }
     const auto busy = static_cast<double>(commitNs) * 100.0 / windowNs;
-    char reads[64];
-    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
+    const auto decodeDrainCount = decodeDrains.load(std::memory_order_relaxed);
+    char reads[96];
+    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
+    reportedDecodeDrains = decodeDrainCount;
     drainText += reads;
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; indirect commits %llu, indirect drains (args overlap) %llu; submits after commits: %llu for an end-of-pipe interrupt over open work, %llu by label deadline, %llu by size cap; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), static_cast<unsigned long long>(counted[2]), static_cast<unsigned long long>(counted[3]), static_cast<unsigned long long>(counted[4]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -463,6 +465,7 @@ void DrawPipeline::run() {
             countWrites(items.front().writes, false);
             done = std::move(items.front());
             items.pop_front();
+            retiredItems.fetch_add(1, std::memory_order_release);
             ++commits;
             commitNs += spent;
             if (failed) ++commitErrors;
@@ -603,6 +606,28 @@ void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
             queuedWrites.pop_back();
         }
     }
+}
+
+DrawPipeline::Watch DrawPipeline::WatchWrites() {
+    if (!Busy()) return {Retired(), 0, {}};
+    std::lock_guard lock(mutex);
+    Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
+    for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    return watch;
+}
+
+bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
+    const auto overlaps = [&reads](const std::vector<Range>& writes) {
+        return std::any_of(reads.begin(), reads.end(), [&writes](const Range& read) {
+            return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
+        });
+    };
+    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
+    std::lock_guard lock(mutex);
+    if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
+    const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+    if (retiredNow == watch.retired) return false;
+    return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
 }
 
 bool DrawPipeline::Busy() const {

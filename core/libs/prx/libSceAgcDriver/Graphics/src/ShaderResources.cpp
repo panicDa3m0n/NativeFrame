@@ -3457,7 +3457,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+        const auto shadow = BufferShadowLazy() ? BufferShadowSerial() : 0;
+        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending && provedShadow == shadow) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
@@ -3475,6 +3476,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             provedEpoch = epoch;
             provedProof = proof;
             provedPending = pending;
+            provedShadow = shadow;
         } else {
             provedEpoch = 0;
         }

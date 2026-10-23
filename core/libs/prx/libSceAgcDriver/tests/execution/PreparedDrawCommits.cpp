@@ -1,8 +1,10 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepare.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
@@ -19,6 +21,7 @@
 
 namespace {
 
+using AgcDriver::DriverDetail::DrawPipeline;
 using AgcDriver::Graphics::Require;
 using AgcDriver::Graphics::ShaderResources;
 
@@ -26,7 +29,7 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
 };
-alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4200100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 alignas(256) std::array<float, 4> PixelConstant{};
 
@@ -84,15 +87,15 @@ std::vector<std::uint32_t> ConstantDraws(std::size_t draws) {
     };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
         {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 0}, {0x8c, 0},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 2u << 1u},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 4u << 1u},
     };
+    const std::array<std::uint32_t, 4> descriptor{static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>((constant >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(PixelConstant)), 0x31016facu};
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
     for (std::size_t draw = 0; draw < draws; ++draw) {
-        Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(constant)});
-        Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(constant >> 32u)});
+        for (std::uint32_t k = 0; k < descriptor.size(); ++k) Append(commands, 0x76, {0x00c + k, descriptor[k]});
         Append(commands, 0x2d, {3, 2});
     }
     return commands;
@@ -128,20 +131,25 @@ int main() {
         }
         Require(AgcDriver::DriverDetail::DrawPrepare::Threads() == 2, "APS5_PARALLEL_DRAW_PREPARE=2 does not give 2 preparation threads");
         Require(ShaderResources::EpochProofs(), "the draw pipeline does not turn the epoch proofs on");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(ColorMemory.data(), ColorMemory.size(), true, true, true);
+            mutation.Add(PixelConstant.data(), sizeof(PixelConstant), true, true, true);
+        }
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
         ColorMemory.fill(std::byte{0});
         PixelConstant[0] = 0.25f;
-        const auto before = ShaderResources::EpochProofReuses();
+        const auto before = DrawPipeline::CommittedDraws();
         auto commands = ConstantDraws(16);
         Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
         AgcDriverWaitIdle_nid_postfix();
-        const auto reused = ShaderResources::EpochProofReuses() - before;
+        const auto committed = DrawPipeline::CommittedDraws() - before;
         Require(BrightestColorByte() == 64, "the draws of constant 0.25 wrote " + std::to_string(BrightestColorByte()) + ", expected 64");
-        Require(reused > 0, "sixteen identical prepared draws in one submission reused no epoch proof: each prepared draw entered the draw pipeline as a non-draw item and broke the proofs");
+        Require(committed == 16, "sixteen prepared draws were committed as " + std::to_string(committed) + " draw items, expected 16: a prepared draw that enters the draw pipeline as a non-draw item breaks the epoch proofs of every later draw");
         AgcDriverShutdown_nid_postfix();
-        std::cout << "Sixteen prepared draws reused " << reused << " epoch proofs\n";
+        std::cout << "Sixteen prepared draws were committed as draws\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

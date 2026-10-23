@@ -55,10 +55,15 @@ bool DrawPipeline::MetadataPassesPipelined() {
 
 namespace {
 std::atomic<std::uint64_t> pipelinedMetadataPasses{0};
+std::atomic<std::uint64_t> committedDraws{0};
 }
 
 std::uint64_t DrawPipeline::PipelinedMetadataPasses() {
     return pipelinedMetadataPasses.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DrawPipeline::CommittedDraws() {
+    return committedDraws.load(std::memory_order_relaxed);
 }
 
 void DrawPipeline::CountPipelinedMetadataPass() {
@@ -437,6 +442,7 @@ void DrawPipeline::run() {
                 while (std::chrono::steady_clock::now() < until) {}
             }
             if (!isDraw) GuestMemory::BreakProofs();
+            else committedDraws.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

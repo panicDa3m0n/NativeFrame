@@ -198,6 +198,7 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::size_t unmoved = 0;
         ~DrawBindings();
     };
     struct MovedBuffer {

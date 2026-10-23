@@ -5836,6 +5836,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
+        if (override == moved.end()) ++result->unmoved;
         totalSnapshotBytes += bytes;
         if (profiled) preparedSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <array>
 #include <atomic>
@@ -107,6 +108,13 @@ void hookReadOverPendingDispatch(DrawPipeline& pipeline, Log& log) {
     check(!DrawPipeline::DrainBeforeRead(0x900ff0, 32), "a read drained on a thread that is not the queue-0 worker");
 }
 
+void batchCapDefault() {
+    using AgcDriver::DriverDetail::BatchCapFrom;
+    check(BatchCapFrom(nullptr) >= 1024, "the default batch cap submits after fewer than 1024 recorded jobs");
+    check(BatchCapFrom("64") == 64, "APS5_BATCH_CAP=64 did not set the cap");
+    check(BatchCapFrom("0") == 0, "APS5_BATCH_CAP=0 did not disable the cap");
+}
+
 }
 
 int main() {
@@ -116,6 +124,7 @@ int main() {
         indirectArgumentsOverPendingDraw(pipeline, log);
         labelBetweenDispatchAndDraws(pipeline, log);
         hookReadOverPendingDispatch(pipeline, log);
+        batchCapDefault();
         std::puts("draw pipeline commit tests passed");
         return 0;
     } catch (const std::exception& error) {

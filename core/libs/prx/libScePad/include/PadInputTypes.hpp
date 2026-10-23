@@ -20,9 +20,11 @@ enum class InputControl {
     TouchLeft,
     TouchRight,
     StickModifier,
+    Shake,
     ToggleMouse,
     ToggleFullscreen,
-    TogglePerformanceOverlay
+    TogglePerformanceOverlay,
+    Screenshot
 };
 
 enum class PadButton : std::uint32_t {

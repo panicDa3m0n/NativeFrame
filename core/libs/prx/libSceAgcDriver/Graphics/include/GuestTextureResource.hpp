@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTTEXTURERESOURCE_HPP
 
 #include "Recompiler.hpp"
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -89,6 +90,7 @@ struct GuestTextureResource {
     std::uint32_t minLod = 0;
     std::uint32_t allocatedMipCount = 0;
     std::uint32_t samples = 1;
+    std::uint64_t fmaskCmaskAddress = 0;
 };
 
 float EffectiveMinLod(const GuestTextureResource& resource);
@@ -96,6 +98,7 @@ float EffectiveMinLod(const GuestTextureResource& resource);
 bool IsNullTextureResource(std::span<const std::uint32_t> words);
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
 bool DescriptorSingleLevel(std::span<const std::uint32_t> words);
+bool FirstLayerDescriptor(std::span<const std::uint32_t> words, std::array<std::uint32_t, 8>& narrowed);
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension);
 bool ArrayLayersServeView(const GuestTextureResource& surface, const GuestTextureResource& view);
 

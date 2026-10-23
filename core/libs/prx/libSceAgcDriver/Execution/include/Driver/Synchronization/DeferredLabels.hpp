@@ -38,6 +38,8 @@ bool NeedsRecordedLabels(std::uint32_t header);
 
 bool PacketLocksItself(std::uint32_t header);
 
+std::uint64_t BatchCapFrom(const char* text);
+
 }
 
 #endif

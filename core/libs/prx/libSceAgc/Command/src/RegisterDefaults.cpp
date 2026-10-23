@@ -1,12 +1,10 @@
 #include "prx/libSceAgc/Command/include/RegisterDefaults.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
-#include "prx/libc/include/ApplicationHeap.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
-#include <exception>
 #include <mutex>
 #include <vector>
 
@@ -24,7 +22,7 @@ static_assert(sizeof(TypeIndex) == 8);
 struct RegisterDefaults {
     ShaderRegister** tables[4];
     std::uint32_t registerCounts[4];
-    TypeIndex* types;
+    void* types;
     std::uint32_t count;
 };
 
@@ -54,29 +52,7 @@ struct Storage {
 };
 
 std::mutex defaultsMutex;
-std::array<std::array<Storage, 14>, 2> storage;
-
-// The SDK the title was built with, from its process parameters (0 without them, as in the tests).
-std::uint32_t titleSdkVersion() {
-    static const std::uint32_t version = [] {
-        try {
-            std::uint32_t value = 0;
-            std::memcpy(&value, static_cast<const std::byte*>(ApplicationProcessParameters_nid_no_patch()) + 0x10, sizeof(value));
-            return value;
-        } catch (const std::exception&) {
-            return std::uint32_t{0};
-        }
-    }();
-    return version;
-}
-
-// Titles built before SDK 10.00 walk the compact 12-byte type entries, whose second word also packs
-// each block's register count and stride: Astro Bot (PPSA21567, SDK 9.04) writes past its
-// command buffer when it gets the pairs. Later titles, PPSA99011 among them, read the pairs.
-bool compactTypes() {
-    const auto sdk = titleSdkVersion();
-    return sdk != 0 && sdk < 0x10000000u;
-}
+std::array<std::array<std::array<Storage, 14>, 2>, 2> storage;
 
 struct AgcContextState {
     std::uint32_t data[512];
@@ -107,11 +83,13 @@ void InitDefaultCxState() {
 
 }
 
-void* GetRegisterDefaults(std::uint32_t version, bool internal, const char* function) {
+void* GetRegisterDefaults(std::uint32_t version, bool internal, const char* function,
+                          RegisterDefaultsTypeLayout typeLayout) {
     Require(version < 14, function, "unsupported register defaults version");
     const auto* source = internal ? agcInternalRegDefaultsByVersion[version] : agcPublicRegDefaultsByVersion[version];
     std::lock_guard lock(defaultsMutex);
-    auto& destination = storage[internal ? 1 : 0][version];
+    const auto layoutIndex = typeLayout == RegisterDefaultsTypeLayout::KeyBankPairs ? 1 : 0;
+    auto& destination = storage[internal ? 1 : 0][layoutIndex][version];
     if (!destination.initialized) {
         std::array<std::vector<ShaderRegister*>, 4> pointers;
         RegisterDefaults defaults{};
@@ -129,13 +107,19 @@ void* GetRegisterDefaults(std::uint32_t version, bool internal, const char* func
         }
         Require(source->count == 0 || source->types != nullptr, function, "missing register defaults types");
         std::vector<TypeIndex> types;
-        types.reserve(source->count);
-        for (std::uint32_t entry = 0; entry < source->count; ++entry) {
-            const std::uint32_t bankIndex = source->types[entry * 3 + 1] & 0x3ffu;
-            Require((bankIndex >> 2) < source->banks[bankIndex & 3u].pointerCount, function, "register defaults type exceeds its bank");
-            types.push_back({source->types[entry * 3], bankIndex});
+        if (typeLayout == RegisterDefaultsTypeLayout::KeyBankPairs) {
+            types.reserve(source->count);
+            for (std::uint32_t entry = 0; entry < source->count; ++entry) {
+                const std::uint32_t bankIndex = source->types[entry * 3 + 1] & 0x3ffu;
+                Require((bankIndex >> 2) < source->banks[bankIndex & 3u].pointerCount, function, "register defaults type exceeds its bank");
+                types.push_back({source->types[entry * 3], bankIndex});
+            }
         }
-        defaults.types = compactTypes() ? reinterpret_cast<TypeIndex*>(source->types) : types.empty() ? nullptr : types.data();
+        if (typeLayout == RegisterDefaultsTypeLayout::KeyBankPairs) {
+            defaults.types = types.empty() ? nullptr : types.data();
+        } else {
+            defaults.types = source->types;
+        }
         defaults.count = source->count;
         destination.pointers = std::move(pointers);
         destination.types = std::move(types);

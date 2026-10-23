@@ -63,6 +63,8 @@ APS5_PARALLEL_DRAW_PREPARE=2
 
 (real frame 88.8 → 73.7 ms in the same session; see [cpu-chain.md](cpu-chain.md)). Every new change is measured on top of the profile, with its own switch, on the same binary.
 
+Measured again on 23 October 2026 on the line over AnyPS5 main 8499ea52e, with AnyPS5 #9012: four alternating rounds per side, each a 150-second trace window at Crash Site, without and with the profile. Frame p50 87.1 → 78.4 ms (every round: 88.5, 87.4, 86.8, 85.1 against 79.8, 77.1, 78.7, 78.2), p99 91.7 → 82.8 ms, GPU busy unchanged (62.9 and 63.3 ms per present), and no driver reset in either configuration over ten runs.
+
 ## Open observation
 
 Libraries built from upstream before AnyPS5 #6763 (draw inputs copied on NVIDIA's Windows driver) got slower run after run in one session (303, 382, 443 ms), while the build with #6763 stayed stable. In those runs the GPU was 94 % busy but drew about 78 W of 285: it was waiting for PCIe reads. The cause of the growth (disk caches shared between runs?) was not investigated, because builds with #6763 do not show it.

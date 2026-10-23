@@ -6,6 +6,7 @@
 #endif
 #include <mutex>
 #include <vulkan/vulkan.h>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
 
 class TextureDetiler;
 class GpuColorTransfer;
@@ -72,12 +74,28 @@ inline void Check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
+inline VkShaderModule CreateShaderModule(PFN_vkCreateShaderModule create, VkDevice device, bool graphicsPipelineLibrary, const std::uint32_t* code, std::size_t bytes, const char* operation) {
+    std::vector<std::uint32_t> keyed(code, code + bytes / sizeof(std::uint32_t));
+    if (!graphicsPipelineLibrary && keyed.size() > 2) keyed[2] ^= 0x8000u;
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = keyed.size() * sizeof(std::uint32_t);
+    info.pCode = keyed.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    Check(create(device, &info, nullptr, &module), operation);
+    return module;
+}
+
 inline void Require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC graphics: ") + reason);
 }
 
 struct DescriptorRejected : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+struct BdaUnalignedAccess : std::runtime_error {
+    BdaUnalignedAccess(const std::string& message, std::uint32_t instruction) : std::runtime_error(message), instruction(instruction) {}
+    std::uint32_t instruction;
 };
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the
@@ -134,16 +152,17 @@ inline std::uint64_t& DeviceProcLookups() {
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+inline constexpr VkMemoryPropertyFlags HostBufferProperties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+inline constexpr VkMemoryPropertyFlags MappedDeviceProperties = HostBufferProperties | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
 inline VkMemoryPropertyFlags SnapshotMemoryProperties(const VkPhysicalDeviceMemoryProperties& memory, bool disabled) {
-    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    constexpr VkMemoryPropertyFlags bar = host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     constexpr VkDeviceSize ResizableBarBytes = VkDeviceSize{4} << 30u;
-    if (disabled) return host;
+    if (disabled) return HostBufferProperties;
     for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
         const auto& type = memory.memoryTypes[i];
-        if ((type.propertyFlags & bar) == bar && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size >= ResizableBarBytes) return bar;
+        if ((type.propertyFlags & MappedDeviceProperties) == MappedDeviceProperties && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size >= ResizableBarBytes) return MappedDeviceProperties;
     }
-    return host;
+    return HostBufferProperties;
 }
 
 struct Context {
@@ -175,8 +194,11 @@ struct Context {
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
     bool drawInputsInPlace = true;
+    bool discreteGpu = false;
     bool dmaBufImport = false;
     bool sparseBinding = false;
+    bool sparseResidencyBuffer = false;
+    bool sparseResidencyAliased = false;
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
@@ -207,6 +229,9 @@ struct Context {
     bool dualSrcBlend = false;
     bool samplerFilterMinmax = false;
     bool nonSeamlessCubeMap = false;
+    VkSampleCountFlags mergedCoverageSampleCounts = 0;
+    VkSampleCountFlags truncatedCoverageSampleCounts = 0;
+    bool mixedAttachmentSamples = false;
     bool conservativeRasterization = false;
     bool meshWave32 = false;
     VkBuffer emptyBuffer = VK_NULL_HANDLE;
@@ -224,12 +249,20 @@ struct Context {
     bool runtimeDescriptorArray = false;
     bool partiallyBound = false;
     bool variableDescriptorCount = false;
+    bool sampledImageUpdateAfterBind = false;
     std::uint32_t imageTableCapacity = 0;
     std::uint32_t samplerTableCapacity = 0;
     bool individuallyFreeDescriptorSets = false;
+    bool imageTableUpdateAfterBind = false;
+    bool samplerTableUpdateAfterBind = false;
     bool geometryShader = false;
+    bool largePoints = false;
     bool sampleRateShading = false;
+    bool fillModeNonSolid = false;
+    bool maintenance5 = false;
     bool storageImageMultisample = false;
+    bool storageImageWriteWithoutFormat = false;
+    bool imageFormatList = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
     bool nullDescriptors = false;
@@ -250,6 +283,8 @@ struct Context {
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
+    std::array<VkExtent2D, 4> sampleLocationGridSizes{};
+    bool shaderStencilExport = false;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
     bool shaderTerminateInvocation = false;
 
@@ -279,10 +314,15 @@ struct Context {
         return SnapshotMemoryProperties(memory, disabled);
     }
 
-    std::uint32_t MemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {
+    std::optional<std::uint32_t> MatchingMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
+        return std::nullopt;
+    }
+
+    std::uint32_t MemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {
+        if (const auto type = MatchingMemoryType(mask, flags)) return *type;
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
     }
 
@@ -344,7 +384,48 @@ struct Context {
         if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
         return HostMemoryType(mask);
     }
+
+    VkMemoryPropertyFlags MappedBufferProperties(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {
+        if ((flags & MappedDeviceProperties) != MappedDeviceProperties) return flags;
+        const auto mapped = MatchingMemoryType(mask, flags);
+        if (!mapped) {
+            static std::atomic<std::uint64_t> placements{0};
+            const auto count = placements.fetch_add(1) + 1;
+            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] mapped buffer: none of the buffer's memory types (mask 0x%x) is mapped device-local, placed in host memory; %llu such allocations\n", mask, static_cast<unsigned long long>(count));
+            return HostBufferProperties;
+        }
+        if (memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return flags;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        memoryProperties2(physical, &properties);
+        const auto heap = memory.memoryTypes[*mapped].heapIndex;
+        const auto budget = reported.heapBudget[heap];
+        const auto usage = reported.heapUsage[heap];
+        if (budget == 0 || (usage < budget && bytes <= budget - usage)) return flags;
+        static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+        const auto count = placements.fetch_add(1) + 1;
+        const auto total = placedBytes.fetch_add(bytes) + bytes;
+        if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] mapped buffer: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory; %llu such allocations, %llu MiB\n", heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+        return HostBufferProperties;
+    }
+
+    std::optional<std::uint32_t> RefusedMappedMemoryFallback(std::uint32_t mask, VkMemoryPropertyFlags flags, std::uint32_t refused) const {
+        if ((flags & MappedDeviceProperties) != MappedDeviceProperties || refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
+        std::optional<std::uint32_t> host;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            const auto& type = memory.memoryTypes[i];
+            if ((mask & (1u << i)) == 0 || (type.propertyFlags & HostBufferProperties) != HostBufferProperties || (memory.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+            if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) return i;
+            if (!host) host = i;
+        }
+        return host;
+    }
 };
+
+inline VkShaderModule CreateShaderModule(const Context& context, const std::uint32_t* code, std::size_t bytes, const char* operation) {
+    return CreateShaderModule(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule"), context.device, context.graphicsPipelineLibrary, code, bytes, operation);
+}
 
 inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
@@ -354,6 +435,8 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
 std::uint32_t ImageTableCapacity(const Context& context);
 std::uint32_t StorageTableCapacity(const Context& context);
 std::uint32_t SamplerTableCapacity(const Context& context);
+bool ImageTableUpdateAfterBind(const Context& context);
+bool SamplerTableUpdateAfterBind(const Context& context);
 
 }
 

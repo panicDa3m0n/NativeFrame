@@ -93,6 +93,10 @@ bool storesThroughAddressesCached(const ShaderRecompiler::SharedSpirv& spirv) {
 
 }
 
+bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv) {
+    return storesThroughAddressesCached(spirv);
+}
+
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
     if (words.size() < 5 || words[0] != spv::MagicNumber) return true;
     std::unordered_set<std::uint32_t> pointerTypes;
@@ -112,6 +116,17 @@ bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
         stores = stores || extendedWithPointer || (pointer != 0 && pointers.contains(pointer));
     });
     return stores;
+}
+
+namespace {
+
+// A lazy build that reads through addresses maps the live range slab bytes in its BDA table with
+// APS5_BDA_SLAB_OVERLAY; without it the build publishes them first.
+bool overlayAllowed() {
+    static const bool enabled = std::getenv("APS5_BDA_SLAB_OVERLAY") != nullptr;
+    return enabled;
+}
+
 }
 
 void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
@@ -138,6 +153,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
     }
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
+        bdaOverlayAllowed = overlayAllowed();
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         guestMemory.AcquireRegistered();
         const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

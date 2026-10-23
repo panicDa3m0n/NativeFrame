@@ -7,7 +7,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include <chrono>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -17,11 +20,89 @@ struct HostImport;
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
+// O16.T8 probe (APS5_SPEC_PROBE=1, studies/committer-fuori-dal-lock.md P0): what a prepare thread
+// would take off the GPU mutex for a draw, taken beside the prepared key with lock-free reads only
+// (the template under the key, the draw's read-only guest buffer ranges clean in the published
+// pending-write snapshot, the stamps that would prove them). The commit compares and counts (the
+// [spec-probe] line); nothing else reads it, so no decision changes.
+struct DrawSpeculationProbe {
+    std::weak_ptr<ShaderResources> candidate;
+    bool found = false;
+    std::uint64_t tracker = 0;
+    std::uint64_t writeGeneration = 0;
+    std::uint64_t publishGeneration = 0;
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t storageCacheSerial = 0;
+    std::uint64_t registry = 0;
+    std::uint64_t commits = 0;
+    std::chrono::steady_clock::time_point at;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    std::uint32_t pendingAtPrepare = 0;
+    std::uint64_t probeNanoseconds = 0;
+    // The queue-0 epoch token at the start of the prepare job and whether the job was sequenced
+    // under the same token (set by the execution layer before the commit).
+    std::uint64_t epoch = 0;
+    bool epochSame = true;
+};
+// O16.T9 (APS5_SPEC_BINDINGS=1): a draw's bindings made by its prepare thread from the template its
+// key found (ShaderResources::SpeculateDrawBindings), with what the commit checks before it takes
+// them instead of making its own (recordDraw): the same template, moved buffers and in-place
+// reads, the queue-0 epoch and the allocation registry unchanged, no pending GPU write over a
+// copied range and no tracker stamp over one since `tracker` (read before the copies; every range
+// was watched and unchanged after them, and no range was unwatched since `unwatch`). Without
+// `ready` there is nothing to take. APS5_VERIFY_SPEC_BINDINGS=1 makes the commit's own bindings
+// beside a taken speculation, records those, and aborts when the choices differ.
+struct DrawSpeculation {
+    std::shared_ptr<ShaderResources> resources;
+    std::vector<ShaderResources::MovedBuffer> moved;
+    std::shared_ptr<const ShaderResources::InPlaceRanges> inPlace;
+    std::shared_ptr<ShaderResources::DrawBindings> bindings;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    std::uint64_t tracker = 0;
+    std::uint64_t unwatch = 0;
+    std::uint64_t registry = 0;
+    // The queue-0 epoch token at the start of the prepare job and whether the job was sequenced
+    // under the same token (set by the execution layer before the commit).
+    std::uint64_t epoch = 0;
+    bool epochSame = true;
+    bool ready = false;
+};
+// O22.T3 (APS5_SPEC_INPUTS=1): what a draw's prepare thread derives from its stages and state alone
+// (the fragment outputs, the vertex input layout, the described set layouts and the pipeline for a
+// recorded draw without proxied targets or stencil replay). The commit takes the outputs for the
+// same state and stage objects on the same device, and the pipeline when its own vertex layout,
+// set layout keys and attachment layout match too. APS5_VERIFY_SPEC_INPUTS=1 derives them again at
+// the commit and reports any difference.
+struct DrawInputSpeculation {
+    VkDevice device = VK_NULL_HANDLE;
+    const State* state = nullptr;
+    const CompiledShader* shaders = nullptr;
+    std::size_t shaderCount = 0;
+    std::uint32_t fragmentOutputs = 0;
+    VertexInputLayout vertexInput;
+    std::vector<std::uint32_t> mainKey;
+    std::vector<std::uint32_t> fragmentKey;
+    std::shared_ptr<Pipeline> pipeline;
+};
 struct PreparedDrawKey {
     ResourceCache::Key key;
     std::size_t hash = 0;
+    std::shared_ptr<DrawSpeculationProbe> probe;
+    std::shared_ptr<DrawSpeculation> speculation;
+    std::shared_ptr<const DrawInputSpeculation> inputs;
 };
 bool PreparedDrawKeys();
+bool SpecProbe();
+bool SpecBindings();
+bool SpecInputs();
+std::shared_ptr<const DrawInputSpeculation> SpeculateDrawInputs(const Context& context, const State& state, std::span<const CompiledShader> shaders);
+const std::uint32_t* TakeSpeculatedOutputs(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders);
+std::shared_ptr<Pipeline> TakeSpeculatedPipeline(const DrawInputSpeculation* speculation, const Context& context, const State& state, std::span<const CompiledShader> shaders, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, bool lean, bool proxiedTargets);
+// The two halves of a DrawSpeculation outside a parallel-prepared draw (tests): what a prepare
+// thread makes for a key whose template SharedResourceCache holds, and the commit's check, which
+// takes the bindings (null for a draw without snapshots) or returns false for PrepareDrawBindings.
+std::shared_ptr<DrawSpeculation> SpeculateDrawBindings(const PreparedDrawKey& prepared, std::span<const CompiledShader> shaders);
+bool TakeSpeculativeBindings(const DrawSpeculation* speculation, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, Recorder& recorder, std::shared_ptr<ShaderResources::DrawBindings>& bindings);
 PreparedDrawKey PrepareDrawKey(VkDevice device, std::span<const CompiledShader> shaders, std::uint32_t colorAttachments);
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDrawKey* prepared = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
@@ -35,7 +116,7 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
-DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes);
+DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);
 struct InPlaceIndices {
@@ -97,9 +178,11 @@ bool DrawRecipes();
 // draw index, the vertex ranges, the device features, APS5_NO_GPU_INDIRECT_DRAW) or under the device
 // lock in Draw (the memory state of the records). `readMs` is the CPU read's time (its sync);
 // `rewritten` counts a GPU-side draw whose records were copied and patched with a constant.
-enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, Count };
+enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, IndexRange, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
 std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
+void CountEmptyIndirectDraw(double readMs);
+std::uint64_t EmptyIndirectDrawCount();
 
 struct DrawPassCounts {
     std::uint64_t draws = 0;
@@ -134,6 +217,10 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
 std::uint64_t ResidentTargetMemoHits();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
+void RunDepthCopyPass(const Context& context, const DepthCopyPass& pass);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
+bool DrawPipelineEnabled();
+bool CommitTrims();
 
 }
 

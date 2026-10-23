@@ -3,11 +3,12 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/InputCommandFile.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -28,19 +29,21 @@ int APS5_VABI scePadResetOrientation(int);
 int APS5_VABI scePadSetAngularVelocityDeadbandState(int, bool);
 int APS5_VABI scePadSetAngularVelocityBiasCorrectionState(int, bool);
 int APS5_VABI scePadIsRemoteController(int, bool*);
+int APS5_VABI scePadGetAccessibilityControllerState(int, std::uint32_t*);
+bool APS5_VABI scePadIsDS4Connected(std::int32_t);
+bool APS5_VABI scePadIsBlasterConnected(std::int32_t);
+bool APS5_VABI scePadIsMoveConnected(std::int32_t);
+int APS5_VABI scePadGetControllerInformation(int, PadControllerInformation*);
+int APS5_VABI scePadDeviceClassParseData(int, const PadData*, PadDeviceClassData*);
+int APS5_VABI scePadDeviceClassGetExtendedInformation(int, PadDeviceClassExtendedInformation*);
+int APS5_VABI scePadSetVibration(int, const PadVibrationParam*);
+int APS5_VABI scePadGetExtControllerInformation(int, void*);
+int APS5_VABI scePadResetLightBar(int);
+int APS5_VABI scePadSetLightBar(int, const PadLightBarParam*);
+int APS5_VABI scePadSetMotionSensorState(int, bool);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
-
-static void RequireUnknownPadNidNotImplemented() {
-    try {
-        scePadUnknown_n3kSX62fgNo();
-    } catch (const std::runtime_error& error) {
-        Require(std::string(error.what()) == "scePadUnknown_n3kSX62fgNo not implemented");
-        return;
-    }
-    std::abort();
-}
 
 static void CheckInputCommands() {
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-pad-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -121,7 +124,6 @@ static float SettleOrientationW() {
 }
 
 static void CheckTiltCorrection(int handle) {
-    RequireUnknownPadNidNotImplemented();
     PadInputState tilted;
     tilted.hasMotion = true;
     tilted.accel = {9.80665f, 0.0f, 0.0f};
@@ -153,6 +155,17 @@ static void CheckAngularVelocityDeadband(int handle) {
     PadPublishInput_nid_postfix(PadInputState{});
 }
 
+static void CheckStickDeadZones(int handle) {
+    PadControllerInformation info{};
+    Require(scePadGetControllerInformation(handle, &info) == PAD_OK);
+    Require(info.stickInfo.deadZoneLeft == 13 && info.stickInfo.deadZoneRight == 13);
+    std::array<std::uint8_t, 0x2c> extended{};
+    Require(scePadGetExtControllerInformation(handle, extended.data()) == PAD_OK);
+    PadControllerInformation base{};
+    std::memcpy(&base, extended.data(), sizeof(base));
+    Require(base.stickInfo.deadZoneLeft == 13 && base.stickInfo.deadZoneRight == 13);
+}
+
 static void CheckTouchContact() {
     PadInputState touch;
     touch.buttons = static_cast<std::uint32_t>(Pad::PadButton::TouchPad);
@@ -163,6 +176,46 @@ static void CheckTouchContact() {
     Require(data.touch_data_touch_num == 1);
     Require(data.touch_data_touch0_x == 960);
     Require(data.touch_data_touch0_y == 471);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Pad::ReadState();
+}
+
+static void CheckTouchPadInformation(int handle) {
+    PadControllerInformation info;
+    std::memset(&info, 0x5a, sizeof(info));
+    Require(scePadGetControllerInformation(handle, &info) == PAD_OK);
+    Require(info.touchPadInfo.resolution.x == kTouchPadWidth);
+    Require(info.touchPadInfo.resolution.y == kTouchPadHeight);
+    Require(info.touchPadInfo.pixelDensity == 44.86f);
+    Require(scePadGetControllerInformation(handle + 1, &info) == PAD_ERROR_INVALID_HANDLE);
+
+    std::array<std::uint8_t, 0x2c> extended{};
+    extended.fill(0x5a);
+    Require(scePadGetExtControllerInformation(handle, extended.data()) == PAD_OK);
+    PadControllerInformation base{};
+    std::memcpy(&base, extended.data(), sizeof(base));
+    Require(base.touchPadInfo.resolution.x == kTouchPadWidth);
+    Require(base.touchPadInfo.resolution.y == kTouchPadHeight);
+    Require(base.touchPadInfo.pixelDensity == 44.86f);
+}
+
+static void CheckVirtualTouchContact() {
+    PadInputState left;
+    left.touchLeft = true;
+    PadPublishInput_nid_postfix(left);
+    const auto leftData = Pad::ReadState();
+    Require(leftData.touch_data_touch_num == 1);
+    Require(leftData.touch_data_touch0_x == kTouchPadWidth / 4);
+    Require(leftData.touch_data_touch0_y == kTouchPadHeight / 2);
+
+    PadInputState right;
+    right.touchRight = true;
+    PadPublishInput_nid_postfix(right);
+    const auto rightData = Pad::ReadState();
+    Require(rightData.touch_data_touch_num == 1);
+    Require(rightData.touch_data_touch0_x == kTouchPadWidth * 3 / 4);
+    Require(rightData.touch_data_touch0_y == kTouchPadHeight / 2);
+
     PadPublishInput_nid_postfix(PadInputState{});
     Pad::ReadState();
 }
@@ -200,12 +253,154 @@ static void CheckReadQueue(int handle) {
     Require(data[0].buttons == 0);
 }
 
+static void CheckTapBetweenReads() {
+    const auto cross = static_cast<std::uint32_t>(Pad::PadButton::Cross);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Pad::ReadState();
+    PadInputState pressed;
+    pressed.buttons = cross;
+    PadPublishInput_nid_postfix(pressed);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Require((Pad::ReadState().buttons & cross) != 0);
+    Require((Pad::ReadState().buttons & cross) == 0);
+    PadPublishInput_nid_postfix(pressed);
+    Require((Pad::ReadState().buttons & cross) != 0);
+    Require((Pad::ReadState().buttons & cross) != 0);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Require((Pad::ReadState().buttons & cross) == 0);
+}
+
+static void CheckLatchedPressLifetime(int handle) {
+    const auto cross = static_cast<std::uint32_t>(Pad::PadButton::Cross);
+    const auto circle = static_cast<std::uint32_t>(Pad::PadButton::Circle);
+    PadInputState pressed;
+    PadData data{};
+    PadData drained[64]{};
+    scePadRead_nid_postfix(handle, drained, 64);
+    pressed.buttons = cross;
+    PadPublishInput_nid_postfix(pressed);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Require(scePadRead_nid_postfix(handle, drained, 64) >= 1);
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require((data.buttons & cross) == 0);
+    pressed.buttons = cross;
+    PadPublishInput_nid_postfix(pressed);
+    PadPublishInput_nid_postfix(PadInputState{});
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require((data.buttons & cross) == 0);
+    pressed.buttons = cross;
+    PadPublishInput_nid_postfix(pressed);
+    PadPublishInput_nid_postfix(PadInputState{});
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    pressed.buttons = circle;
+    PadPublishInput_nid_postfix(pressed);
+    PadPublishInput_nid_postfix(PadInputState{});
+    Require(scePadReadState(handle, &data) == PAD_OK);
+    Require((data.buttons & cross) == 0);
+    Require((data.buttons & circle) != 0);
+}
+
 static void CheckReadStateHandle(int handle) {
     PadData data{};
     Require(scePadReadState(0, &data) == PAD_ERROR_INVALID_HANDLE);
     Require(scePadReadState(handle + 1, &data) == PAD_ERROR_INVALID_HANDLE);
     Require(scePadRead_nid_postfix(0, &data, 1) == PAD_ERROR_INVALID_HANDLE);
     Require(scePadReadState(handle, &data) == PAD_OK);
+    Require(scePadRead_nid_postfix(handle, nullptr, 1) == PAD_ERROR_INVALID_ARG);
+    Require(scePadRead_nid_postfix(handle, &data, 0) == PAD_ERROR_INVALID_ARG);
+    Require(scePadRead_nid_postfix(handle, &data, -1) == PAD_ERROR_INVALID_ARG);
+    Require(scePadReadState(handle, nullptr) == PAD_ERROR_INVALID_ARG);
+}
+
+static void CheckSpecialPort(int user, int handle) {
+    constexpr int noHandle = static_cast<int>(0x80920008);
+    constexpr int alreadyOpened = static_cast<int>(0x80920004);
+    const int special = scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr);
+    Require(special > 0 && special != handle);
+    Require(scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == alreadyOpened);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == special);
+    Require(scePadGetHandle(user, 0, 0) == handle);
+    PadData data[2];
+    std::memset(data, 0xff, sizeof(data));
+    Require(scePadRead_nid_postfix(special, nullptr, 1) == PAD_ERROR_INVALID_ARG);
+    Require(scePadRead_nid_postfix(special, data, 0) == PAD_ERROR_INVALID_ARG);
+    Require(scePadRead_nid_postfix(special, data, 2) == 1);
+    Require(!data[0].connected && data[0].connected_count == 0 && data[0].buttons == 0 && data[0].timestamp == 0);
+    Require(data[0].left_stick_x == 0x80 && data[0].left_stick_y == 0x80 && data[0].right_stick_x == 0x80 && data[0].right_stick_y == 0x80);
+    Require(data[0].analog_buttons_l2 == 0 && data[0].orientation_x == 0.0f && data[0].orientation_w == 1.0f);
+    Require(data[0].acceleration_x == 0.0f && data[0].acceleration_y == 1.0f && data[0].acceleration_z == 0.0f && data[0].touch_data_touch_num == 0);
+    Require(data[1].buttons == 0xffffffff);
+    std::memset(data, 0xff, sizeof(data[0]));
+    Require(scePadReadState(special, nullptr) == PAD_ERROR_INVALID_ARG);
+    Require(scePadReadState(special, data) == PAD_OK);
+    Require(!data[0].connected && data[0].connected_count == 0 && data[0].buttons == 0);
+    Require(data[0].left_stick_x == 0x80 && data[0].orientation_w == 1.0f && data[0].acceleration_y == 1.0f);
+    PadControllerInformation info;
+    std::memset(&info, 0xff, sizeof(info));
+    Require(scePadGetControllerInformation(special, nullptr) == PAD_ERROR_INVALID_ARG);
+    Require(scePadGetControllerInformation(special, &info) == PAD_OK);
+    Require(!info.connected && info.connectedCount == 0 && info.deviceClass == 0);
+    PadDeviceClassData classData;
+    std::memset(&classData, 0xff, sizeof(classData));
+    Require(scePadDeviceClassParseData(special, data, &classData) == PAD_OK);
+    Require(!classData.dataValid && classData.deviceClass == 0);
+    PadDeviceClassExtendedInformation extended;
+    std::memset(&extended, 0xff, sizeof(extended));
+    Require(scePadDeviceClassGetExtendedInformation(special, &extended) == PAD_OK);
+    Require(extended.deviceClass == -1 && extended.reserved[0] == 0);
+    Require(scePadDeviceClassGetExtendedInformation(handle, &extended) == PAD_OK);
+    Require(extended.deviceClass == 0);
+    const PadVibrationParam vibration{0, 0};
+    const PadLightBarParam lightBar{0, 0, 255};
+    Require(scePadSetVibration(special, nullptr) == PAD_ERROR_INVALID_ARG);
+    Require(scePadSetVibration(special, &vibration) == PAD_OK);
+    Require(scePadSetLightBar(special, &lightBar) == PAD_OK);
+    Require(scePadResetLightBar(special) == PAD_OK);
+    Require(scePadSetMotionSensorState(special, true) == PAD_OK);
+    Require(scePadResetOrientation(special) == PAD_OK);
+    Require(scePadReadState(handle, data) == PAD_OK);
+    Require(data[0].connected);
+    Require(scePadGetControllerInformation(handle, &info) == PAD_OK);
+    Require(info.connected && info.connectedCount == 1);
+    Require(scePadClose_nid_postfix(special) == PAD_OK);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
+    Require(scePadClose_nid_postfix(special) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadRead_nid_postfix(special, data, 1) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadReadState(special, data) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadGetControllerInformation(special, &info) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadGetHandle(user, 0, 0) == handle);
+    Require(scePadReadState(handle, data) == PAD_OK);
+    const int other = user + 1;
+    const int first = scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr);
+    const int second = scePadOpen_nid_postfix(other, PAD_PORT_TYPE_SPECIAL, 0, nullptr);
+    Require(first > 0 && second > 0 && first != second && second != handle);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == first);
+    Require(scePadGetHandle(other, PAD_PORT_TYPE_SPECIAL, 0) == second);
+    Require(scePadOpen_nid_postfix(other, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == alreadyOpened);
+    Require(scePadClose_nid_postfix(first) == PAD_OK);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
+    Require(scePadGetHandle(other, PAD_PORT_TYPE_SPECIAL, 0) == second);
+    Require(scePadRead_nid_postfix(first, data, 1) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadRead_nid_postfix(second, data, 1) == 1);
+    Require(!data[0].connected);
+    const int again = scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr);
+    Require(again > 0 && again != second);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == again);
+    Require(scePadClose_nid_postfix(again) == PAD_OK);
+    Require(scePadClose_nid_postfix(second) == PAD_OK);
+    Require(scePadGetHandle(other, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
+    std::array<int, 16> handles{};
+    for (int i = 0; i < 16; ++i) {
+        handles[i] = scePadOpen_nid_postfix(user + i, PAD_PORT_TYPE_SPECIAL, 0, nullptr);
+        Require(handles[i] > 0 && handles[i] != handle && (i == 0 || handles[i] != handles[i - 1]));
+    }
+    Require(scePadOpen_nid_postfix(user + 16, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == static_cast<int>(0x809b0081));
+    Require(scePadGetHandle(user + 16, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
+    Require(scePadGetHandle(user + 15, PAD_PORT_TYPE_SPECIAL, 0) == handles[15]);
+    for (int i = 0; i < 16; ++i) Require(scePadClose_nid_postfix(handles[i]) == PAD_OK);
+    Require(scePadGetHandle(user + 15, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
+    Require(scePadGetHandle(user, 0, 0) == handle);
 }
 
 static void CheckRemoteController(int handle) {
@@ -215,6 +410,23 @@ static void CheckRemoteController(int handle) {
     Require(remote);
     Require(scePadIsRemoteController(handle, &remote) == PAD_OK);
     Require(!remote);
+}
+
+static void CheckTrackerDevices(int handle) {
+    for (const int candidate : {handle, handle + 1}) {
+        Require(!scePadIsDS4Connected(candidate));
+        Require(!scePadIsBlasterConnected(candidate));
+        Require(!scePadIsMoveConnected(candidate));
+    }
+}
+
+static void CheckAccessibilityControllerState(int handle) {
+    std::uint32_t state = 7;
+    Require(scePadGetAccessibilityControllerState(handle + 1, nullptr) == PAD_ERROR_INVALID_ARG);
+    Require(scePadGetAccessibilityControllerState(handle + 1, &state) == PAD_ERROR_INVALID_HANDLE);
+    Require(state == 7);
+    Require(scePadGetAccessibilityControllerState(handle, &state) == PAD_OK);
+    Require(state == 0);
 }
 
 static void CheckInjectedState(const std::filesystem::path& path) {
@@ -257,7 +469,7 @@ static void CheckInjectedState(const std::filesystem::path& path) {
     const auto centred = Pad::ReadState();
     Require(centred.left_stick_x == 42 && centred.right_stick_y == 17);
     Require(centred.timestamp > moved.timestamp);
-    for (const auto& [command, x] : {std::pair{"3 2097152 300\n", 480}, std::pair{"4 4194304 300\n", 1440}}) {
+    for (const auto& [command, x] : {std::pair{"3 2097152 300\n", kTouchPadWidth / 4}, std::pair{"4 4194304 300\n", kTouchPadWidth * 3 / 4}}) {
         std::ofstream(path) << command;
         PadData touched{};
         const auto touchDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -266,7 +478,7 @@ static void CheckInjectedState(const std::filesystem::path& path) {
             if (touched.touch_data_touch_num != 0) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         } while (std::chrono::steady_clock::now() < touchDeadline);
-        Require(touched.touch_data_touch_num == 1 && touched.touch_data_touch0_x == x && touched.touch_data_touch0_y == 471);
+        Require(touched.touch_data_touch_num == 1 && touched.touch_data_touch0_x == x && touched.touch_data_touch0_y == kTouchPadHeight / 2);
         Require(touched.buttons == (0x2000 | 0x100000));
         std::this_thread::sleep_for(std::chrono::milliseconds(310));
         const auto lifted = Pad::ReadState();
@@ -277,6 +489,10 @@ static void CheckInjectedState(const std::filesystem::path& path) {
 
 int main() {
     CheckInputCommands();
+    std::uint32_t accessibilityState = 7;
+    Require(scePadGetAccessibilityControllerState(PAD_HANDLE, nullptr) == PAD_ERROR_NOT_INITIALIZED);
+    Require(scePadGetAccessibilityControllerState(PAD_HANDLE, &accessibilityState) == PAD_ERROR_NOT_INITIALIZED);
+    Require(accessibilityState == 7);
     Require(scePadUnknown_n3kSX62fgNo() == static_cast<int>(0x80920005));
     const auto path = std::filesystem::temp_directory_path() / ("anyps5-pad-state-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {
@@ -299,6 +515,13 @@ int main() {
         Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
         Require(snapshot.audioVibrationLarge == 100 && snapshot.audioVibrationSmall == 150);
         Require(snapshot.vibrationLarge == 12 && snapshot.vibrationSmall == 34);
+        PadQueueLegacyAudioHaptics_nid_postfix(1, 0, ~std::uint64_t{0}, 200, 20);
+        Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
+        Require(snapshot.audioVibrationLarge == 200 && snapshot.audioVibrationSmall == 150);
+        PadClearLegacyAudioHaptics_nid_postfix(1);
+        Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
+        Require(snapshot.audioVibrationLarge == 100 && snapshot.audioVibrationSmall == 150);
+        Require(snapshot.vibrationLarge == 12 && snapshot.vibrationSmall == 34);
         PadSubmitAudioHaptics_nid_postfix(0, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         Require(PadFetchOutput_nid_postfix(&sequence, &snapshot));
@@ -318,24 +541,43 @@ int main() {
     Require(scePadOpenExt(user, PAD_PORT_TYPE_SPECIAL, 1, wheel) == PAD_ERROR_INVALID_ARG);
     Require(scePadOpenExt(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == PAD_ERROR_INVALID_ARG);
     Require(scePadGetHandle(user, 0, 0) == noHandle);
-    Require(scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == static_cast<int>(0x80920007));
+    const int earlySpecial = scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr);
+    Require(earlySpecial > 0);
     Require(scePadGetHandle(user, 0, 0) == noHandle);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == earlySpecial);
+    Require(scePadClose_nid_postfix(earlySpecial) == PAD_OK);
+    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
     Require(scePadInit_nid_postfix() == 0);
-    Require(scePadUnknown_n3kSX62fgNo() == static_cast<int>(0x809200ff));
+    Require(scePadUnknown_n3kSX62fgNo() == PAD_OK);
     const int handle = scePadOpen_nid_postfix(user, 0, 0, nullptr);
     Require(handle > 0);
+    Require(scePadUnknown_n3kSX62fgNo() == PAD_OK);
     Require(scePadGetHandle(user, 0, 0) == handle);
-    Require(scePadOpen_nid_postfix(user, PAD_PORT_TYPE_SPECIAL, 0, nullptr) == static_cast<int>(0x80920007));
-    Require(scePadGetHandle(user, PAD_PORT_TYPE_SPECIAL, 0) == noHandle);
-    Require(scePadGetHandle(user, 0, 0) == handle);
+    CheckSpecialPort(user, handle);
     CheckTiltCorrection(handle);
     CheckAngularVelocityDeadband(handle);
     CheckTouchContact();
+    CheckVirtualTouchContact();
+    CheckTouchPadInformation(handle);
+    CheckStickDeadZones(handle);
     CheckPartialTrigger();
     CheckReadQueue(handle);
+    CheckTapBetweenReads();
+    CheckLatchedPressLifetime(handle);
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
+    CheckTrackerDevices(handle);
+    CheckAccessibilityControllerState(handle);
     CheckInjectedState(commandPath);
+    PadLightBarParam lightBar{255, 128, 64};
+    Require(scePadSetLightBar(handle, &lightBar) == PAD_OK);
+    Require(scePadSetLightBar(handle, nullptr) == PAD_ERROR_INVALID_ARG);
+    Require(scePadSetLightBar(handle + 1, &lightBar) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadResetLightBar(handle) == PAD_OK);
+    Require(scePadResetLightBar(handle + 1) == PAD_ERROR_INVALID_HANDLE);
+    Require(scePadSetMotionSensorState(handle, true) == PAD_OK);
+    Require(scePadSetMotionSensorState(handle, false) == PAD_OK);
+    Require(scePadSetMotionSensorState(handle + 1, true) == PAD_ERROR_INVALID_HANDLE);
     Require(scePadSetVibrationMode(handle, 1) == 0);
     Require(scePadSetVibrationMode(handle, 2) == 0);
     Require(scePadSetVibrationMode(handle, 3) == 0);
@@ -348,6 +590,7 @@ int main() {
     Require(scePadGetHandle(user, 0, 1) == noHandle);
     Require(scePadClose_nid_postfix(handle) == 0);
     Require(scePadGetHandle(user, 0, 0) == noHandle);
+    Require(scePadUnknown_n3kSX62fgNo() == PAD_OK);
     Require(scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(true) == 0);
     Require(scePadSetAngularVelocityDeadbandState(handle, false) == 0);
     Require(scePadSetAngularVelocityDeadbandState(handle + 1, false) == PAD_ERROR_INVALID_HANDLE);

@@ -41,20 +41,30 @@ static void CheckMetadataMismatch(unsigned mode) {
 static void CheckValidRelease() {
     constexpr std::size_t bytes = 2 * 1024 * 1024;
     auto& mappings = GuestArena::WindowsMappings::Get();
-    auto* base = static_cast<unsigned char*>(mappings.Reserve(nullptr, bytes));
-    Require(base != nullptr);
+    auto* reserved = static_cast<unsigned char*>(mappings.Reserve(nullptr, 2 * bytes));
+    Require(reserved != nullptr);
+    const auto start = (reinterpret_cast<std::uintptr_t>(reserved) + bytes - 1) & ~static_cast<std::uintptr_t>(bytes - 1);
+    auto* base = reinterpret_cast<unsigned char*>(start);
+    const auto oneRun = [&] {
+        std::uintptr_t first = 0;
+        std::uintptr_t last = 0;
+        return mappings.ResidentSpan(start + bytes - 1, 1, &first, &last) && first == start && last == start + bytes;
+    };
     const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, bytes, nullptr);
     Require(section != nullptr);
     mappings.Map(base, bytes, section, 0, PAGE_READWRITE, true, true);
+    Require(oneRun());
     base[0] = 31;
     base[bytes - 1] = 89;
     DWORD previous;
     Require(VirtualProtect(base + 65536, 65536, PAGE_READONLY, &previous));
     mappings.Reset(base, bytes);
     mappings.Map(base, bytes, section, 0, PAGE_READWRITE, true, true);
+    Require(oneRun());
     Require(base[0] == 31 && base[bytes - 1] == 89);
     mappings.Reset(base, bytes);
-    Require(VirtualFree(base, 0, MEM_RELEASE));
+    Require(VirtualFree(reserved, 2 * bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS));
+    Require(VirtualFree(reserved, 0, MEM_RELEASE));
     mappings.ForgetSection(section);
     CloseHandle(section);
 }

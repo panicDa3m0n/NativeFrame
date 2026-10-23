@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BDARESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "Recompiler.hpp"
 #include <string>
 #include <utility>
@@ -14,7 +15,11 @@ bool LoopGuardTripped();
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
-    BdaResources(const Context& context, const GuestBufferMemory& memory);
+    // `liveSlabs` (a read-only build in the lazy mode of the range slabs): the table maps the bytes
+    // range slabs hold newer than their imports to the slabs (OverlayLiveSpans), which it keeps.
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool liveSlabs = false);
+    // Whether the table maps live slab bytes (such a build is not reused: Revalidate).
+    bool Overlaid() const { return !keptSlabs.empty(); }
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
@@ -25,6 +30,11 @@ public:
         std::vector<std::string> messages;
     };
     void SetImageTables(std::vector<ImageTableFaults> tables, std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges);
+    struct SrtGuardFaults {
+        std::uint32_t stage = 0;
+        std::vector<std::uint32_t> flattenedSrt;
+    };
+    void SetSrtGuards(std::vector<SrtGuardFaults> guards);
     // APS5_PROFILE_DRAW: page tables served from the per-device cache and built anew (cumulative),
     // and how many recent tables the cache holds right now.
     struct TableCacheStats {
@@ -52,12 +62,19 @@ private:
     // same device addresses share one buffer while one of them is alive (see the table cache in
     // BdaResources.cpp, which refers to it weakly).
     void markWrittenPages() const;
+    void checkSrtGuard() const;
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
+    std::vector<std::shared_ptr<ShadowSlab>> keptSlabs;
+    std::vector<SrtGuardFaults> srtGuards;
 };
+
+// O17.T1: `ranges` (ascending, disjoint) with the parts that `live` covers pointed at the slabs
+// (permissions kept), the rest unchanged; the slabs mapped go to `kept`, the bytes mapped to `mapped`.
+std::vector<ShaderRecompiler::BdaAbi::Range> OverlayLiveSpans(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, const std::vector<LiveSlabSpan>& live, std::vector<std::shared_ptr<ShadowSlab>>& kept, std::uint64_t& mapped);
 
 }
 

@@ -128,14 +128,64 @@ BdaResources::BdaResources(const Context& context) {
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
+    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+std::vector<ShaderRecompiler::BdaAbi::Range> OverlayLiveSpans(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, const std::vector<LiveSlabSpan>& live, std::vector<std::shared_ptr<ShadowSlab>>& kept, std::uint64_t& mapped) {
+    std::vector<ShaderRecompiler::BdaAbi::Range> result;
+    result.reserve(ranges.size() + live.size() * 2u);
+    auto first = live.begin();
+    for (const auto& range : ranges) {
+        while (first != live.end() && first->end <= range.begin) ++first;
+        auto cursor = range.begin;
+        const auto append = [&](std::uint64_t end, const LiveSlabSpan* span) {
+            if (cursor >= end) return;
+            auto part = range;
+            part.begin = cursor;
+            part.end = end;
+            if (span != nullptr) {
+                // The memory's permissions stay: the lookup of an atomic access asks for both,
+                // whether or not the build stores (a read-only range made such builds fail).
+                part.deviceAddress = span->deviceAddress + (cursor - span->begin);
+                mapped += end - cursor;
+                if (std::find(kept.begin(), kept.end(), span->slab) == kept.end()) kept.push_back(span->slab);
+            } else {
+                part.deviceAddress += cursor - range.begin;
+            }
+            result.push_back(part);
+            cursor = end;
+        };
+        for (auto span = first; span != live.end() && span->begin < range.end; ++span) {
+            append(std::max(cursor, span->begin), nullptr);
+            append(std::min(range.end, span->end), &*span);
+        }
+        append(range.end, nullptr);
+    }
+    return result;
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool liveSlabs) : BdaResources(context) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
-    const auto& ranges = cached.has_value() ? *cached->ranges : built;
-    const auto serial = cached.has_value() ? cached->serial : 0;
+    const std::vector<ShaderRecompiler::BdaAbi::Range>* source = cached.has_value() ? cached->ranges : &built;
+    auto serial = cached.has_value() ? cached->serial : 0;
+    std::vector<ShaderRecompiler::BdaAbi::Range> overlaid;
+    if (liveSlabs) {
+        if (const auto live = LiveRangeSlabSpans(context); !live.empty()) {
+            std::uint64_t mapped = 0;
+            overlaid = OverlayLiveSpans(*source, live, keptSlabs, mapped);
+            if (mapped != 0) {
+                // Not the space's table any more: found by its words alone.
+                source = &overlaid;
+                serial = 0;
+                NoteAddressOverlay(mapped);
+            } else {
+                keptSlabs.clear();
+            }
+        }
+    }
+    const auto& ranges = *source;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
@@ -208,7 +258,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, ranges, table, serial});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }
@@ -245,10 +295,11 @@ void BdaResources::CheckFault() const {
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));
     if (report.state == ShaderRecompiler::BdaAbi::FaultState::Empty) {
-        Require(static_cast<std::uint32_t>(report.reason) == 0 && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.reserved == 0, "BDA fault record has data without publication");
+        Require(static_cast<std::uint32_t>(report.reason) == 0 && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.otherFaults == 0, "BDA fault record has data without publication");
+        checkSrtGuard();
         return;
     }
-    Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.reserved == 0, "incomplete or invalid BDA fault record");
+    Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.otherFaults <= 1, "incomplete or invalid BDA fault record");
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
@@ -294,6 +345,10 @@ void BdaResources::CheckFault() const {
             break;
         }
     }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Unaligned) {
+        if (report.otherFaults == 0) throw BdaUnalignedAccess(message.str(), report.instruction);
+        message << "; a fault of another kind was recorded in the same dispatch";
+    }
     throw std::runtime_error(message.str());
 }
 
@@ -304,6 +359,27 @@ namespace AgcDriver::Graphics {
 void BdaResources::SetImageTables(std::vector<ImageTableFaults> tables, std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
     imageTables = std::move(tables);
     imageTableRanges = std::move(ranges);
+}
+
+void BdaResources::SetSrtGuards(std::vector<SrtGuardFaults> guards) {
+    srtGuards = std::move(guards);
+}
+
+void BdaResources::checkSrtGuard() const {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    std::uint32_t guard = 0;
+    std::memcpy(&guard, fault->Bytes().data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(guard));
+    if (guard == 0) return;
+    const auto stage = guard >> Abi::SrtGuardStageShift;
+    const auto record = guard & ((1u << Abi::SrtGuardStageShift) - 1u);
+    const auto found = std::find_if(srtGuards.begin(), srtGuards.end(), [&](const SrtGuardFaults& candidate) { return candidate.stage == stage; });
+    const auto* guards = found != srtGuards.end() ? &*found : srtGuards.size() == 1 ? &srtGuards.front() : nullptr;
+    Require(guards != nullptr && record + 2u < guards->flattenedSrt.size(), "a guarded SRT read faulted without its poison record");
+    const auto& words = guards->flattenedSrt;
+    const auto address = static_cast<std::uint64_t>(words[record + 1u]) | (static_cast<std::uint64_t>(words[record + 2u]) << 32u);
+    std::ostringstream message;
+    message << "BDA access failed: address=0x" << std::hex << address << " instruction=0x" << words[record] << std::dec << " bytes=4 stage=" << stage << " reason=" << static_cast<std::uint32_t>(Abi::FaultReason::Unmapped);
+    throw std::runtime_error(message.str());
 }
 
 void BdaResources::markWrittenPages() const {
@@ -321,7 +397,7 @@ void BdaResources::markWrittenPages() const {
                 Require(false, message.str());
             }
         }
-        GuestMemory::MarkWritten(begin, bytes);
+        GuestMemory::MarkPossiblyWritten(begin, bytes);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];

@@ -87,11 +87,12 @@ bool Driver::reapEachPacket() {
     return each;
 }
 
+std::uint64_t BatchCapFrom(const char* text) {
+    return text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull;
+}
+
 std::uint64_t Driver::batchCap() {
-    static const std::uint64_t value = [] {
-        const char* text = std::getenv("APS5_BATCH_CAP");
-        return text ? std::strtoull(text, nullptr, 10) : 64ull;
-    }();
+    static const std::uint64_t value = BatchCapFrom(std::getenv("APS5_BATCH_CAP"));
     return value;
 }
 
@@ -125,7 +126,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         first = false;
         countLabelOutcome(reason);
         if (reason != 0 && reason != 5) {
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (reason != 1 && reason != 7 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(label.address, bytes, 4);
             KernelWakeSleepers_nid_no_patch();
         }

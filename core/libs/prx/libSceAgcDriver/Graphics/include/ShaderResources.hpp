@@ -51,6 +51,7 @@ bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<c
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
+bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -319,6 +320,7 @@ public:
         bool audited = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -681,6 +683,10 @@ private:
     // BufferShadowSerial at the last proof (O16.T17): when it moved, the in-place ranges publish
     // the range slabs' live bytes over them.
     std::uint64_t bufferShadowSerialSeen = 0;
+    std::uint64_t provedEpoch = 0;
+    std::uint64_t provedProof = 0;
+    std::uint64_t provedPending = 0;
+    bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

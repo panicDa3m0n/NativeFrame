@@ -4652,6 +4652,9 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     retile(*half, unit3, unit / 2, 0x22, true);
     Require(AnyShadowedOverlaps(unit3, 1) && AnyShadowedOverlaps(unit4 - 1, 1) && AnyShadowedOverlaps(unit3 + 1000, 64), "a fresh unit is not seen as shadowed");
     Require(!AnyShadowedOverlaps(unit3 - 1, 1) && !AnyShadowedOverlaps(unit4, unit) && !AnyShadowedOverlaps(address, 3 * unit), "a range outside the unit is seen as shadowed");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> outside{{{unit3 - 8, unit3}, {unit4, unit4 + unit}}};
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> reaching{{{unit3 - 8, unit3}, {unit4 - 4, unit4}}};
+    Require(!AnyShadowedOverlaps(outside) && AnyShadowedOverlaps(reaching), "a set of ranges around the fresh unit was answered wrongly");
     {
         // An upload's runs over units 2..4 split at unit 3's freshness; the fresh piece reads the slab.
         const std::pair<std::uint64_t, std::uint64_t> run{2 * unit, 5 * unit};
@@ -4997,11 +5000,14 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(words[2 * unit] == 0x44 && words[4 * unit - 1] == 0x45, "a CPU store made after the idle flush returned was overwritten by its publish");
     Require(words[2 * unit + 1] == 0x22 && words[3 * unit - 1] == 0x22 && words[3 * unit] == 0x33 && words[1 * unit] == 0x11 && words[4 * unit] == 0x11, "the idle publish's bytes are wrong");
+    words[5 * unit] = 0x11;
+    CollectWritesUncached(address, bytes);
     retile(address + 5 * unit, 0x55);
     StorageTexture::FlushAllPending("label");
-    Require(recorder.PendingWriteOverlaps(address + 5 * unit, unit), "a publish of a flush other than the idle one was waited");
+    const bool pending = recorder.PendingWriteOverlaps(address + 5 * unit, unit);
     recorder.Sync();
-    Require(words[5 * unit] == 0x55 && words[6 * unit - 1] == 0x55, "the label flush's publish did not land");
+    Require(words[5 * unit] == 0x55 && words[6 * unit - 1] == 0x55, "the label flush's publish did not land: the unit read as written after its retile, so the publish dropped it as stale");
+    Require(pending, "a publish of a flush other than the idle one was waited");
     std::cout << "idle publish wait verified\n";
 }
 
@@ -6610,6 +6616,9 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
                 context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
                 image->MarkDirty();
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> beside{{{address - 64, address - 16}, {address + surfaceBytes, address + surfaceBytes + 64}}};
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> touching{{{address - 64, address - 16}, {address + surfaceBytes - 4, address + surfaceBytes}}};
+                Require(!StorageTexture::AnyPendingOverlaps(beside) && StorageTexture::AnyPendingOverlaps(touching), "(c) " + what + ": a set of ranges beside the pending image or touching its last word was answered wrongly");
                 for (std::size_t i = 0; i < 4096; ++i) memory[offset + i] = pattern(offset + i);
                 if (changed) memory[offset + 16] = static_cast<std::uint8_t>(~pattern(offset + 16));
                 AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);

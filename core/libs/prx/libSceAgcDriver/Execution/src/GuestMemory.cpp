@@ -1615,6 +1615,23 @@ std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<std::uint64_t> proofSerial{1};
+thread_local bool proofThread = false;
+}
+
+std::uint64_t ProofSerial() {
+    return proofSerial.load(std::memory_order_acquire);
+}
+
+void BreakProofs() {
+    proofSerial.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void MarkProofThread() {
+    proofThread = true;
+}
+
 std::uint64_t CollectEpoch() {
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }
@@ -1822,6 +1839,7 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -1866,6 +1884,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
+    BreakProofs();
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2296,7 +2315,10 @@ bool GpuMutexType::tryEnter() {
 
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    if (++depth == 1) {
+        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        if (!proofThread) BreakProofs();
+    }
 }
 
 bool GpuMutexType::try_lock() {
@@ -2651,6 +2673,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
+    BreakProofs();
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <numbers>
 #include <stdexcept>
@@ -262,10 +263,32 @@ static void TestPan() {
     work.speaker_angles[0] = -INFINITY;
     Require(PanThrows(&work, &front, 1, 2));
     Require(sceNgs2PanInit(&work, nullptr, 360.0f, 2) == SCE_NGS2_OK);
-    Require(PanInitThrows(nullptr, nullptr, 360.0f, 2));
-    for (std::uint32_t count : {0u, 1u, 3u, 6u, 8u}) Require(PanInitThrows(&work, nullptr, 360.0f, count));
+    Ngs2PanWork marked;
+    std::memset(&marked, 0x5a, sizeof(marked));
+    Ngs2PanWork expected;
+    std::memcpy(&expected, &marked, sizeof(marked));
+    const auto unchanged = [&] { return std::memcmp(&marked, &expected, sizeof(marked)) == 0; };
     const float pair[] = {-30.0f, 30.0f};
-    Require(PanInitThrows(&work, pair, 180.0f, 2) && !PanInitThrows(&work, pair, 2.0f * pi, 2));
+    Require(sceNgs2PanInit(nullptr, nullptr, 360.0f, 2) == static_cast<int>(0x804A8010));
+    Require(sceNgs2PanInit(nullptr, pair, 180.0f, 3) == static_cast<int>(0x804A8010));
+    Require(sceNgs2PanInit(nullptr, nullptr, 100.0f, 3) == static_cast<int>(0x804A8010));
+    for (std::uint32_t count : {1u, 3u, 6u, 8u, 255u}) {
+        Require(sceNgs2PanInit(&marked, nullptr, 360.0f, count) == static_cast<int>(0x804A8451));
+        Require(unchanged());
+    }
+    Require(PanInitThrows(&marked, nullptr, 360.0f, 0));
+    Require(unchanged());
+    for (std::uint32_t count : {0u, 1u, 3u, 6u, 8u, 255u}) {
+        Require(sceNgs2PanInit(&marked, pair, 360.0f, count) == static_cast<int>(0x804A8451));
+        Require(sceNgs2PanInit(&marked, pair, 2.0f * pi, count) == static_cast<int>(0x804A8451));
+        Require(unchanged());
+    }
+    for (const float unitAngle : {180.0f, 0.0f, 359.0f, 361.0f, 90.0f, pi}) {
+        Require(sceNgs2PanInit(&marked, pair, unitAngle, 2) == static_cast<int>(0x804A8450));
+        Require(sceNgs2PanInit(&marked, pair, unitAngle, 3) == static_cast<int>(0x804A8450));
+        Require(unchanged());
+    }
+    Require(sceNgs2PanInit(&work, pair, 2.0f * pi, 2) == SCE_NGS2_OK);
     const float invalid[] = {0.0f, NAN};
     Require(PanInitThrows(&work, invalid, 360.0f, 2));
     const float onUnit[] = {720.0f, 30.0f};
@@ -748,6 +771,41 @@ static void TestSampleRate() {
     const auto out = RenderI16(system);
     for (std::uint32_t i = 0; i < Grain; i++) Require(out[i] == expected[i]);
     Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+}
+
+static bool SystemOptionThrows(const Ngs2SystemOption& option) {
+    Ngs2ContextBufferInfo query{};
+    try {
+        sceNgs2SystemQueryBufferSize(&option, &query);
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+static void TestSystemOptionFlags() {
+    Ngs2SystemOption option{};
+    Require(sceNgs2SystemResetOption(&option) == SCE_NGS2_OK && option.flags == 0);
+    option.flags = 0x2;
+    Ngs2ContextBufferInfo query{};
+    Require(sceNgs2SystemQueryBufferSize(&option, &query) == SCE_NGS2_OK && query.host_buffer_size != 0);
+    const auto info = Buffer(query);
+    uintptr_t system = 0;
+    Require(sceNgs2SystemCreate(&option, &info, &system) == SCE_NGS2_OK && system != 0);
+    Require(sceNgs2SystemSetGrainSamples(system, Grain) == SCE_NGS2_OK);
+    const auto master = Mastering(system, 1);
+    const std::vector<std::int16_t> pcm{1000, 2000, 3000, 4000};
+    const auto sampler = Sampler(system, pcm, 1);
+    Patch(sampler, master);
+    Event(sampler, SCE_NGS2_VOICE_EVENT_PLAY);
+    const auto out = RenderI16(system);
+    Require(std::equal(pcm.begin(), pcm.end(), out.begin()));
+    Require(sceNgs2SystemDestroy(system, nullptr) == SCE_NGS2_OK);
+
+    for (const std::uint32_t flags : {0x1u, 0x3u, 0x4u, 0x80000000u, 0x80000002u}) {
+        option.flags = flags;
+        Require(SystemOptionThrows(option));
+    }
 }
 
 static void TestUserData() {
@@ -1466,6 +1524,7 @@ int main() {
     TestReverb();
     TestReverbSetup();
     TestSampleRate();
+    TestSystemOptionFlags();
     TestUserData();
     TestPcmCallbackReset();
     TestPcmCallbackRefill();

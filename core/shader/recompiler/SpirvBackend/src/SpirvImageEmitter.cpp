@@ -246,6 +246,10 @@ bool VolumeSliceAddress(const ImageEmitAccess& access) {
     return access.mem.imageDimension == RdnaImageDimension::Dim2DArray && access.image.dimension == RdnaImageDimension::Dim3D;
 }
 
+bool ArraySliceAddress(const ImageEmitAccess& access) {
+    return access.mem.imageDimension == RdnaImageDimension::Dim3D && access.image.dimension == RdnaImageDimension::Dim2DArray;
+}
+
 std::uint32_t VolumeSliceInRange(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t image, std::optional<std::uint32_t> lod) {
     auto& state = ctx.state;
     state.module.EmitCapability(spv::CapabilityImageQuery);
@@ -1073,8 +1077,8 @@ void EmitWriteOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     auto& state = ctx.state;
     const bool uintImage = access.image.numericClass == IrTextureNumericClass::Uint;
     auto condition = ctx.Arg(access.inst, 3);
-    if (VolumeSliceAddress(access)) {
-        if (access.image.mipMode == ImageMipMode::DynamicStorage) ctx.Fail(access.inst, "stores a 2D-array address to a 3D image with dynamic mips, which is not implemented");
+    if (VolumeSliceAddress(access) || ArraySliceAddress(access)) {
+        if (access.image.mipMode == ImageMipMode::DynamicStorage) ctx.Fail(access.inst, "stores a 2D-array address to a 3D image or a 3D address to a 2D-array image with dynamic mips, which is not implemented");
         const auto image = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, ImageType(state, access.image), image, StorageImageDescriptorPointer(state, access.mem.resource));
         condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, VolumeSliceInRange(ctx, access, image, std::nullopt));

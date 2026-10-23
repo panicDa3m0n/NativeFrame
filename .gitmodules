@@ -52,3 +52,9 @@
 [submodule "3rdparty/vgmstream"]
 	path = 3rdparty/vgmstream
 	url = https://github.com/vgmstream/vgmstream.git
+[submodule "3rdparty/ogg"]
+	path = 3rdparty/ogg
+	url = https://github.com/xiph/ogg.git
+[submodule "3rdparty/vorbis"]
+	path = 3rdparty/vorbis
+	url = https://github.com/xiph/vorbis.git

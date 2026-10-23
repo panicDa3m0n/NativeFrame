@@ -216,6 +216,9 @@ std::uint64_t ResidentTargetMemoHits();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 void RunDepthCopyPass(const Context& context, const DepthCopyPass& pass);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
+bool DrawPipelineEnabled();
+bool CommitTrims();
 
 }
 

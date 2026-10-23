@@ -296,6 +296,23 @@ static void Processes() {
     Require(ChildTry(fixtures, 2) == 0);
 }
 
+static void Directories() {
+    const std::filesystem::path directory = std::filesystem::temp_directory_path() / ("anyps5-flock-dir-" + std::to_string(::GetCurrentProcessId()));
+    std::filesystem::create_directories(directory);
+    const std::string path = directory.string();
+    const int descriptor = open_nid_postfix(path.c_str(), 0x20000, 0);
+    Require(descriptor >= 0);
+    Require(flock_nid_postfix(descriptor, 1 | 4) == 0);
+    Require(flock_nid_postfix(descriptor, 2 | 4) == 0);
+    Require(flock_nid_postfix(descriptor, 2) == 0);
+    Require(flock_nid_postfix(descriptor, 8) == 0);
+    Require(flock_nid_postfix(descriptor, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(flock_nid_postfix(descriptor, 4) == -1 && *__error_nid_postfix() == 9);
+    Require(close_nid_postfix(descriptor) == 0);
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 int main(int argc, char** argv) {
     if (argc >= 4 && std::string(argv[1]) == "child") {
         int busy = 0;
@@ -320,5 +337,6 @@ int main(int argc, char** argv) {
     else if (mode == "threads") Threads();
     else if (mode == "streams") Streams();
     else if (mode == "process") Processes();
+    else if (mode == "directory") Directories();
     else std::abort();
 }

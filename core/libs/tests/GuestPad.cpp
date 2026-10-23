@@ -30,6 +30,9 @@ int APS5_VABI scePadSetAngularVelocityDeadbandState(int, bool);
 int APS5_VABI scePadSetAngularVelocityBiasCorrectionState(int, bool);
 int APS5_VABI scePadIsRemoteController(int, bool*);
 int APS5_VABI scePadGetAccessibilityControllerState(int, std::uint32_t*);
+bool APS5_VABI scePadIsDS4Connected(std::int32_t);
+bool APS5_VABI scePadIsBlasterConnected(std::int32_t);
+bool APS5_VABI scePadIsMoveConnected(std::int32_t);
 int APS5_VABI scePadGetControllerInformation(int, PadControllerInformation*);
 int APS5_VABI scePadGetExtControllerInformation(int, void*);
 int APS5_VABI scePadResetLightBar(int);
@@ -147,6 +150,17 @@ static void CheckAngularVelocityDeadband(int handle) {
     Require(scePadReadState(handle, &data) == PAD_OK);
     Require(data.angular_velocity_x == 0.01f && data.angular_velocity_z == -0.017f);
     PadPublishInput_nid_postfix(PadInputState{});
+}
+
+static void CheckStickDeadZones(int handle) {
+    PadControllerInformation info{};
+    Require(scePadGetControllerInformation(handle, &info) == PAD_OK);
+    Require(info.stickInfo.deadZoneLeft == 13 && info.stickInfo.deadZoneRight == 13);
+    std::array<std::uint8_t, 0x2c> extended{};
+    Require(scePadGetExtControllerInformation(handle, extended.data()) == PAD_OK);
+    PadControllerInformation base{};
+    std::memcpy(&base, extended.data(), sizeof(base));
+    Require(base.stickInfo.deadZoneLeft == 13 && base.stickInfo.deadZoneRight == 13);
 }
 
 static void CheckTouchContact() {
@@ -305,6 +319,14 @@ static void CheckRemoteController(int handle) {
     Require(!remote);
 }
 
+static void CheckTrackerDevices(int handle) {
+    for (const int candidate : {handle, handle + 1}) {
+        Require(!scePadIsDS4Connected(candidate));
+        Require(!scePadIsBlasterConnected(candidate));
+        Require(!scePadIsMoveConnected(candidate));
+    }
+}
+
 static void CheckAccessibilityControllerState(int handle) {
     std::uint32_t state = 7;
     Require(scePadGetAccessibilityControllerState(handle + 1, nullptr) == PAD_ERROR_INVALID_ARG);
@@ -442,12 +464,14 @@ int main() {
     CheckTouchContact();
     CheckVirtualTouchContact();
     CheckTouchPadInformation(handle);
+    CheckStickDeadZones(handle);
     CheckPartialTrigger();
     CheckReadQueue(handle);
     CheckTapBetweenReads();
     CheckLatchedPressLifetime(handle);
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
+    CheckTrackerDevices(handle);
     CheckAccessibilityControllerState(handle);
     CheckInjectedState(commandPath);
     PadLightBarParam lightBar{255, 128, 64};

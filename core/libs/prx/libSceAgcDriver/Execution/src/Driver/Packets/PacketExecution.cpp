@@ -35,6 +35,24 @@ bool pipelineDma() {
     return enabled;
 }
 
+bool keepsDrawFinisher(std::uint32_t header, std::uint32_t opcode) {
+    if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
+    if (Pm4::DrawOpcode(opcode)) return true;
+    switch (opcode) {
+        case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x69: case 0x76: case 0x79: return true;
+        case 0x10: return ((header >> 2u) & 0x3fu) == 0;
+        default: return false;
+    }
+}
+
+bool waitTakesPendingLabel(std::span<const std::uint32_t> packet) {
+    if (packet.size() < 5) return false;
+    const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+    const std::uint64_t awaited = (packet[2] & (awaitedBytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto value = DrawPipeline::Queue0().PendingLabel(awaited, awaitedBytes);
+    return value.has_value() && Pm4::WaitComparesValue(packet, *value);
+}
+
 bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
@@ -231,6 +249,12 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    struct SettleFinisher {
+        bool queue0;
+        ~SettleFinisher() {
+            if (queue0) DrawFinisher::Get().Settle();
+        }
+    } settleFinisher{submission.queue == 0};
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -240,10 +264,20 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
+            const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
+            const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
+            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
+            if (!beside) DrawFinisher::Get().Drain();
+            if (DrawFinisher::Overlap()) {
+                DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
+                if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
+            }
+        }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
-        const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (pipelined && DrawPrepare::Threads() != 0) {
             const bool special = predicated || header == FlipPacketHeader || header == RenderingWaitPacketHeader || submission.flips.contains(cursor);
             const bool indirectRegisters = !special && (opcode == 0x63 || opcode == 0x64 || opcode == 0x9f);
@@ -534,6 +568,7 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
+    if (submission.queue == 0) DrawFinisher::Get().Drain();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     if (Graphics::BufferShadowProbe()) Graphics::ProbeBufferBoundary(Graphics::ProbeBoundary::Submission);

@@ -20,6 +20,7 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "SavedExecMaskLoop.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -4088,6 +4089,18 @@ void verifyHalfWaveReduction() {
         {0u, 0x38000000u, 0x88000000u, spv::OpGroupNonUniformBitwiseOr, "half-wave reduction: the wave64 OR scan did not read lane 31 as a subgroup OR on 32 lanes"},
     }};
     for (const auto& reduction : scans) require(reductions(pixel(scan(reduction.identity, reduction.vector, reduction.scalar), 32u, true), reduction.reduce) == 1u, reduction.message);
+    auto loopScan = scan(0xffffffffu, 0x26000000u, 0x83800000u);
+    const auto savedMaskLoop = AgcTest::SavedExecMaskLoop(8u);
+    loopScan.insert(loopScan.begin(), savedMaskLoop.begin(), savedMaskLoop.end());
+    auto helperLoop = loopScan;
+    helperLoop[0] = 0xbea204c1u;
+    expectFailure([&] { static_cast<void>(pixel(helperLoop, 32u, true)); }, "v_readlane_b32 of lane 63 is outside the 32-lane host subgroup", "half-wave reduction: a loop initialized with helper lanes was proven to exclude them");
+    auto upperHelperLoop = loopScan;
+    upperHelperLoop[0] = 0xbea2037eu;
+    upperHelperLoop.insert(upperHelperLoop.begin() + 1, 0xbea303c1u);
+    expectFailure([&] { static_cast<void>(pixel(upperHelperLoop, 32u, true)); }, "v_readlane_b32 of lane 63 is outside the 32-lane host subgroup", "half-wave reduction: the low-word loop proof was reused for helper-inclusive upper lanes");
+    require(reductions(pixel(loopScan, 32u, true), spv::OpGroupNonUniformUMin) == 1u, "half-wave reduction: a loop-carried saved EXEC mask exhausted the entry-lane proof on 32 lanes");
+    require(halves(pixel(loopScan, 64u, true), spv::OpGroupNonUniformUMin, 0xffffffffu), "half-wave reduction: a loop-carried saved EXEC mask did not preserve the two half-wave UMin reductions");
     auto comparedScan = scan(0u, 0x38000000u, 0x88000000u);
     *std::find(comparedScan.begin(), comparedScan.end(), 0xbe98047eu) = 0x8a986a7eu;
     comparedScan.insert(comparedScan.begin(), 0x7c080080u);
@@ -4500,13 +4513,15 @@ void verifyMeshConfiguration() {
     RecompileCacheKey::Build(other, key);
     require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(other), "the cache keys ignore the mesh configuration");
     require(mesh.outputPrimitiveSize == 3u && replay.request.graphics->mesh->outputPrimitiveSize == 3u, "a mesh configuration does not output triangles by default");
-    otherMesh = mesh;
-    otherMesh.outputPrimitiveSize = 2u;
-    other.graphics = GraphicsCompileContext{0u, {}, otherMesh, std::nullopt, {}};
-    const auto lineReplay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(other));
-    require(lineReplay.request.graphics.has_value() && lineReplay.request.graphics->mesh.has_value() && lineReplay.request.graphics->mesh->outputPrimitiveSize == 2u, "the mesh output primitive size was lost in serialization");
-    RecompileCacheKey::Build(other, key);
-    require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(other), "the cache keys ignore the mesh output primitive size");
+    for (const auto primitiveSize : {1u, 2u}) {
+        otherMesh = mesh;
+        otherMesh.outputPrimitiveSize = primitiveSize;
+        other.graphics = GraphicsCompileContext{0u, {}, otherMesh, std::nullopt, {}};
+        const auto primitiveReplay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(other));
+        require(primitiveReplay.request.graphics.has_value() && primitiveReplay.request.graphics->mesh.has_value() && primitiveReplay.request.graphics->mesh->outputPrimitiveSize == primitiveSize, "the mesh output primitive size was lost in serialization");
+        RecompileCacheKey::Build(other, key);
+        require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(other), "the cache keys ignore the mesh output primitive size");
+    }
     RecompileRequest hull{};
     hull.shader = {ShaderStage::TessellationControl, 0x10000u, code, 0, {}};
     hull.context.waveSize = 64;
@@ -4883,7 +4898,7 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->layerExported = true;
     minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQSoAAAA=", "new requests did not use serialization version 42");
+    require(requestPrefix(encoded, 8u) == "NVNQQSsAAAA=", "new requests did not use serialization version 43");
     const std::array<std::uint32_t, 2> fallbacks{0x40u, 0x1ac4u};
     auto withFallbacks = minimal;
     withFallbacks.context.linkedCallFallbacks = fallbacks;
@@ -5001,7 +5016,7 @@ void verifyPixelRequestSerialization() {
     for (std::size_t bytes = 0; bytes < 45u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag, quad pixel mask or quad sample mask was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQSsAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQSwAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -5290,15 +5305,16 @@ void verifyDepthRemapRequests() {
     const auto replay = serializer.Deserialize(remapped);
     require(replay.request.target.depthRangeRemap && replay.request.context.vertex.has_value() && replay.request.context.vertex->paClVsOutCntl == 0x89abcdefu, "the depth remap target flag or the vertex info did not round-trip");
     require(replay.request.context.vertex->depthRemapMode == 2u, "the depth remap mode did not round-trip");
-    require(serializer.Serialize(replay.request) == remapped, "a version 35 depth remap request changed on re-serialization");
+    require(serializer.Serialize(replay.request) == remapped, "the depth remap request changed on re-serialization");
     const auto plainBytes = decodeBase64(plain);
     const auto remappedBytes = decodeBase64(remapped);
-    require(plainBytes.size() == remappedBytes.size() && plainBytes.size() > 5u && std::equal(plainBytes.begin(), plainBytes.end() - 7, remappedBytes.begin()), "the depth remap flag and mode are not the 6 bytes before the f32 flush and denormal preserve flags of a vertex request");
+    constexpr std::size_t pointTailBytes = 13u;
+    require(plainBytes.size() == remappedBytes.size() && plainBytes.size() > 7u + pointTailBytes && std::equal(plainBytes.begin(), plainBytes.end() - 7 - pointTailBytes, remappedBytes.begin()) && std::equal(plainBytes.end() - pointTailBytes, plainBytes.end(), remappedBytes.end() - pointTailBytes), "the depth remap flag and mode are not the 6 bytes before the f32 flush and denormal preserve flags and the point tail of a vertex request");
     for (const std::uint8_t legacyVersion : {32u, 34u}) {
         auto legacyBytes = remappedBytes;
         legacyBytes.pop_back();
         legacyBytes[4] = legacyVersion;
-        legacyBytes.resize(legacyBytes.size() - 6u);
+        legacyBytes.resize(legacyBytes.size() - 6u - pointTailBytes);
         const auto legacy = serializer.Deserialize(encodeBase64(legacyBytes));
         require(!legacy.request.target.depthRangeRemap && legacy.request.context.vertex.has_value() && legacy.request.context.vertex->depthRemapMode == 0u, ("a version " + std::to_string(legacyVersion) + " vertex request read depth remap fields").c_str());
         require(serializer.Serialize(legacy.request) == plain, ("a version " + std::to_string(legacyVersion) + " vertex request misread the fields before the depth remap").c_str());
@@ -5306,10 +5322,10 @@ void verifyDepthRemapRequests() {
     auto version35 = remappedBytes;
     version35.pop_back();
     version35[4] = 35u;
-    version35.pop_back();
+    version35.resize(version35.size() - 1u - pointTailBytes);
     const auto replay35 = serializer.Deserialize(encodeBase64(version35));
     require(replay35.request.target.depthRangeRemap && replay35.request.context.vertex->depthRemapMode == 2u && !replay35.request.target.float32FlushToZero && serializer.Serialize(replay35.request) == remapped, "a version 35 request misread the depth remap fields or read an f32 flush flag");
-    auto truncated = remappedBytes;
+    auto truncated = version35;
     truncated.resize(truncated.size() - 2u);
     expectFailure([&] { static_cast<void>(serializer.Deserialize(encodeBase64(truncated))); }, "truncated data", "a truncated depth remap mode was accepted");
     auto trailing = remappedBytes;
@@ -5350,9 +5366,12 @@ void verifyMergedHullConfiguration() {
     const auto replay = serializer.Deserialize(merged);
     require(replay.request.graphics.has_value() && replay.request.graphics->tessellation.has_value() && replay.request.graphics->tessellation->mergedHull, "a merged hull configuration was lost in serialization");
     require(!serializer.Deserialize(separate).request.graphics->tessellation->mergedHull, "a separate hull configuration was read as merged");
+    constexpr std::size_t pointTailBytes = 13u;
     auto legacy = decodeBase64(merged);
+    require(legacy.size() > 53u + pointTailBytes && legacy[4] == 43u, "a merged hull request did not use serialization version 43");
+    legacy.resize(legacy.size() - pointTailBytes);
     legacy.pop_back();
-    require(legacy.size() > 52u && legacy[legacy.size() - 52u] == 1u, "the merged hull flag is not the last byte of the tessellation configuration");
+    require(legacy[legacy.size() - 52u] == 1u, "the merged hull flag is not the last byte of the tessellation configuration");
     legacy.erase(legacy.end() - 52);
     for (const auto version : {30u, 31u, 32u, 34u, 35u, 36u, 37u, 38u}) {
         auto older = legacy;
@@ -7587,6 +7606,24 @@ void verifyDynamicStorageMipChain() {
     require(ResourceMaterializer::TryRuntimeImageMode(image, allLevels, modes).mode.has_value(), "a dynamic-mip storage image with sixteen levels was rejected");
 }
 
+void verifyArrayVolumeStoreMode() {
+    using namespace ShaderRecompiler;
+    const DescriptorValue descriptor{{0x11800100u, 0xc3800000u, 0x0003c003u, 0xd0900facu, 0u, 0x00700000u, 0u, 0u}, 8u};
+    ImageResource store{};
+    store.resourceClass = ImageResourceClass::Storage;
+    store.dimension = RdnaImageDimension::Dim3D;
+    store.written = true;
+    store.fmaskCompatible = false;
+    const auto modes = ResourceMaterializer::RuntimeImageModes(store);
+    require(modes[ResourceMaterializer::RuntimeImageMode(store, descriptor, modes)].dimension == RdnaImageDimension::Dim2DArray, "3D image store on a 2D-array T# did not select an array runtime mode");
+    store.read = true;
+    expectFailure([&] { static_cast<void>(ResourceMaterializer::RuntimeImageMode(store, descriptor, ResourceMaterializer::RuntimeImageModes(store))); }, "incompatible with the static runtime image interface", "3D image load and store on a 2D-array T# was accepted");
+    store.read = false;
+    store.atomic = true;
+    const DescriptorValue uintDescriptor{{0x11800100u, 0xc1400000u, 0x0003c003u, 0xd0900facu, 0u, 0x00700000u, 0u, 0u}, 8u};
+    expectFailure([&] { static_cast<void>(ResourceMaterializer::RuntimeImageMode(store, uintDescriptor, ResourceMaterializer::RuntimeImageModes(store))); }, "incompatible with the static runtime image interface", "3D image atomic on a 2D-array T# was accepted");
+}
+
 void verifySrgbDepthCompareModes() {
     using namespace ShaderRecompiler;
     for (const auto decodeFormats : {0u, 1u, 2u, 3u}) {
@@ -7761,6 +7798,7 @@ int main(int argc, char** argv) {
         verifyFmaskImageMode();
         verifyCubeDepthCompareMode();
         verifyVolumeArrayLoadMode();
+        verifyArrayVolumeStoreMode();
         verifyVolumeBiasTableRejection();
         verifyDynamicStorageMipChain();
         verifySrgbDepthCompareModes();

@@ -228,7 +228,7 @@ ImageDecode inspectImageDescriptor(const DescriptorValue& descriptor, const Imag
         return rejectImage(PoisonReason::Fmask, "FMASK requires a direct sampled image load");
     }
     if (decoded.fmask && format != IrBufferFormat::Fmask32_S8_F8) return rejectImage(PoisonReason::Fmask, "FMASK format is not implemented");
-    if (decoded.fmask && (descriptor.dwords[6] & (3u << 20u)) != 0u) return rejectImage(PoisonReason::Fmask, "FMASK CMASK compression is not implemented");
+    if (decoded.fmask && ((descriptor.dwords[6] & (1u << 20u)) != 0u || ((descriptor.dwords[6] & (1u << 21u)) != 0u && (descriptor.dwords[6] >> 24u) == 0u && descriptor.dwords[7] == 0u))) return rejectImage(PoisonReason::Fmask, "FMASK CMASK compression is not implemented without readable metadata");
     if (decoded.fmask && (base.packed || base.byElements != 0u)) return rejectImage(PoisonReason::Fmask, "packed FMASK image reads are not implemented");
     if (base.packed) {
         if (table || (!storage && descriptorImageSwizzle(descriptor) != ShaderImageIdentitySwizzle)) {
@@ -1872,6 +1872,12 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             auto volume = mode;
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
+        }
+        const bool arrayStore = image.dimension == RdnaImageDimension::Dim3D && storage && image.written && !image.read && !image.atomic && image.mipMode != ImageMipMode::DynamicStorage;
+        if (arrayStore && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
+            auto array = mode;
+            array.dimension = RdnaImageDimension::Dim2DArray;
+            modes.push_back(array);
         }
         if (image.dimension == RdnaImageDimension::Dim2DMsaa && image.fmaskCompatible && image.cubeFaceCompatible && !table && !storage && !depth && conversion == IrBufferFormat::Invalid && packed == IrBufferFormat::Invalid && image.byElements == 0u) {
             auto plane = mode;

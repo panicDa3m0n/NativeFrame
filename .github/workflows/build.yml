@@ -121,7 +121,7 @@ jobs:
           curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
           7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
       - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
-      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+      - uses: hendrikmuhs/ccache-action@dbeefd73e8e2ffc1bbc412570072735eb4db3607 # v1.2.25
         with:
           key: windows
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
